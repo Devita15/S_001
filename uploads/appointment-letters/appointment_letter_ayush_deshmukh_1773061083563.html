@@ -1,0 +1,161 @@
+
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Appointment Letter</title>
+        <style>
+          body { 
+            font-family: Arial, sans-serif; 
+            margin: 15px; 
+            line-height: 1.3;
+            font-size: 11px;
+          }
+          .container { 
+            max-width: 1000px; 
+            margin: 0 auto; 
+            border: 1px solid #ddd;
+            padding: 20px;
+          }
+          .header { 
+            text-align: center; 
+            border-bottom: 2px solid #003366; 
+            padding-bottom: 5px;
+            margin-bottom: 10px;
+          }
+          .company-name { 
+            font-size: 20px; 
+            font-weight: bold; 
+            color: #003366; 
+          }
+          .title { 
+            font-size: 14px; 
+            font-weight: bold; 
+          }
+          .section { 
+            margin: 10px 0;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 5px;
+          }
+          .section-title { 
+            font-weight: bold; 
+            color: #003366;
+            font-size: 12px;
+            margin-bottom: 3px;
+          }
+          .details-grid {
+            display: grid;
+            grid-template-columns: 120px 1fr 120px 1fr;
+            gap: 5px;
+            margin: 5px 0;
+          }
+          .label { font-weight: bold; }
+          table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            font-size: 10px;
+          }
+          th, td { 
+            padding: 4px; 
+            border: 1px solid #ddd; 
+          }
+          th { 
+            background: #003366; 
+            color: white; 
+          }
+          .total-row { 
+            font-weight: bold; 
+            background: #f0f0f0; 
+          }
+          .signature-section {
+            margin-top: 15px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+          }
+          .footer { 
+            margin-top: 15px; 
+            text-align: center; 
+            font-size: 8px; 
+            color: #666;
+            border-top: 1px solid #ddd;
+            padding-top: 5px;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="company-name">SUYASH ENTERPRISES</div>
+            <div class="title">APPOINTMENT LETTER</div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; font-size: 10px;">
+            <span>Date: 9/3/2026</span>
+            <span>Ref: APPT/2e5daf/2026</span>
+          </div>
+
+          <p><strong>Dear Ayush Deshmukh,</strong></p>
+          
+          <p style="text-align: justify;">We are pleased to appoint you as an employee of Suyash Enterprises, subject to the terms and conditions set out in this letter.</p>
+
+          <div class="section">
+            <div class="section-title">POSITION DETAILS</div>
+            <div class="details-grid">
+              <span class="label">Position:</span>
+              <span>Not Specified</span>
+              <span class="label">Department:</span>
+              <span>Not Specified</span>
+              
+              <span class="label">Location:</span>
+              <span>Head Office</span>
+              <span class="label">Reporting To:</span>
+              <span>Department Head</span>
+              
+              <span class="label">Joining Date:</span>
+              <span colspan="3">11 March 2026</span>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">COMPENSATION DETAILS</div>
+            <table>
+              <tr><th>Component</th><th>Monthly (₹)</th><th>Annual (₹)</th></tr>
+              <tr><td>Basic Salary</td><td>15,000</td><td>180,000</td></tr>
+              <tr><td>HRA</td><td>7,500</td><td>90,000</td></tr>
+              <tr><td>Conveyance</td><td>1,600</td><td>19,200</td></tr>
+              <tr><td>Medical</td><td>1,250</td><td>15,000</td></tr>
+              <tr><td>Special</td><td>0</td><td>0</td></tr>
+              <tr class="total-row"><td colspan="2"><strong>Total CTC (Annual)</strong></td><td><strong>₹70,602</strong></td></tr>
+            </table>
+          </div>
+
+          <div class="section">
+            <div class="section-title">TERMS AND CONDITIONS</div>
+            <ul style="margin: 2px 0; padding-left: 20px; font-size: 10px;">
+              <li>Probation period: 6 months</li>
+              <li>Notice period: 30 days by either party</li>
+              <li>Subject to background verification clearance</li>
+              <li>Company rules and regulations apply</li>
+            </ul>
+          </div>
+
+          <div class="signature-section">
+            <div>
+              <p>For Suyash Enterprises</p>
+              <p><br><br></p>
+              <p>(Authorized Signatory)</p>
+            </div>
+            <div>
+              <p>I accept the above terms:</p>
+              <p>Signature: _________________________</p>
+              <p>Date: 9/3/2026</p>
+            </div>
+          </div>
+
+          <div class="footer">
+            This is a system generated document
+          </div>
+        </div>
+      </body>
+      </html>
+    

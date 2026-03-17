@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Offer Letter - {{candidateName}}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #003366;
+            padding-bottom: 20px;
+        }
+        .company-name {
+            font-size: 24px;
+            font-weight: bold;
+            color: #003366;
+        }
+        .document-title {
+            font-size: 20px;
+            margin-top: 10px;
+        }
+        .content {
+            margin: 20px 0;
+        }
+        .details-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        .details-table td {
+            padding: 10px;
+            border: 1px solid #ddd;
+        }
+        .details-table td:first-child {
+            font-weight: bold;
+            width: 40%;
+            background: #f5f5f5;
+        }
+        .ctc-section {
+            margin: 30px 0;
+        }
+        .ctc-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .ctc-table th {
+            background: #003366;
+            color: white;
+            padding: 10px;
+        }
+        .ctc-table td {
+            padding: 8px;
+            border: 1px solid #ddd;
+        }
+        .ctc-table tr:last-child {
+            font-weight: bold;
+            background: #f0f0f0;
+        }
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+        }
+        .signature {
+            margin-top: 30px;
+        }
+        .signature-line {
+            width: 200px;
+            border-bottom: 1px solid #000;
+            margin: 10px 0;
+        }
+        .terms {
+            margin-top: 30px;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="company-name">{{companyName}}</div>
+        <div class="document-title">Offer of Employment</div>
+    </div>
+
+    <div class="content">
+        <p>Date: {{generatedDate}}</p>
+        <p>To,</p>
+        <p><strong>{{candidateName}}</strong><br>
+        {{candidateAddress}}</p>
+
+        <p>Dear {{candidateName}},</p>
+
+        <p>We are pleased to offer you the position of <strong>{{position}}</strong> at {{companyName}}. 
+        We were impressed with your qualifications and believe that your skills and experience will be 
+        valuable to our organization.</p>
+
+        <h3>Position Details</h3>
+        <table class="details-table">
+            <tr>
+                <td>Position Title</td>
+                <td>{{position}}</td>
+            </tr>
+            <tr>
+                <td>Department</td>
+                <td>{{department}}</td>
+            </tr>
+            <tr>
+                <td>Location</td>
+                <td>{{location}}</td>
+            </tr>
+            <tr>
+                <td>Employment Type</td>
+                <td>{{offerDetails.employmentType}}</td>
+            </tr>
+            <tr>
+                <td>Probation Period</td>
+                <td>{{offerDetails.probationPeriod}} months</td>
+            </tr>
+            <tr>
+                <td>Notice Period</td>
+                <td>{{offerDetails.noticePeriod}} days</td>
+            </tr>
+            <tr>
+                <td>Proposed Joining Date</td>
+                <td>{{joiningDate}}</td>
+            </tr>
+            <tr>
+                <td>Reporting To</td>
+                <td>{{offerDetails.reportingTo}}</td>
+            </tr>
+        </table>
+
+        <h3>Compensation & Benefits</h3>
+        <div class="ctc-section">
+            <table class="ctc-table">
+                <thead>
+                    <tr>
+                        <th>Component</th>
+                        <th>Monthly (₹)</th>
+                        <th>Annual (₹)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Basic Salary</td>
+                        <td>{{ctc.monthly.basic}}</td>
+                        <td>{{ctc.annual.basic}}</td>
+                    </tr>
+                    <tr>
+                        <td>House Rent Allowance</td>
+                        <td>{{ctc.monthly.hra}}</td>
+                        <td>{{ctc.annual.hra}}</td>
+                    </tr>
+                    <tr>
+                        <td>Conveyance Allowance</td>
+                        <td>{{ctc.monthly.conveyance}}</td>
+                        <td>{{ctc.annual.conveyance}}</td>
+                    </tr>
+                    <tr>
+                        <td>Medical Allowance</td>
+                        <td>{{ctc.monthly.medical}}</td>
+                        <td>{{ctc.annual.medical}}</td>
+                    </tr>
+                    <tr>
+                        <td>Special Allowance</td>
+                        <td>{{ctc.monthly.special}}</td>
+                        <td>{{ctc.annual.special}}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Gross Salary</strong></td>
+                        <td><strong>{{ctc.monthly.gross}}</strong></td>
+                        <td><strong>{{ctc.annual.gross}}</strong></td>
+                    </tr>
+                    <tr>
+                        <td>Employer PF Contribution</td>
+                        <td>-</td>
+                        <td>{{ctc.annual.employerPf}}</td>
+                    </tr>
+                    <tr>
+                        <td>Employer ESI Contribution</td>
+                        <td>-</td>
+                        <td>{{ctc.annual.employerEsi}}</td>
+                    </tr>
+                    <tr>
+                        <td>Bonus</td>
+                        <td>-</td>
+                        <td>{{ctc.annual.bonus}}</td>
+                    </tr>
+                    <tr>
+                        <td>Gratuity</td>
+                        <td>-</td>
+                        <td>{{ctc.annual.gratuity}}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Total Cost to Company</strong></td>
+                        <td></td>
+                        <td><strong>{{ctc.annual.total}}</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <h3>Terms and Conditions</h3>
+        <ol class="terms">
+            <li>This offer is subject to successful background verification and document verification.</li>
+            <li>You will be on probation for {{offerDetails.probationPeriod}} months from the date of joining.</li>
+            <li>During the probation period, either party can terminate employment with {{offerDetails.noticePeriod}} days' notice.</li>
+            <li>All company policies and procedures must be adhered to during employment.</li>
+            <li>This offer is valid for 15 days from the date of issue.</li>
+        </ol>
+
+        <p>Please sign and return a copy of this letter as your acceptance of this offer. 
+        You can accept this offer by clicking the link provided in the email or by signing below.</p>
+
+        <div class="footer">
+            <p>We look forward to welcoming you to {{companyName}}!</p>
+            
+            <div class="signature">
+                <p>Sincerely,</p>
+                <div class="signature-line"></div>
+                <p><strong>HR Manager</strong><br>
+                {{companyName}}</p>
+            </div>
+
+            <div class="signature">
+                <p>Accepted by:</p>
+                <div class="signature-line"></div>
+                <p>{{candidateName}}<br>
+                Date: ______________</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

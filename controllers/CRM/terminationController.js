@@ -1,0 +1,429 @@
+﻿const Termination = require('../../models/HR/Termination');
+const Employee = require('../../models/HR/Employee');
+const initiateTermination = async (req, res) => {
+  try {
+    const { employeeId, reason, lastWorkingDay, terminationType, initiatorType } = req.body;
+    
+    console.log('Initiating termination with data:', { employeeId, reason, lastWorkingDay, terminationType, initiatorType });
+
+    // Validate required fields
+    if (!employeeId || !reason || !lastWorkingDay || !terminationType || !initiatorType) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields: employeeId, reason, lastWorkingDay, terminationType, initiatorType' 
+      });
+    }
+    
+     // ==================== DATE VALIDATION ====================
+    // Parse and validate last working day
+    const parsedLastWorkingDay = new Date(lastWorkingDay);
+    const currentDate = new Date();
+    const today = new Date(currentDate.setHours(0, 0, 0, 0));
+
+    // Check if date is valid
+    if (isNaN(parsedLastWorkingDay.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid last working day format. Please provide a valid date.'
+      });
+    }
+
+    // Last working day cannot be in the past
+    if (parsedLastWorkingDay < today) {
+      return res.status(400).json({
+        success: false,
+        message: 'Last working day cannot be in the past. Please select a future date.'
+      });
+    }
+
+    // Check if employee exists - handle both MongoDB ObjectId and EmployeeID string
+    let employee;
+    
+    // Check if employeeId is a valid MongoDB ObjectId
+    if (employeeId.match(/^[0-9a-fA-F]{24}$/)) {
+      employee = await Employee.findById(employeeId);
+    }
+    
+    // If not found by _id, try to find by EmployeeID string
+    if (!employee) {
+      employee = await Employee.findOne({ EmployeeID: employeeId });
+    }
+
+    if (!employee) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Employee not found with provided ID' 
+      });
+    }
+
+    console.log('Found employee:', employee.EmployeeID);
+
+    // Check if employee is already terminated/resigned
+    if (employee.EmploymentStatus !== 'active') {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Employee is already ${employee.EmploymentStatus}` 
+      });
+    }
+
+    // Check if there's already a pending termination for this employee
+    const existingTermination = await Termination.findOne({
+      employeeId: employee._id,
+      status: { $in: ['pending', 'approved'] }
+    });
+
+    if (existingTermination) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `A ${existingTermination.status} termination/resignation record already exists for this employee` 
+      });
+    }
+
+    // Determine reviewer based on initiator type
+    let reviewerId;
+    if (initiatorType === 'HR') {
+      // For HR termination, assign manager as reviewer (could be current user or find a manager)
+      reviewerId = req.user?.employeeId || req.user?.id; // Current HR/Manager
+      
+      // If no reviewer found, try to find an HR manager
+      if (!reviewerId) {
+        const hrManager = await Employee.findOne({ 
+          role: 'HR', 
+          EmploymentStatus: 'active' 
+        });
+        reviewerId = hrManager ? hrManager._id : null;
+      }
+    } else {
+      // For employee resignation, assign HR as reviewer
+      const hrEmployee = await Employee.findOne({ 
+        role: 'HR', 
+        EmploymentStatus: 'active' 
+      });
+      reviewerId = hrEmployee ? hrEmployee._id : null;
+    }
+
+    if (!reviewerId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No reviewer available. Please ensure an HR employee exists in the system.' 
+      });
+    }
+
+    // Generate unique termination ID
+    const terminationId = 'TERM-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+
+    // Create termination record
+    const termination = await Termination.create({
+      terminationId,
+      employeeId: employee._id,
+      employeeID: employee.EmployeeID,
+      initiatorType: initiatorType.toUpperCase(),
+      terminationType: terminationType.toLowerCase(),
+      reason,
+      lastWorkingDay: new Date(lastWorkingDay),
+      reviewerId,
+      createdBy: req.user?.id || req.user?._id,
+      status: 'pending',
+      initiatedAt: new Date()
+    });
+
+    // Populate the response
+    const populatedTermination = await Termination.findById(termination._id)
+      .populate('employeeId', 'FirstName LastName EmployeeID Email DepartmentID DesignationID')
+      .populate('reviewerId', 'FirstName LastName Email');
+
+    res.status(201).json({
+      success: true,
+      data: populatedTermination,
+      message: `${initiatorType === 'HR' ? 'Termination' : 'Resignation'} initiated successfully`
+    });
+  } catch (error) {
+    console.error('Error initiating termination:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error', 
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined 
+    });
+  }
+};
+
+// @desc    Submit exit feedback
+// @route   POST /api/terminations/:terminationId/feedback
+// @access  Employee/HR (based on termination type)
+const submitFeedback = async (req, res) => {
+  try {
+    const { terminationId } = req.params;
+    const {
+      reasonForLeaving,
+      experienceWithCompany,
+      wouldRecommend,
+      feedbackDetails,
+      suggestionsForImprovement,
+      rehireEligible
+    } = req.body;
+
+    const termination = await Termination.findOne({ terminationId });
+    if (!termination) {
+      return res.status(404).json({ success: false, message: 'Termination record not found' });
+    }
+
+    // Check if feedback already submitted
+    if (termination.feedback.submitted) {
+      return res.status(400).json({ success: false, message: 'Feedback already submitted' });
+    }
+
+    // Update feedback
+    termination.feedback = {
+      submitted: true,
+      submittedBy: req.user.id,
+      submittedAt: new Date(),
+      exitInterview: {
+        reasonForLeaving,
+        experienceWithCompany,
+        wouldRecommend,
+        feedbackDetails,
+        suggestionsForImprovement,
+        rehireEligible
+      }
+    };
+
+    await termination.save();
+
+    res.status(200).json({
+      success: true,
+      data: termination,
+      message: 'Feedback submitted successfully'
+    });
+  } catch (error) {
+    console.error('Error submitting feedback:', error);
+    res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Approve termination/resignation
+// @route   POST /api/terminations/:terminationId/approve
+// @access  HR/Manager
+const approveTermination = async (req, res) => {
+  try {
+    const { terminationId } = req.params;
+    const { comments } = req.body;
+
+    const termination = await Termination.findOne({ terminationId }).populate('employeeId');
+    if (!termination) {
+      return res.status(404).json({ success: false, message: 'Termination record not found' });
+    }
+
+    // Check if already approved
+    if (termination.status === 'approved') {
+      return res.status(400).json({ success: false, message: 'Already approved' });
+    }
+
+    // Check if feedback is submitted (for resignations)
+    if (termination.initiatorType === 'EMPLOYEE' && !termination.feedback.submitted) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot approve until exit feedback is submitted' 
+      });
+    }
+
+    // Update termination status
+    termination.status = 'approved';
+    termination.approvalDetails = {
+      approvedBy: req.user.id,
+      approvedAt: new Date(),
+      comments
+    };
+
+    await termination.save();
+
+    res.status(200).json({
+      success: true,
+      data: termination,
+      message: `${termination.terminationType} approved successfully`
+    });
+  } catch (error) {
+    console.error('Error approving termination:', error);
+    res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Delete termination record
+// @route   DELETE /api/terminations/:terminationId
+// @access  Admin/HR Manager
+const deleteTermination = async (req, res) => {
+  try {
+    const { terminationId } = req.params;
+
+    // Find the termination record
+    const termination = await Termination.findOne({ terminationId });
+    
+    if (!termination) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Termination record not found' 
+      });
+    }
+
+    // Optional: Check if termination can be deleted based on status
+    // For example, prevent deletion of approved terminations
+    if (termination.status === 'approved') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete approved termination records. Please cancel or archive instead.' 
+      });
+    }
+
+    // Store employee info for response
+    const employeeInfo = {
+      employeeId: termination.employeeID,
+      terminationType: termination.terminationType,
+      status: termination.status
+    };
+
+    // Delete the termination record
+    await Termination.deleteOne({ terminationId });
+
+    // Log the deletion for audit purposes
+    console.log(`Termination record ${terminationId} deleted by user ${req.user?.id} at ${new Date().toISOString()}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'Termination record deleted successfully',
+      data: {
+        terminationId,
+        employee: employeeInfo
+      }
+    });
+
+  } catch (error) {
+    console.error('Error deleting termination:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error', 
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined 
+    });
+  }
+};
+
+// @desc    Get all termination records
+// @route   GET /api/terminations
+// @access  HR/Manager
+const getAllTerminations = async (req, res) => {
+  try {
+    const { status, type } = req.query;
+    let query = {};
+
+    if (status) query.status = status;
+    if (type) query.terminationType = type;
+
+    const terminations = await Termination.find(query)
+      .populate('employeeId', 'FirstName LastName EmployeeID Email')
+      .populate('reviewerId', 'FirstName LastName')
+      .populate('approvalDetails.approvedBy', 'FirstName LastName')
+      .sort('-createdAt');
+
+    res.status(200).json({
+      success: true,
+      count: terminations.length,
+      data: terminations
+    });
+  } catch (error) {
+    console.error('Error fetching terminations:', error);
+    res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+// @desc    Get single termination record
+// @route   GET /api/terminations/:terminationId
+// @access  HR/Manager/Employee
+const getTerminationById = async (req, res) => {
+  try {
+    const { terminationId } = req.params;
+
+    const termination = await Termination.findOne({ terminationId })
+      .populate('employeeId')
+      .populate('reviewerId', 'FirstName LastName Email')
+      .populate('approvalDetails.approvedBy', 'FirstName LastName')
+      .populate('createdBy', 'FirstName LastName');
+
+    if (!termination) {
+      return res.status(404).json({ success: false, message: 'Termination record not found' });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: termination
+    });
+  } catch (error) {
+    console.error('Error fetching termination:', error);
+    res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+// Helper function to generate experience and relieving letters
+const generateLetters = async (termination, employee) => {
+  try {
+    const doc = new PDFDocument();
+    const experienceLetterPath = `./uploads/letters/experience_${employee.EmployeeID}_${Date.now()}.pdf`;
+    const relievingLetterPath = `./uploads/letters/relieving_${employee.EmployeeID}_${Date.now()}.pdf`;
+
+    // Generate Experience Letter
+    const experienceStream = require('fs').createWriteStream(experienceLetterPath);
+    doc.pipe(experienceStream);
+    
+    doc.fontSize(20).text('EXPERIENCE CERTIFICATE', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(12).text(`This is to certify that ${employee.FullName} (Employee ID: ${employee.EmployeeID}) worked with us from ${new Date(employee.DateOfJoining).toLocaleDateString()} to ${new Date(termination.lastWorkingDay).toLocaleDateString()}.`);
+    doc.text(`During their tenure, they demonstrated excellent performance and dedication.`);
+    doc.text(`We wish them all the best in their future endeavors.`);
+    
+    doc.end();
+
+    // Generate Relieving Letter (similar process)
+    // ... (similar PDF generation for relieving letter)
+
+    // Update termination document with letter paths
+    termination.documents.experienceLetter = {
+      generated: true,
+      path: experienceLetterPath,
+      generatedAt: new Date()
+    };
+    termination.documents.relievingLetter = {
+      generated: true,
+      path: relievingLetterPath,
+      generatedAt: new Date()
+    };
+
+  } catch (error) {
+    console.error('Error generating letters:', error);
+  }
+};
+
+// Helper function to notify payroll
+const notifyPayroll = async (termination, employee) => {
+  try {
+    // Here you would integrate with your payroll system
+    // For now, we'll just update the termination record
+    termination.settlementDetails = {
+      payrollNotified: true,
+      notifiedAt: new Date()
+    };
+
+    console.log(`Payroll notified for employee: ${employee.EmployeeID}`);
+    
+    // You could also send an email or create a notification
+    // await sendEmailToPayroll(termination, employee);
+    
+  } catch (error) {
+    console.error('Error notifying payroll:', error);
+  }
+};
+
+module.exports = {
+  initiateTermination,
+  submitFeedback,
+  approveTermination,
+  getAllTerminations,
+  getTerminationById,
+  deleteTermination
+};
