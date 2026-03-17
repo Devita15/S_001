@@ -1,9 +1,8 @@
 // routes/HR/shiftRoutes.js
 const express = require('express');
 const router = express.Router();
-const shiftControllerPath = 'C:\\Users\\ayush\\Downloads\\suyash-enterprises (2)\\suyash-enterprises\\controllers\\HR\\shiftController.js';
-const shiftController = require(shiftControllerPath);const { protect } = require('../../middleware/authMiddleware');
-
+const shiftController =require("../../controllers/HR/shiftController");
+const {protect} =require("../../middleware/authMiddleware");
 router.use(protect);
 
 /**
