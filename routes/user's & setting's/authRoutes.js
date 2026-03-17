@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   register,
@@ -6,7 +6,7 @@ const {
   getProfile,
   changePassword,
   logout
-} = require('../controllers/authController');
+} = require("../../controllers/user's & setting's/authController");
 const { protect } = require('../../middleware/authMiddleware');
 
 /**

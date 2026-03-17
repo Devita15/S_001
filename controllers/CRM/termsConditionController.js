@@ -2,41 +2,12 @@ const TermsCondition = require('../../models/CRM/TermsCondition');
 
 const getTermsConditions = async (req, res) => {
   try {
-    const { 
-      page = 1, 
-      limit = 10, 
-      search 
-    } = req.query;
-    
-    // Build query
-    const query = {};
-    
-    // Add search functionality if search parameter is provided
-    if (search) {
-      query.$or = [
-        { Title: new RegExp(search, 'i') },
-        { Description: new RegExp(search, 'i') }
-      ];
-    }
-    
-    // Get total count for pagination
-    const total = await TermsCondition.countDocuments(query);
-    
-    // Fetch terms conditions with pagination
-    const termsConditions = await TermsCondition.find(query)
-      .sort({ Sequence: 1 })
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit));
+    const termsConditions = await TermsCondition.find()
+      .sort({ Sequence: 1 });
     
     res.json({ 
       success: true, 
-      data: termsConditions,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(total / limit),
-        totalItems: total,
-        itemsPerPage: parseInt(limit)
-      }
+      data: termsConditions 
     });
   } catch (error) {
     res.status(500).json({ 

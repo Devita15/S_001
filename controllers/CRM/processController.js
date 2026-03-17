@@ -1,4 +1,4 @@
-const Process = require('../../models/HR/Process');
+const Process = require('../../models/CRM/Process');
 
 // @desc    Get all processes
 // @route   GET /api/processes

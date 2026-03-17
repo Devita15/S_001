@@ -1,5 +1,5 @@
 const axios = require('axios');
-const BackgroundVerification = require('../models/BackgroundVerification');
+const BackgroundVerification = require('../models/HR/BackgroundVerification');
 const crypto = require('crypto');
 
 class BGVService {

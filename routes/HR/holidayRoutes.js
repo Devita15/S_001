@@ -1,7 +1,7 @@
-// routes/holidayRoutes.js
+﻿// routes/holidayRoutes.js
 const express = require('express');
 const router = express.Router();
-const holidayController = require('../controllers/holidayController');
+const holidayController = require('../../controllers/HR/holidayController');
 const { protect } = require('../../middleware/authMiddleware');
 
 router.use(protect);

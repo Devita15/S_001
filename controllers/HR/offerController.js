@@ -1,10 +1,10 @@
-const Offer = require('../models/Offer');
-const OfferApprovalFlow = require('../models/OfferApprovalFlow');
-const Candidate = require('../models/Candidate');
-const Application = require('../models/Application');
-const JobOpening = require('../models/JobOpening');
+﻿const Offer = require('../../models/HR/Offer');
+const OfferApprovalFlow = require('../../models/HR/OfferApprovalFlow');
+const Candidate = require('../../models/HR/Candidate');
+const Application = require('../../models/HR/Application');
+const JobOpening = require('../../models/HR/JobOpening');
 const Requisition = require('../../models/HR/Requisition');
-const User = require('../../models/User');
+const User = require('../../models/user\'s & setting\'s/User');
 const ctcCalculator = require('../../services/ctcCalculatorService');
 const pdfGenerator = require('../../services/playwrightPdfGenerator');
 const workflowService = require('../../services/workflowService');
@@ -16,7 +16,7 @@ const mongoose = require('mongoose');
 
 // In offerController.js, add this helper function at the top
 const generateOfferId = async () => {
-  const Offer = require('../models/Offer');
+  const Offer = require('../../models/HR/Offer');
   const year = new Date().getFullYear();
   const count = await Offer.countDocuments({
     offerId: new RegExp(`OFF-${year}-`, 'i')

@@ -1,12 +1,12 @@
 const mongoose = require('mongoose');
-const Employee = require('../models/Employee');
-const Salary = require('../models/Salary');
-const PerformanceReview = require('../models/PerformanceReview');
-const Increment = require('../models/Increment');
-const IncrementPolicy = require('../models/IncrementPolicy');
-const AttendanceProcessed = require('../models/AttendanceProcessed');
-const Production = require('../models/Production');
-const Accident = require('../models/Accident');
+const Employee = require('../models/HR/Employee');
+const Salary = require('../models/HR/Salary');
+const PerformanceReview = require('../models/HR/PerformanceReview');
+const Increment = require('../models/HR/Increment');
+const IncrementPolicy = require('../models/HR/IncrementPolicy');
+const AttendanceProcessed = require('../models/HR/AttendanceProcessed');
+const Production = require('../models/HR/Production');
+const Accident = require('../models/HR/Accident');
 
 class IncrementService {
   

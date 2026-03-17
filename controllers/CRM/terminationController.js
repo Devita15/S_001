@@ -1,6 +1,5 @@
-const Termination = require('../../models/HR/Termination');
-const Employee = require('../models/Employee');
-
+﻿const Termination = require('../../models/HR/Termination');
+const Employee = require('../../models/HR/Employee');
 const initiateTermination = async (req, res) => {
   try {
     const { employeeId, reason, lastWorkingDay, terminationType, initiatorType } = req.body;

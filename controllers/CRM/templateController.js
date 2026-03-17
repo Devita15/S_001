@@ -1,6 +1,6 @@
 const Template = require('../../models/CRM/Template');
 const TemplateProcessMapping = require('../../models/CRM/TemplateProcessMapping');
-const Process = require('../../models/HR/Process');
+const Process = require('../../models/CRM/Process');
 
 // @desc    Get all templates
 // @route   GET /api/templates

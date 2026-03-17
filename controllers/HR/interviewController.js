@@ -1,7 +1,7 @@
-const Interview = require('../models/Interview');
-const Application = require('../models/Application');
-const Candidate = require('../models/Candidate');
-const User = require('../../models/User');
+﻿const Interview = require('../../models/HR/Interview');
+const Application = require('../../models/HR/Application');
+const Candidate = require('../../models/HR/Candidate');
+const User = require('../../models/user\'s & setting\'s/User');
 const notificationService = require('../../services/notificationService');
 const auditService = require('../../services/auditService');
 const calendarService = require('../../services/calendarService');
@@ -10,7 +10,7 @@ const mongoose = require('mongoose');
 
 // In interviewController.js, add this helper function at the top
 const generateInterviewId = async () => {
-  const Interview = require('../models/Interview');
+  const Interview = require('../../models/HR/Interview');
   const year = new Date().getFullYear();
   const count = await Interview.countDocuments({
     interviewId: new RegExp(`INT-${year}-`, 'i')

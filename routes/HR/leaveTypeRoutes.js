@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getLeaveTypes,
@@ -6,7 +6,7 @@ const {
   createLeaveType,
   updateLeaveType,
   deleteLeaveType
-} = require('../controllers/leaveTypeController');
+} = require('../../controllers/HR/leaveTypeController');
 const { protect } = require('../../middleware/authMiddleware');
 router.use(protect);
 

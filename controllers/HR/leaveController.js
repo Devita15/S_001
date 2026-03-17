@@ -1,7 +1,7 @@
-const Leave = require('../models/Leave');
-const LeaveType = require('../models/LeaveType');
-const Employee = require('../models/Employee');
-const AttendanceProcessed = require('../models/AttendanceProcessed');
+﻿const Leave = require('../../models/HR/Leave');
+const LeaveType = require('../../models/HR/LeaveType');
+const Employee = require('../../models/HR/Employee');
+const AttendanceProcessed = require('../../models/HR/AttendanceProcessed');
 const mongoose = require('mongoose');
 
 // Calculate leave days function - Modified to include ALL days (including weekends)

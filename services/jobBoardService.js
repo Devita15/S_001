@@ -1,5 +1,5 @@
 const axios = require('axios');
-const JobBoardLog = require('../models/JobBoardLog');
+const JobBoardLog = require('../models/HR/JobBoardLog');
 
 class JobBoardService {
   

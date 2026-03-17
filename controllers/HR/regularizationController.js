@@ -1,7 +1,6 @@
 // controllers/regularizationController.js - FIXED
 const Regularization = require('../../models/HR/Regularization');
-const AttendanceProcessed = require('../models/AttendanceProcessed'); // FIX: Changed from service to model
-
+const AttendanceProcessed = require('../../models/HR/AttendanceProcessed');
 
 class RegularizationController {
   

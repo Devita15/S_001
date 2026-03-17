@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { protect } = require('../../middleware/authMiddleware');
 const {
@@ -7,7 +7,7 @@ const {
   updateCompanyFinancial,
   deleteCompanyFinancial,
   getCompanyFinancialStats
-} = require('../controllers/companyFinancialController');
+} = require("../../controllers/user's & setting's/companyFinancialController");
 
 // All routes are protected
 router.use(protect);

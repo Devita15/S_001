@@ -1,5 +1,4 @@
-const Customer = require('../models/Customer');
-
+﻿const Customer = require('../../models/CRM/Customer');
 // @desc    Get all customers
 // @route   GET /api/customers
 // @access  Public

@@ -1,7 +1,7 @@
-// routes/safetyRoutes.js
+﻿// routes/safetyRoutes.js
 const express = require('express');
 const router = express.Router();
-const safetyController = require('../controllers/safetyController');
+const safetyController = require('../../controllers/HR/safetyController');
 const upload = require('../../middleware/upload');
 
 /**

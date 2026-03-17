@@ -1,9 +1,8 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware')
-const pieceRateMasterController = require('../controllers/pieceRateMasterController');
-
+const pieceRateMasterController = require('../../controllers/HR/pieceRateMasterController');
 // All routes require authentication
 router.use(protect);
 

@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getDesignations,
@@ -6,7 +6,7 @@ const {
   createDesignation,
   updateDesignation,
   deleteDesignation
-} = require('../controllers/designationController');
+} = require('../../controllers/HR/designationController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // Public routes

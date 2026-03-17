@@ -1,7 +1,7 @@
 // routes/regularizationRoutes.js
 const express = require('express');
 const router = express.Router();
-const regularizationController = require('../controllers/regularizationController');
+const regularizationController = require('../../controllers/HR/regularizationController');
 const { protect } = require('../../middleware/authMiddleware');
 
 router.use(protect);

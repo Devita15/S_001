@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   uploadDocument,
@@ -7,7 +7,7 @@ const {
   getDocumentById,
   generateUploadUrl,
   downloadDocument
-} = require('../controllers/documentController');
+} = require('../../controllers/HR/documentController');
 const { protect } = require('../../middleware/authMiddleware');
 const upload = require('../../middleware/uploadMiddleware');
 const { validate } = require('../../middleware/validationMiddleware');

@@ -1,6 +1,6 @@
-// controllers/employeeBehaviorController.js
-const EmployeeBehavior = require('../models/EmployeeBehavior');
-const Employee = require('../models/Employee');
+﻿// controllers/employeeBehaviorController.js
+const EmployeeBehavior = require('../../models/HR/EmployeeBehavior');
+const Employee = require('../../models/HR/Employee');
 const mongoose = require('mongoose');
 const auditService = require('../../services/auditService');
 const fs = require('fs');

@@ -1,6 +1,6 @@
-const MediclaimPolicy = require('../models/MediclaimPolicy');
-const MediclaimEnrollment = require('../models/MediclaimEnrollment');
-const Employee = require('../models/Employee');
+const MediclaimPolicy = require('../models/HR/MediclaimPolicy');
+const MediclaimEnrollment = require('../models/HR/MediclaimEnrollment');
+const Employee = require('../models/HR/Employee');
 const emailService = require('./emailService');
 
 /**

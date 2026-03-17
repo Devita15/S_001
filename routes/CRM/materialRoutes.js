@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getMaterials,
@@ -7,7 +7,7 @@ const {
   updateMaterial,
   deleteMaterial,
   getMaterialsDropdown
-} = require('../controllers/materialController');
+} = require('../../controllers/CRM/materialController');
 const { protect } = require('../../middleware/authMiddleware');
 
 /**

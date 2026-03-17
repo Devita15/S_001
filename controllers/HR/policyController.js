@@ -1,7 +1,7 @@
-const MediclaimPolicy = require('../models/MediclaimPolicy');
-const MediclaimEnrollment = require('../models/MediclaimEnrollment');
-const MediclaimClaim = require('../models/MediclaimClaim');
-const Employee = require('../models/Employee');
+﻿const MediclaimPolicy = require('../../models/HR/MediclaimPolicy');
+const MediclaimEnrollment = require('../../models/HR/MediclaimEnrollment');
+const MediclaimClaim = require('../../models/HR/MediclaimClaim');
+const Employee = require('../../models/HR/Employee');
 const emailService = require('../../services/emailService');
 
 exports.createPolicy = async (req, res) => {

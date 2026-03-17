@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getCustomers,
@@ -6,7 +6,7 @@ const {
   createCustomer,
   updateCustomer,
   deleteCustomer
-} = require('../controllers/customerController');
+} = require('../../controllers/CRM/customerController');
 const { protect } = require('../../middleware/authMiddleware');
 
 router.get('/',protect, getCustomers);

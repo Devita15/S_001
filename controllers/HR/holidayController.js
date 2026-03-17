@@ -1,6 +1,5 @@
-// controllers/holidayController.js
-const Holiday = require('../models/Holiday');
-
+﻿// controllers/holidayController.js
+const Holiday = require('../../models/HR/Holiday');
 class HolidayController {
   
   // Create holiday

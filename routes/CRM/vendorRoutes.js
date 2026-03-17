@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getVendors,
@@ -7,7 +7,7 @@ const {
   updateVendor,
   deleteVendor,
   getVendorsDropdown
-} = require('../controllers/vendorController');
+} = require('../../controllers/CRM/vendorController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected

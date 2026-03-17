@@ -1,8 +1,8 @@
 // services/employeeHistoryService.js
-const Employee = require('../models/Employee');
+const Employee = require('../models/HR/Employee');
 const Salary = require('../models/HR/Salary');
 const Termination = require('../models/HR/Termination');
-const Document = require('../models/Document');
+const Document = require('../models/HR/Document');
 const mongoose = require('mongoose');
 
 class EmployeeHistoryService {

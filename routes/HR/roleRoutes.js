@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getRoles,
@@ -8,7 +8,7 @@ const {
   deleteRole,
   getRoleStats,
   getRolesDropdown
-} = require('../controllers/roleController');
+} = require('../../controllers/HR/roleController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // router.use(protect);

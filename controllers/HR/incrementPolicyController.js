@@ -1,4 +1,4 @@
-const IncrementPolicy = require('../models/IncrementPolicy');
+﻿const IncrementPolicy = require('../../models/HR/IncrementPolicy');
 const mongoose = require('mongoose');
 
 const incrementPolicyController = {

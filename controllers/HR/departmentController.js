@@ -1,5 +1,4 @@
-const Department = require('../models/Department');
-
+﻿const Department = require('../../models/HR/Department');
 // @desc    Get all departments
 // @route   GET /api/departments
 // @access  Public
@@ -222,7 +221,7 @@ const deleteDepartment = async (req, res) => {
     }
     
     // Check if department has employees
-    const Employee = require('../models/Employee');
+    const Employee = require('../../models/HR/Employee');
     const employeeCount = await Employee.countDocuments({ DepartmentID: department._id });
     
     if (employeeCount > 0) {

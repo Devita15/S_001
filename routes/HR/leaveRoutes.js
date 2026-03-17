@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   applyLeave,
@@ -10,7 +10,7 @@ const {
   getLeaveReport,
   updateLeave,
   deleteLeave
-} = require('../controllers/leaveController');
+} = require('../../controllers/HR/leaveController');
 const { protect } = require('../../middleware/authMiddleware');
 
 

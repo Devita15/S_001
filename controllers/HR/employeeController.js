@@ -1,10 +1,10 @@
-// controllers/employeeController.js
-const Employee = require('../models/Employee');
+﻿// controllers/employeeController.js
+const Employee = require('../../models/HR/Employee');
 const Salary = require('../../models/HR/Salary');
-const EmployeeBehavior = require('../models/EmployeeBehavior');
-const Department = require('../models/Department');
-const Designation = require('../models/Designation');
-const User = require('../../models/User');
+const EmployeeBehavior = require('../../models/HR/EmployeeBehavior');
+const Department = require('../../models/HR/Department');
+const Designation = require('../../models/HR/Designation');
+const User = require('../../models/user\'s & setting\'s/User');
 const mongoose = require('mongoose');
 
 /**
@@ -883,8 +883,8 @@ const hardDeleteEmployee = async (req, res) => {
     }
 
     // Check for related records
-    const Attendance = require('../models/Attendance');
-    const Leave = require('../models/Leave');
+    const Attendance = require('../../models/HR/Attendance');
+    const Leave = require('../../models/HR/Leave');
     const Salary = require('../../models/HR/Salary');
     
     const hasAttendance = await Attendance.exists({ EmployeeID: employee._id });

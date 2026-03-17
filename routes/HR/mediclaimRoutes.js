@@ -1,10 +1,10 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware');
-const policyController = require('../controllers/policyController');
-const enrollmentController = require('../controllers/enrollmentController');
-const claimController = require('../controllers/claimController');
+const policyController = require('../../controllers/HR/policyController');
+const enrollmentController = require('../../controllers/HR/enrollmentController');
+const claimController = require('../../controllers/HR/claimController');
 
 // ==================== POLICY ROUTES ====================
 // All policy routes require authentication and HR role

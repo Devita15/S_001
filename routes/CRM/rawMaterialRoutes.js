@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getRawMaterials,
@@ -9,7 +9,7 @@ const {
   deleteRawMaterial,
   getRawMaterialsDropdown,
   bulkCreateRawMaterials
-} = require('../controllers/rawMaterialController');
+} = require('../../controllers/CRM/rawMaterialController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected

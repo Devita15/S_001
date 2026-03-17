@@ -1,5 +1,5 @@
-// controllers/bgvController.js
-const BackgroundVerification = require('../models/BackgroundVerification');
+﻿// controllers/bgvController.js
+const BackgroundVerification = require('../../models/HR/BackgroundVerification');
 const mongoose = require('mongoose');
 
 // @desc    Initiate background verification

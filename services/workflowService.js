@@ -1,5 +1,5 @@
-const OfferApprovalFlow = require('../models/OfferApprovalFlow');
-const User = require('../models/User');
+const OfferApprovalFlow = require('../models/HR/OfferApprovalFlow');
+const User = require("../models/user's & setting's/User");
 const notificationService = require('./notificationService');
 
 class WorkflowService {
@@ -95,7 +95,7 @@ class WorkflowService {
           approvalFlow.completedAt = new Date();
           
           // Update offer status
-          const Offer = require('../models/Offer');
+          const Offer = require('../models/HR/Offer');
           await Offer.findByIdAndUpdate(approvalFlow.offerId._id, {
             status: 'approved'
           });
@@ -105,7 +105,7 @@ class WorkflowService {
         approvalFlow.completedAt = new Date();
         
         // Update offer status
-        const Offer = require('../models/Offer');
+        const Offer = require('../models/HR/Offer');
         await Offer.findByIdAndUpdate(approvalFlow.offerId._id, {
           status: 'rejected'
         });
@@ -169,7 +169,7 @@ class WorkflowService {
         await flow.save();
 
         // Update offer
-        const Offer = require('../models/Offer');
+        const Offer = require('../models/HR/Offer');
         await Offer.findByIdAndUpdate(flow.offerId, {
           status: 'expired'
         });

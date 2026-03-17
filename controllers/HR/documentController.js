@@ -1,5 +1,5 @@
-// controllers/documentController.js
-const Document = require('../models/Document');
+﻿// controllers/documentController.js
+const Document = require('../../models/HR/Document');
 const cloudStorage = require('../../services/cloudStorageService');
 const mongoose = require('mongoose');
 

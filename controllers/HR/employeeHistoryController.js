@@ -76,7 +76,7 @@ class EmployeeHistoryController {
       const { year, limit = 12 } = req.query;
       
       // Find employee first
-      const Employee = require('../models/Employee');
+      const Employee = require('../../models/HR/Employee');
       let employee;
       
       if (mongoose.Types.ObjectId.isValid(employeeId)) {

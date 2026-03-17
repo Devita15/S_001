@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   initiateBGV,
@@ -7,7 +7,7 @@ const {
   handleWebhook,
   getAllBGV,
   decideBGV
-} = require('../controllers/bgvController');
+} = require('../../controllers/HR/bgvController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // Public webhook endpoint (no auth)

@@ -1,7 +1,7 @@
-// routes/employeeHistoryRoutes.js
+﻿// routes/employeeHistoryRoutes.js
 const express = require('express');
 const router = express.Router();
-const employeeHistoryController = require('../controllers/employeeHistoryController');
+const employeeHistoryController = require('../../controllers/HR/employeeHistoryController');
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware');
 

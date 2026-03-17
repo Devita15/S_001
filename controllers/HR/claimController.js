@@ -1,6 +1,6 @@
-const MediclaimClaim = require('../models/MediclaimClaim');
-const MediclaimEnrollment = require('../models/MediclaimEnrollment');
-const Employee = require('../models/Employee');
+﻿const MediclaimClaim = require('../../models/HR/MediclaimClaim');
+const MediclaimEnrollment = require('../../models/HR/MediclaimEnrollment');
+const Employee = require('../../models/HR/Employee');
 const emailService = require('../../services/emailService');
 
 exports.submitClaim = async (req, res) => {

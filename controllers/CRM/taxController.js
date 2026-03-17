@@ -24,7 +24,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const mongoose = require('mongoose');
-const Tax      = require('../../models/HR/Tax');
+const Tax      = require('../../models/CRM/Tax');
 
 // Valid Indian GST rates — also defined in model, kept here for response messages
 const VALID_GST_RATES = [0, 0.1, 0.25, 1, 1.5, 3, 5, 7.5, 12, 18, 28];

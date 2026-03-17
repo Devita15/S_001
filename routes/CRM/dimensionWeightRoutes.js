@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getDimensionWeights,
@@ -6,7 +6,7 @@ const {
   createDimensionWeight,
   updateDimensionWeight,
   deleteDimensionWeight
-} = require('../controllers/dimensionWeightController');
+} = require('../../controllers/CRM/dimensionWeightController');
 const { protect } = require('../../middleware/authMiddleware');
 
 /**

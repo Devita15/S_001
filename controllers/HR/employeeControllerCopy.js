@@ -1,6 +1,6 @@
-const Employee = require('../models/Employee');
-const Department = require('../models/Department');
-const Designation = require('../models/Designation');
+﻿const Employee = require('../../models/HR/Employee');
+const Department = require('../../models/HR/Department');
+const Designation = require('../../models/HR/Designation');
 
 // @desc    Get all employees
 // @route   GET /api/employees
@@ -260,10 +260,10 @@ const deleteEmployee = async (req, res) => {
     }
 
     // Check if employee has related records
-    const Attendance = require('../models/Attendance');
-    const Leave = require('../models/Leave');
+    const Attendance = require('../../models/HR/Attendance');
+    const Leave = require('../../models/HR/Leave');
     const Salary = require('../../models/HR/Salary');
-    const Performance = require('../models/Performance');
+    const Performance = require('../../models/HR/Performance');
     
     const attendanceCount = await Attendance.countDocuments({ EmployeeID: employee._id });
     const leaveCount = await Leave.countDocuments({ EmployeeID: employee._id });

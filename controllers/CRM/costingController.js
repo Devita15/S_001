@@ -1,10 +1,10 @@
-const Costing = require('../models/Costing');
-const Item = require('../models/Item');
+﻿const Costing = require('../../models/CRM/Costing');
+const Item = require('../../models/CRM/Item');
 const Vendor = require('../../models/CRM/Vendor');
-const Process = require('../../models/HR/Process');
+const Process = require('../../models/CRM/Process');
 const RawMaterial = require('../../models/CRM/RawMaterial');
-const Tax = require('../../models/HR/Tax');
-const Company = require('../models/Company');
+const Tax = require('../../models/CRM/Tax');  // Note: Tax appears to be in CRM, not HR
+const Company = require('../../models/user\'s & setting\'s/Company');
 const Template = require('../../models/CRM/Template');
 // @desc    Get all costings
 // @route   GET /api/costings

@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   initiateTermination,
@@ -7,7 +7,7 @@ const {
   getAllTerminations,
   getTerminationById,
   deleteTermination
-} = require('../controllers/terminationController');
+} = require('../../controllers/HR/terminationController');
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware')
 // All routes require authentication

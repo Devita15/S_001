@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   initiateOffer,
@@ -13,7 +13,7 @@ const {
   getCandidateApprovedOffers,
   getOffers
 
-} = require('../controllers/offerController');
+} = require('../../controllers/HR/offerController');
 const { protect } = require('../../middleware/authMiddleware');
 const { validate } = require('../../middleware/validationMiddleware');
 const { body } = require('express-validator');

@@ -1,6 +1,6 @@
-const Requisition = require('../../models/HR/Requisition');
-const ApprovalFlow = require('../models/ApprovalFlow');
-const User = require('../../models/User');
+﻿const Requisition = require('../../models/HR/Requisition');
+const ApprovalFlow = require('../../models/HR/ApprovalFlow');
+const User = require('../../models/user\'s & setting\'s/User');
 const notificationService = require('../../services/notificationService');
 const auditService = require('../../services/auditService');
 const documentService = require('../../services/documentService');

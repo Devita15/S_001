@@ -1,4 +1,4 @@
-// routes/employeeBehaviorRoutes.js
+﻿// routes/employeeBehaviorRoutes.js
 const express = require('express');
 const router = express.Router();
 const upload = require('../../middleware/upload');
@@ -13,7 +13,7 @@ const {
   getPendingCases,
   getAllBehavior,
   deleteAttachment
-} = require('../controllers/employeeBehaviorController');
+} = require('../../controllers/HR/employeeBehaviorController');
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware');
 

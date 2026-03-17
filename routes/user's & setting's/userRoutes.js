@@ -1,11 +1,11 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getAllUsers,
   getUserById,
   updateUser,
   deleteUser,
-} = require('../controllers/userController');
+} = require("../../controllers/user's & setting's/userController");
 const { protect, authorize } = require('../../middleware/authMiddleware');
 
 /**

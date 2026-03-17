@@ -1,6 +1,6 @@
-const JobOpening = require('../models/JobOpening');
+﻿const JobOpening = require('../../models/HR/JobOpening');
 const Requisition = require('../../models/HR/Requisition');
-const User = require('../../models/User');
+const User = require('../../models/user\'s & setting\'s/User');
 const notificationService = require('../../services/notificationService');
 const auditService = require('../../services/auditService');
 const jobBoardService = require('../../services/jobBoardService');
@@ -8,7 +8,7 @@ const mongoose = require('mongoose');
 
 // In jobController.js, add this helper function at the top
 const generateJobId = async () => {
-  const JobOpening = require('../models/JobOpening');
+  const JobOpening = require('../../models/HR/JobOpening');
   const year = new Date().getFullYear();
   const count = await JobOpening.countDocuments({
     jobId: new RegExp(`JOB-${year}-`, 'i')
@@ -292,7 +292,7 @@ const getJobs = async (req, res) => {
     ]);
 
     // Add application counts
-    const Application = require('../models/Application');
+    const Application = require('../../models/HR/Application');
     for (let job of jobs) {
       job.applicationCount = await Application.countDocuments({ jobId: job._id });
     }
@@ -345,7 +345,7 @@ const getJobById = async (req, res) => {
     }
 
     // Get applications for this job
-    const Application = require('../models/Application');
+    const Application = require('../../models/HR/Application');
     const applications = await Application.find({ jobId: job._id })
       .populate('candidateId', 'firstName lastName email phone')
       .sort('-createdAt')

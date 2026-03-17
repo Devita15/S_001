@@ -1,6 +1,6 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
-const incrementController = require('../controllers/incrementController');
+const incrementController = require('../../controllers/HR/incrementController');
 const { protect, authorize } = require('../../middleware/authMiddleware');
 
 // Protect all routes

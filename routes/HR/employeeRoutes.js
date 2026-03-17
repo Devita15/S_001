@@ -1,4 +1,4 @@
-// routes/employeeRoutes.js
+﻿// routes/employeeRoutes.js
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
@@ -12,7 +12,7 @@ const {
   hardDeleteEmployee,
   getEmployeeStats,
   getEmployeeYearlySummary
-} = require('../controllers/employeeController');
+} = require('../../controllers/HR/employeeController');
 
 // Middleware imports
 const { protect } = require('../../middleware/authMiddleware');

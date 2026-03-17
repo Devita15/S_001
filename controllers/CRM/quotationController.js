@@ -73,15 +73,15 @@
 
 const Quotation            = require('../../models/CRM/Quotation');
 const QuotationItemProcess = require('../../models/CRM/QuotationItemProcess');
-const Company              = require('../models/Company');
+const Company              = require('../../models/user\'s & setting\'s/Company');
 const Vendor               = require('../../models/CRM/Vendor');
-const Item                 = require('../models/Item');
+const Item                 = require('../../models/CRM/Item');
 const RawMaterial          = require('../../models/CRM/RawMaterial');
-const Process              = require('../../models/HR/Process');
-const Tax                  = require('../../models/HR/Tax');
+const Process              = require('../../models/CRM/Process');
+const Tax                  = require('../../models/CRM/Tax');
 const TermsCondition       = require('../../models/CRM/TermsCondition');
 const Template             = require('../../models/CRM/Template');
-const DimensionWeight      = require('../models/DimensionWeight');
+const DimensionWeight      = require('../../models/CRM/DimensionWeight');
 const ExcelJS              = require('exceljs');
 const { generateQuotationExcel } = require('../../utils/excelGenerators');
 

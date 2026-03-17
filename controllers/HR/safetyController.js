@@ -1,12 +1,12 @@
-// controllers/safetyController.js
+﻿// controllers/safetyController.js
 const PPEMaster = require('../../models/HR/PPEMaster');
 const PPEIssuance = require('../../models/HR/PPEIssuance');
 const SafetyTraining = require('../../models/HR/SafetyTraining');
-const EmployeeTrainingRecord = require('../models/EmployeeTrainingRecord');
-const Accident = require('../models/Accident');
-const MedicalRecord = require('../models/MedicalRecord');
+const EmployeeTrainingRecord = require('../../models/HR/EmployeeTrainingRecord');
+const Accident = require('../../models/HR/Accident');
+const MedicalRecord = require('../../models/HR/MedicalRecord');
 const PPEInventory = require('../../models/HR/PPEInventory');
-const Employee = require('../models/Employee');
+const Employee = require('../../models/HR/Employee');
 
 // PPE Controllers
 exports.createPPE = async (req, res) => {

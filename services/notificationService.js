@@ -1,5 +1,5 @@
-const Notification = require('../models/Notification');
-const User = require('../models/User');
+const Notification = require('../models/HR/Notification');
+const User = require("../models/user's & setting's/User");
 
 class NotificationService {
   

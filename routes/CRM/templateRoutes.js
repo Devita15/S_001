@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getTemplates,
@@ -7,7 +7,7 @@ const {
   updateTemplate,
   deleteTemplate,
   getTemplatesDropdown
-} = require('../controllers/templateController');
+} = require('../../controllers/CRM/templateController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected

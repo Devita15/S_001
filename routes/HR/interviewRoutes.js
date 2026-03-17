@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   scheduleInterview,
@@ -7,7 +7,7 @@ const {
   submitFeedback,
   getInterviews,
   getInterviewById
-} = require('../controllers/interviewController');
+} = require('../../controllers/HR/interviewController');
 const { protect } = require('../../middleware/authMiddleware');
 const { validate, interviewValidation, feedbackValidation, validateId } = require('../../middleware/validationMiddleware');
 

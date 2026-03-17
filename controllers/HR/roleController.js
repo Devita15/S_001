@@ -1,5 +1,4 @@
-const Role = require('../../models/Role');
-
+﻿const Role = require('../../models/user\'s & setting\'s/Role');
 // @desc    Get all roles
 // @route   GET /api/roles
 // @access  Public

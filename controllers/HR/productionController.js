@@ -1,6 +1,6 @@
-const Production = require('../../models/HR/Production');
-const Employee = require('../models/Employee');
-const PieceRateMaster = require('../../models/HR/PieceRateMaster'); 
+﻿const Production = require('../../models/HR/Production');
+const Employee = require('../../models/HR/Employee');
+const PieceRateMaster = require('../../models/HR/PieceRateMaster');
 const mongoose = require('mongoose');
 
 class ProductionController {

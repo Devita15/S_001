@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const upload = require('../../middleware/uploadMiddleware');
 const {
@@ -11,7 +11,7 @@ const {
   shortlistCandidate,
   updateCandidate, 
   updateCandidateResume,
-} = require('../controllers/candidateController');
+} = require('../../controllers/HR/candidateController');
 const { protect } = require('../../middleware/authMiddleware');
 const { validate, candidateValidation, validateId } = require('../../middleware/validationMiddleware');
 

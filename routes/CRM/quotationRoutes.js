@@ -1,10 +1,10 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getQuotations,
   getQuotation,
   createQuotation
-} = require('../controllers/quotationController');
+} = require('../../controllers/CRM/quotationController');
 const { protect } = require('../../middleware/authMiddleware');
 
 /**

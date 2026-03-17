@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getEmployees,
@@ -7,7 +7,7 @@ const {
   updateEmployee,
   deleteEmployee,
   getEmployeeStats
-} = require('../controllers/employeeController');
+} = require('../../controllers/HR/employeeController');
 const { protect } = require('../../middleware/authMiddleware');
 const { authorize } = require('../../middleware/roleMiddleware');
 

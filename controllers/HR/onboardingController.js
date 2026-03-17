@@ -1,6 +1,6 @@
-// controllers/onboardingController.js
-const EmployeeOnboarding = require('../models/EmployeeOnboarding');
-const Employee = require('../models/Employee');
+﻿// controllers/onboardingController.js
+const EmployeeOnboarding = require('../../models/HR/EmployeeOnboarding');
+const Employee = require('../../models/HR/Employee');
 const mongoose = require('mongoose');
 
 // @desc    Create Onboarding Record

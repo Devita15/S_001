@@ -1,5 +1,4 @@
-const LeaveType = require('../models/LeaveType');
-
+﻿const LeaveType = require('../../models/HR/LeaveType');
 // @desc    Get all leave types
 // @route   GET /api/leavetypes
 // @access  Public
@@ -225,7 +224,7 @@ const deleteLeaveType = async (req, res) => {
     }
     
     // Check if leave type has any leave records
-    const Leave = require('../models/Leave');
+    const Leave = require('../../models/HR/Leave');
     const leaveCount = await Leave.countDocuments({ LeaveTypeID: leaveType._id });
     
     if (leaveCount > 0) {

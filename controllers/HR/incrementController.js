@@ -1,5 +1,5 @@
-const EmployeeIncrement = require('../models/EmployeeIncrement');
-const Employee = require('../models/Employee');
+﻿const EmployeeIncrement = require('../../models/HR/EmployeeIncrement');
+const Employee = require('../../models/HR/Employee');
 const PieceRateMaster = require('../../models/HR/PieceRateMaster');
 const incrementCalculationService = require('../../services/incrementCalculationService');
 const mongoose = require('mongoose');

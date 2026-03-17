@@ -1,7 +1,6 @@
-// controllers/processDetailController.js
+﻿// controllers/processDetailController.js
 const ProcessDetail = require('../../models/CRM/ProcessDetail');
-const Item = require('../models/Item');
-
+const Item = require('../../models/CRM/Item');
 // @desc    Get all process details
 // @route   GET /api/process-details
 // @access  Private

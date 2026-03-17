@@ -1,11 +1,11 @@
-// routes/onboardingRoutes.js
+﻿// routes/onboardingRoutes.js
 const express = require('express');
 const router = express.Router();
 const {
   createOnboarding,
   getOnboardingDetails,
   updateOnboardingStatus
-} = require('../controllers/onboardingController');
+} = require('../../controllers/HR/onboardingController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected and require HR/Admin access

@@ -1,9 +1,9 @@
-// controllers/appointmentLetterController.js
-const Employee = require('../models/Employee');
-const Candidate = require('../models/Candidate');
-const Offer = require('../models/Offer');
-const Document = require('../models/Document');
-const EmployeeOnboarding = require('../models/EmployeeOnboarding');
+﻿// controllers/appointmentLetterController.js
+const Employee = require('../../models/HR/Employee');
+const Candidate = require('../../models/HR/Candidate');
+const Offer = require('../../models/HR/Offer');
+const Document = require('../../models/HR/Document');
+const EmployeeOnboarding = require('../../models/HR/EmployeeOnboarding');
 const appointmentLetterService = require('../../services/appointmentLetterService');
 const emailService = require('../../services/emailService');
 const mongoose = require('mongoose');

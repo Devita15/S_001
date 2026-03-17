@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const uploadCompanyLogo = require('../../middleware/upload');
 const {
@@ -7,7 +7,7 @@ const {
   createCompany,
   updateCompany,
   deleteCompany
-} = require('../controllers/companyController');
+} = require("../../controllers/user's & setting's/companyController");
 const { protect } = require('../../middleware/authMiddleware');
 
 /**

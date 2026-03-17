@@ -1,5 +1,4 @@
-const Item = require('../models/Item');
-
+﻿const Item = require('../../models/CRM/Item');
 // @desc    Get all items
 // @route   GET /api/items
 // @access  Private

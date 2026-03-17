@@ -1,6 +1,6 @@
-const Employee = require('../models/Employee');
+const Employee = require('../models/HR/Employee');
 const PieceRateMaster = require('../models/HR/PieceRateMaster');
-const IncrementPolicy = require('../models/IncrementPolicy');
+const IncrementPolicy = require('../models/HR/IncrementPolicy');
 const behaviorScoreService = require('./behaviorScoreService');
 
 class IncrementCalculationService {

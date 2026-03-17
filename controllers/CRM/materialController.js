@@ -1,5 +1,4 @@
-const Material = require('../models/Material');
-
+﻿const Material = require('../../models/CRM/Material');
 // @desc    Get all materials
 // @route   GET /api/materials
 // @access  Private
@@ -208,7 +207,7 @@ const deleteMaterial = async (req, res) => {
     }
     
     // Check if material is used in items
-    const Item = require('../models/Item');
+    const Item = require('../../models/CRM/Item');
     const itemCount = await Item.countDocuments({ MaterialID: req.params.id, IsActive: true });
     
     if (itemCount > 0) {

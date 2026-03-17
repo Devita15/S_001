@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   createRequisition,
@@ -11,7 +11,7 @@ const {
   addComment,
   getRequisitionStats,
   deleteRequisition
-} = require('../controllers/requisitionController');
+} = require('../../controllers/HR/requisitionController');
 const { protect } = require('../../middleware/authMiddleware');
 const { validate, requisitionValidation, validateId } = require('../../middleware/validationMiddleware');
 

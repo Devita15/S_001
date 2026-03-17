@@ -1,6 +1,6 @@
-// controllers/salaryController.js
+﻿// controllers/salaryController.js
 const Salary = require('../../models/HR/Salary');
-const Employee = require('../models/Employee');
+const Employee = require('../../models/HR/Employee');
 const mongoose = require('mongoose');
 
 class SalaryController {

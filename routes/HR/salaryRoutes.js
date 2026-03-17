@@ -1,7 +1,7 @@
-// routes/salaryRoutes.js
+﻿// routes/salaryRoutes.js
 const express = require('express');
 const router = express.Router();
-const salaryController = require('../controllers/salaryController');
+const salaryController = require('../../controllers/HR/salaryController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes require authentication

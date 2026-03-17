@@ -1,6 +1,6 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
-const incrementPolicyController = require('../controllers/incrementPolicyController');
+const incrementPolicyController = require('../../controllers/HR/incrementPolicyController');
 const { protect, authorize } = require('../../middleware/authMiddleware');
 
 // All routes require authentication and admin/HR role

@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getCostings,
@@ -7,7 +7,7 @@ const {
   updateCostingStatus,
   deleteCosting,
   calculateLine
-} = require('../controllers/costingController');
+} = require('../../controllers/CRM/costingController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected

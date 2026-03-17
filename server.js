@@ -23,52 +23,52 @@ const { setupSwagger } = require('./config/swagger');
 // Connect to database
 connectDB();
 
-// Import route files
-const shiftRoutes = require('./routes/shiftRoutes');
-const regularizationRoutes = require('./routes/regularizationRoutes');
-const holidayRoutes = require('./routes/holidayRoutes');
-const safetyRoutes = require('./routes/safetyRoutes');
-const productionRoutes = require('./routes/productionRoutes');
-const authRoutes = require('./routes/authRoutes');
-const employeeRoutes = require('./routes/employeeRoutes');
-const roleRoutes = require('./routes/roleRoutes');
-const departmentRoutes = require('./routes/departmentRoutes');
-const designationRoutes = require('./routes/designationRoutes');
-const leaveTypeRoutes = require('./routes/leaveTypeRoutes');
-const leaveRoutes = require('./routes/leaveRoutes');
-const companyRoutes = require('./routes/companyRoutes');
-const costingRoutes = require('./routes/costingRoutes');
-const customerRoutes = require('./routes/customerRoutes');
-const dimensionWeightRoutes = require('./routes/dimensionWeightRoutes');
-const itemRoutes = require('./routes/itemRoutes');
-const processRoutes = require('./routes/processRoutes');
-const quotationRoutes = require('./routes/quotationRoutes');
-const rawMaterialRoutes = require('./routes/rawMaterialRoutes');
-const taxRoutes = require('./routes/taxRoutes');
-const termsConditionRoutes = require('./routes/termsConditionRoutes');
-const materialRoutes = require('./routes/materialRoutes');
-const salaryRoutes = require('./routes/salaryRoutes');
-const userRoutes = require('./routes/userRoutes');
-const requisitionRoutes = require('./routes/requisitionRoutes');
-const notificationRoutes = require('./routes/notificationRoutes');
-const jobRoutes = require('./routes/jobRoutes');
-const candidateRoutes = require('./routes/candidateRoutes');
-const interviewRoutes = require('./routes/interviewRoutes');
-const offerRoutes = require('./routes/offerRoutes');
-const documentRoutes = require('./routes/documentRoutes');
-const bgvRoutes = require('./routes/bgvRoutes');
-const mediclaimRoutes = require('./routes/mediclaimRoutes');
-const incrementRoutes = require('./routes/incrementRoutes');
-const onboardingRoutes = require('./routes/onboardingRoutes');
-const pieceRateMasterRoutes = require('./routes/pieceRateMasterRoutes');
-const terminationRoutes = require('./routes/terminationRoutes');
-const appointmentLetterRoutes = require('./routes/appointmentLetterRoutes');
-const employeeBehaviorRoutes = require('./routes/employeeBehaviorRoutes');
-const processDetailRoutes = require('./routes/processDetailRoutes');
-const companyFinancialRoutes = require('./routes/companyFinancialRoutes');
-const vendorRoutes = require('./routes/vendorRoutes');
-const employeeHistoryRoutes = require('./routes/employeeHistoryRoutes');
-const templateRoutes = require('./routes/templateRoutes');
+// Import route files - CORRECTED PATHS with proper apostrophes
+const shiftRoutes = require('./routes/HR/shiftRoutes');
+const regularizationRoutes = require('./routes/HR/regularizationRoutes');
+const holidayRoutes = require('./routes/HR/holidayRoutes');
+const safetyRoutes = require('./routes/HR/safetyRoutes');
+const productionRoutes = require('./routes/CRM/productionRoutes');
+const authRoutes = require('./routes/user\'s & setting\'s/authRoutes');              // Fixed: added apostrophe
+const employeeRoutes = require('./routes/HR/employeeRoutes');
+const roleRoutes = require('./routes/user\'s & setting\'s/roleRoutes');              // Fixed: added apostrophe
+const departmentRoutes = require('./routes/HR/departmentRoutes');
+const designationRoutes = require('./routes/HR/designationRoutes');
+const leaveTypeRoutes = require('./routes/HR/leaveTypeRoutes');
+const leaveRoutes = require('./routes/HR/leaveRoutes');
+const companyRoutes = require('./routes/user\'s & setting\'s/companyRoutes');        // Fixed: added apostrophe
+const costingRoutes = require('./routes/CRM/costingRoutes');
+const customerRoutes = require('./routes/CRM/customerRoutes');
+const dimensionWeightRoutes = require('./routes/CRM/dimensionWeightRoutes');
+const itemRoutes = require('./routes/CRM/itemRoutes');
+const processRoutes = require('./routes/CRM/processRoutes');
+const quotationRoutes = require('./routes/CRM/quotationRoutes');
+const rawMaterialRoutes = require('./routes/CRM/rawMaterialRoutes');
+const taxRoutes = require('./routes/CRM/taxRoutes');
+const termsConditionRoutes = require('./routes/CRM/termsConditionRoutes');
+const materialRoutes = require('./routes/CRM/materialRoutes');
+const salaryRoutes = require('./routes/HR/salaryRoutes');
+const userRoutes = require('./routes/user\'s & setting\'s/userRoutes');              // Fixed: added apostrophe
+const requisitionRoutes = require('./routes/HR/requisitionRoutes');
+const notificationRoutes = require('./routes/HR/notificationRoutes');
+const jobRoutes = require('./routes/HR/jobRoutes');
+const candidateRoutes = require('./routes/HR/candidateRoutes');
+const interviewRoutes = require('./routes/HR/interviewRoutes');
+const offerRoutes = require('./routes/HR/offerRoutes');
+const documentRoutes = require('./routes/HR/documentRoutes');
+const bgvRoutes = require('./routes/HR/bgvRoutes');
+const mediclaimRoutes = require('./routes/HR/mediclaimRoutes');
+const incrementRoutes = require('./routes/CRM/incrementRoutes');
+const onboardingRoutes = require('./routes/HR/onboardingRoutes');
+const pieceRateMasterRoutes = require('./routes/CRM/pieceRateMasterRoutes');
+const terminationRoutes = require('./routes/HR/terminationRoutes');
+const appointmentLetterRoutes = require('./routes/HR/appointmentLetterRoutes');
+const employeeBehaviorRoutes = require('./routes/HR/employeeBehaviorRoutes');
+const processDetailRoutes = require('./routes/CRM/processDetailRoutes');
+const companyFinancialRoutes = require('./routes/user\'s & setting\'s/companyFinancialRoutes');  // Fixed: consistent with others
+const vendorRoutes = require('./routes/CRM/vendorRoutes');
+const employeeHistoryRoutes = require('./routes/HR/employeeHistoryRoutes');
+const templateRoutes = require('./routes/CRM/templateRoutes');
 
 const app = express();
 
@@ -89,7 +89,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Setup Swagger
 setupSwagger(app);
 
-// Mount routers - All routes combined from both versions
+// Mount routers
 app.use('/api/auth', authRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/roles', roleRoutes);
@@ -134,7 +134,7 @@ app.use('/api/process-details', processDetailRoutes);
 app.use('/api/company-financial', companyFinancialRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/vendors', vendorRoutes);
-app.use('/api/employee-history', employeeHistoryRoutes); // Note: Changed from '/api/employees' to avoid conflict
+app.use('/api/employee-history', employeeHistoryRoutes);
 
 // Default route
 app.get('/', (req, res) => {
@@ -209,6 +209,7 @@ if (cron && typeof cron.schedule === 'function') {
       }
     });
     
+    // Policy renewal check at 2 AM daily
     cron.schedule('0 2 * * *', async () => {
       console.log('🔄 Running policy renewal check -', new Date().toISOString());
 
@@ -218,7 +219,6 @@ if (cron && typeof cron.schedule === 'function') {
 
         console.log('📊 Policy renewal summary:', result);
 
-        // If there were errors, log them but don't crash
         if (result.errors > 0) {
           console.warn(`⚠️ ${result.errors} policies failed to renew`);
         }
@@ -240,19 +240,16 @@ if (cron && typeof cron.schedule === 'function') {
       }
     });
 
-
     // Run EVERY MINUTE to check for terminations
     cron.schedule('* * * * *', async () => {
       console.log('🔄 Running termination check - ' + new Date().toISOString());
 
       try {
-        const Termination = require('./models/Termination');
-        const Employee = require('./models/Employee');
+        const Termination = require('./models/HR/Termination');
+        const Employee = require('./models/HR/Employee');
 
-        // Get current UTC date
         const now = new Date();
 
-        // Create UTC date range for TODAY (full day)
         const startOfDayUTC = new Date(Date.UTC(
           now.getUTCFullYear(),
           now.getUTCMonth(),
@@ -267,7 +264,6 @@ if (cron && typeof cron.schedule === 'function') {
           23, 59, 59, 999
         ));
 
-        // Find all approved terminations where lastWorkingDay is TODAY
         const terminationsToProcess = await Termination.find({
           status: 'approved',
           lastWorkingDay: {
@@ -294,19 +290,13 @@ if (cron && typeof cron.schedule === 'function') {
               continue;
             }
 
-            // Determine expected status based on termination type
             const expectedStatus = termination.terminationType === 'termination' ? 'terminated' : 'resigned';
 
-            // Check if already updated
             if (employee.EmploymentStatus !== expectedStatus) {
-              // Store old status for logging
               const oldStatus = employee.EmploymentStatus;
-
-              // Update employee status
               employee.EmploymentStatus = expectedStatus;
               await employee.save();
 
-              // Update termination record
               termination.updatedAt = new Date();
               await termination.save();
 
@@ -315,10 +305,6 @@ if (cron && typeof cron.schedule === 'function') {
               console.log(`   Last Working Day: ${termination.lastWorkingDay.toISOString()}`);
 
               updatedCount++;
-
-              // OPTIONAL: Send notification or email
-              // await notifyTerminationComplete(employee, termination);
-
             } else {
               console.log(`⏭️ SKIPPED: Employee ${employee.EmployeeID} already ${expectedStatus}`);
               skippedCount++;
@@ -338,7 +324,6 @@ if (cron && typeof cron.schedule === 'function') {
       }
     });
     
-    
     console.log('✅ Cron jobs scheduled successfully');
   } catch (err) {
     console.warn('⚠️ Could not schedule cron jobs:', err.message);
@@ -347,16 +332,15 @@ if (cron && typeof cron.schedule === 'function') {
   console.log('⏰ Cron jobs disabled');
 }
 
+// Test endpoint for termination cron
 app.post('/api/test/run-termination-cron-now', async (req, res) => {
   console.log('🔧 MANUALLY RUNNING TERMINATION CRON JOB (UTC)');
   try {
-    const Termination = require('./models/Termination');
-    const Employee = require('./models/Employee');
+    const Termination = require('./models/HR/Termination');
+    const Employee = require('./models/HR/Employee');
     
-    // Get current UTC date
     const now = new Date();
     
-    // Create UTC date range for today
     const startOfDayUTC = new Date(Date.UTC(
       now.getUTCFullYear(),
       now.getUTCMonth(),
@@ -376,9 +360,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
     console.log('Server UTC Time:', now.toISOString());
     console.log('UTC Date Range Start:', startOfDayUTC.toISOString());
     console.log('UTC Date Range End:', endOfDayUTC.toISOString());
-    console.log('Looking for lastWorkingDay between:', startOfDayUTC.toISOString(), 'and', endOfDayUTC.toISOString());
     
-    // Find all approved terminations where lastWorkingDay is today in UTC
     const terminations = await Termination.find({
       status: 'approved',
       lastWorkingDay: { 
@@ -389,7 +371,6 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
     
     console.log(`Found ${terminations.length} terminations with last working day = today (UTC)`);
     
-    // Also log any terminations that are close to this date for debugging
     const allApprovedTerminations = await Termination.find({ 
       status: 'approved' 
     }).populate('employeeId');
@@ -416,8 +397,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
           employeeId: employee.EmployeeID,
           currentStatus: employee.EmploymentStatus,
           expectedStatus: expectedStatus,
-          lastWorkingDayUTC: termination.lastWorkingDay.toISOString(),
-          lastWorkingDayLocal: termination.lastWorkingDay.toLocaleString()
+          lastWorkingDayUTC: termination.lastWorkingDay.toISOString()
         });
         
         if (employee.EmploymentStatus !== expectedStatus) {
@@ -475,7 +455,6 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
   }
 });
 
-
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
@@ -529,5 +508,4 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err.message);
   server.close(() => process.exit(1));
 });
-
 module.exports = server;

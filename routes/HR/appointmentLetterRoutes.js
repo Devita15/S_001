@@ -1,4 +1,4 @@
-// routes/appointmentLetterRoutes.js
+﻿// routes/appointmentLetterRoutes.js
 const express = require('express');
 const router = express.Router();
 const {
@@ -8,7 +8,7 @@ const {
   getAppointmentLetterStatusByCandidate,
   getAppointmentLetterStatusById,
   getAllAppointmentLetters,
-} = require('../controllers/appointmentLetterController');
+} = require('../../controllers/HR/appointmentLetterController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All HR routes

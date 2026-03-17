@@ -1,5 +1,5 @@
-const DimensionWeight = require('../models/DimensionWeight');
-const Item = require('../models/Item');
+﻿const DimensionWeight = require('../../models/CRM/DimensionWeight');
+const Item = require('../../models/CRM/Item');
 
 // @desc    Get all dimension weights
 // @route   GET /api/dimension-weights

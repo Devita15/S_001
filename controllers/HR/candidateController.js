@@ -1,8 +1,8 @@
-const Candidate = require('../models/Candidate');
-const Application = require('../models/Application');
-const JobOpening = require('../models/JobOpening');
-const User = require('../../models/User');
-const Offer = require('../models/Offer');
+﻿const Candidate = require('../../models/HR/Candidate');
+const Application = require('../../models/HR/Application');
+const JobOpening = require('../../models/HR/JobOpening');
+const User = require('../../models/user\'s & setting\'s/User');
+const Offer = require('../../models/HR/Offer');
 const notificationService = require('../../services/notificationService');
 const auditService = require('../../services/auditService');
 const resumeParserService = require('../../services/resumeParserService');
@@ -11,7 +11,7 @@ const mongoose = require('mongoose');
 
 // In candidateController.js, add this helper function at the top
 const generateCandidateId = async () => {
-  const Candidate = require('../models/Candidate');
+  const Candidate = require('../../models/HR/Candidate');
   const year = new Date().getFullYear();
   const count = await Candidate.countDocuments({
     candidateId: new RegExp(`CAN-${year}-`, 'i')
@@ -101,7 +101,7 @@ const addCandidate = async (req, res) => {
     if (jobId && mongoose.Types.ObjectId.isValid(jobId)) {
       const job = await JobOpening.findById(jobId);
       if (job) {
-        const Application = require('../models/Application');
+        const Application = require('../../models/HR/Application');
         
         // Generate application ID
         const generateApplicationId = async () => {

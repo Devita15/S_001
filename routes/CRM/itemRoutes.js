@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getItems,
@@ -7,7 +7,7 @@ const {
   updateItem,
   deleteItem,
   getItemsDropdown
-} = require('../controllers/itemController');
+} = require('../../controllers/CRM/itemController');
 const { protect } = require('../../middleware/authMiddleware');
 
 // All routes are protected

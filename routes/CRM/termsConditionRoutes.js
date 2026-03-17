@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   getTermsConditions,
@@ -6,7 +6,7 @@ const {
   createTermsCondition,
   updateTermsCondition,
   deleteTermsCondition
-} = require('../controllers/termsConditionController');
+} = require('../../controllers/CRM/termsConditionController');
 
 /**
  * @swagger

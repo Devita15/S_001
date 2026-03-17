@@ -1,5 +1,4 @@
-const Designation = require('../models/Designation');
-
+﻿const Designation = require('../../models/HR/Designation');
 // @desc    Get all designations
 // @route   GET /api/designations
 // @access  Public
@@ -220,7 +219,7 @@ const deleteDesignation = async (req, res) => {
     }
     
     // Check if designation has employees
-    const Employee = require('../models/Employee');
+    const Employee = require('../../models/HR/Employee');
     const employeeCount = await Employee.countDocuments({ DesignationID: designation._id });
     
     if (employeeCount > 0) {

@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const {
   createJobOpening,
@@ -8,7 +8,7 @@ const {
   updateJob,
   closeJob,
   deleteJob  
-} = require('../controllers/jobController');
+} = require('../../controllers/HR/jobController');
 const { protect } = require('../../middleware/authMiddleware');
 const { validate, jobValidation, validateId } = require('../../middleware/validationMiddleware');
 

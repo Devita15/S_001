@@ -1,8 +1,8 @@
 // services/reportService.js
-const Employee = require('../models/Employee');
-const EmployeeIncrement = require('../models/EmployeeIncrement');
-const EmployeeBehavior = require('../models/EmployeeBehavior');
-const Department = require('../models/Department');
+const Employee = require('../models/HR/Employee');
+const EmployeeIncrement = require('../models/HR/EmployeeIncrement');
+const EmployeeBehavior = require('../models/HR/EmployeeBehavior');
+const Department = require('../models/HR/Department');
 const mongoose = require('mongoose');
 
 class ReportService {
