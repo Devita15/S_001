@@ -16,10 +16,8 @@ const {
 
 // Middleware imports
 const { protect } = require('../../middleware/authMiddleware');
-
 // Apply authentication to all routes
 router.use(protect);
-
 /**
  * @swagger
  * tags:
