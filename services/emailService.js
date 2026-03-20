@@ -24,16 +24,16 @@ class EmailService {
   async verifyConnection() {
     try {
       await this.transporter.verify();
-      console.log('✅ SMTP server is ready to send emails');
+      console.log(' SMTP server is ready to send emails');
     } catch (error) {
-      console.error('❌ SMTP connection error:', error);
+      console.error(' SMTP connection error:', error);
     }
   }
 
   // Generic send email method
   async sendEmail({ to, subject, html, attachments = [] }) {
     try {
-      console.log('📧 Attempting to send email to:', to);
+      console.log(' Attempting to send email to:', to);
       console.log('Subject:', subject);
       
       const mailOptions = {
@@ -50,7 +50,7 @@ class EmailService {
       // Send email
       const info = await this.transporter.sendMail(mailOptions);
       
-      console.log('✅ Email sent successfully:', {
+      console.log(' Email sent successfully:', {
         messageId: info.messageId,
         to: to,
         subject: subject,
@@ -59,7 +59,7 @@ class EmailService {
       
       return info;
     } catch (error) {
-      console.error('❌ Send email error:', error);
+      console.error(' Send email error:', error);
       console.error('Error details:', {
         code: error.code,
         command: error.command,

@@ -11,7 +11,7 @@ dotenv.config();
 let cron;
 try {
   cron = require('node-cron');
-  console.log('✅ node-cron loaded successfully');
+  console.log(' node-cron loaded successfully');
 } catch (err) {
   console.warn('⚠️ node-cron not installed, scheduled jobs will be disabled');
   cron = { schedule: () => console.log('Cron jobs disabled') };
@@ -69,7 +69,7 @@ const companyFinancialRoutes = require('./routes/user\'s & setting\'s/companyFin
 const vendorRoutes = require('./routes/CRM/vendorRoutes');
 const employeeHistoryRoutes = require('./routes/HR/employeeHistoryRoutes');
 const templateRoutes = require('./routes/CRM/templateRoutes');
-
+const leadRoutes = require('./routes/CRM/leadRoutes');
 const app = express();
 
 // Body parser
@@ -135,7 +135,7 @@ app.use('/api/company-financial', companyFinancialRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/vendors', vendorRoutes);
 app.use('/api/employee-history', employeeHistoryRoutes);
-
+app.use('/api/leads',leadRoutes);
 // Default route
 app.get('/', (req, res) => {
   res.json({
@@ -211,38 +211,38 @@ if (cron && typeof cron.schedule === 'function') {
     
     // Policy renewal check at 2 AM daily
     cron.schedule('0 2 * * *', async () => {
-      console.log('🔄 Running policy renewal check -', new Date().toISOString());
+      console.log(' Running policy renewal check -', new Date().toISOString());
 
       try {
         const { autoRenewPolicies } = require('./services/policyRenewalService');
         const result = await autoRenewPolicies();
 
-        console.log('📊 Policy renewal summary:', result);
+        console.log(' Policy renewal summary:', result);
 
         if (result.errors > 0) {
           console.warn(`⚠️ ${result.errors} policies failed to renew`);
         }
       } catch (err) {
-        console.error('❌ Error in policy renewal cron job:', err.message);
+        console.error('Error in policy renewal cron job:', err.message);
       }
     });
 
     // Send renewal reminders daily at 9 AM
     cron.schedule('0 9 * * *', async () => {
-      console.log('📧 Sending policy renewal reminders -', new Date().toISOString());
+      console.log(' Sending policy renewal reminders -', new Date().toISOString());
 
       try {
         const { sendRenewalReminders } = require('./services/policyRenewalService');
         await sendRenewalReminders();
-        console.log('✅ Renewal reminders sent successfully');
+        console.log('Renewal reminders sent successfully');
       } catch (err) {
-        console.error('❌ Error sending renewal reminders:', err.message);
+        console.error(' Error sending renewal reminders:', err.message);
       }
     });
 
     // Run EVERY MINUTE to check for terminations
     cron.schedule('* * * * *', async () => {
-      console.log('🔄 Running termination check - ' + new Date().toISOString());
+      console.log('Running termination check - ' + new Date().toISOString());
 
       try {
         const Termination = require('./models/HR/Termination');
@@ -273,7 +273,7 @@ if (cron && typeof cron.schedule === 'function') {
         }).populate('employeeId');
 
         if (terminationsToProcess.length > 0) {
-          console.log(`📋 Found ${terminationsToProcess.length} terminations to process for today`);
+          console.log(` Found ${terminationsToProcess.length} terminations to process for today`);
         }
 
         let updatedCount = 0;
@@ -285,7 +285,7 @@ if (cron && typeof cron.schedule === 'function') {
             const employee = termination.employeeId;
 
             if (!employee) {
-              console.error(`❌ Employee not found for termination: ${termination.terminationId}`);
+              console.error(` Employee not found for termination: ${termination.terminationId}`);
               errorCount++;
               continue;
             }
@@ -300,38 +300,36 @@ if (cron && typeof cron.schedule === 'function') {
               termination.updatedAt = new Date();
               await termination.save();
 
-              console.log(`✅ UPDATED: Employee ${employee.EmployeeID} (${employee.FirstName} ${employee.LastName})`);
+              console.log(` UPDATED: Employee ${employee.EmployeeID} (${employee.FirstName} ${employee.LastName})`);
               console.log(`   From: ${oldStatus} → To: ${expectedStatus}`);
               console.log(`   Last Working Day: ${termination.lastWorkingDay.toISOString()}`);
 
               updatedCount++;
             } else {
-              console.log(`⏭️ SKIPPED: Employee ${employee.EmployeeID} already ${expectedStatus}`);
+              console.log(` SKIPPED: Employee ${employee.EmployeeID} already ${expectedStatus}`);
               skippedCount++;
             }
           } catch (err) {
-            console.error(`❌ Error processing termination ${termination.terminationId}:`, err.message);
+            console.error(` Error processing termination ${termination.terminationId}:`, err.message);
             errorCount++;
           }
         }
 
         if (terminationsToProcess.length > 0) {
-          console.log(`📊 Summary: ${updatedCount} updated, ${skippedCount} skipped, ${errorCount} errors`);
+          console.log(` Summary: ${updatedCount} updated, ${skippedCount} skipped, ${errorCount} errors`);
         }
 
       } catch (err) {
-        console.error('❌ Error in termination cron job:', err.message);
+        console.error(' Error in termination cron job:', err.message);
       }
     });
-    
-    console.log('✅ Cron jobs scheduled successfully');
+    console.log(' Cron jobs scheduled successfully');
   } catch (err) {
     console.warn('⚠️ Could not schedule cron jobs:', err.message);
   }
 } else {
-  console.log('⏰ Cron jobs disabled');
+  console.log(' Cron jobs disabled');
 }
-
 // Test endpoint for termination cron
 app.post('/api/test/run-termination-cron-now', async (req, res) => {
   console.log('🔧 MANUALLY RUNNING TERMINATION CRON JOB (UTC)');
@@ -355,7 +353,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
       23, 59, 59, 999
     ));
     
-    console.log('🔍 SEARCH PARAMETERS:');
+    console.log(' SEARCH PARAMETERS:');
     console.log('Server Local Time:', now.toString());
     console.log('Server UTC Time:', now.toISOString());
     console.log('UTC Date Range Start:', startOfDayUTC.toISOString());
@@ -375,7 +373,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
       status: 'approved' 
     }).populate('employeeId');
     
-    console.log('\n📋 ALL APPROVED TERMINATIONS IN SYSTEM:');
+    console.log('\n ALL APPROVED TERMINATIONS IN SYSTEM:');
     allApprovedTerminations.forEach(t => {
       console.log({
         terminationId: t.terminationId,
@@ -393,7 +391,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
       if (employee) {
         const expectedStatus = termination.terminationType === 'termination' ? 'terminated' : 'resigned';
         
-        console.log(`\n📝 Processing:`, {
+        console.log(`\n Processing:`, {
           employeeId: employee.EmployeeID,
           currentStatus: employee.EmploymentStatus,
           expectedStatus: expectedStatus,
@@ -408,7 +406,7 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
           termination.updatedAt = new Date();
           await termination.save();
           
-          console.log(`✅ UPDATED: ${employee.EmployeeID} from ${oldStatus} to ${expectedStatus}`);
+          console.log(`UPDATED: ${employee.EmployeeID} from ${oldStatus} to ${expectedStatus}`);
           
           results.push({
             employeeId: employee.EmployeeID,
@@ -426,7 +424,6 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
         }
       }
     }
-    
     res.json({
       success: true,
       message: 'Cron job executed with UTC dates',
@@ -444,7 +441,6 @@ app.post('/api/test/run-termination-cron-now', async (req, res) => {
       results,
       note: 'Using UTC dates for consistent comparison'
     });
-    
   } catch (error) {
     console.error('Error in test cron:', error);
     res.status(500).json({ 
@@ -484,17 +480,17 @@ const server = app.listen(PORT, HOST, () => {
   const port = address.port;
   
   console.log('\n=================================');
-  console.log(`✅ Server running on http://${host}:${port}`);
-  console.log(`📁 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🌐 MongoDB URI: ${process.env.MONGODB_URI}`);
+  console.log(`Server running on http://${host}:${port}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`MongoDB URI: ${process.env.MONGODB_URI}`);
   console.log('=================================\n');
-  console.log(`📚 Swagger Docs: http://localhost:${port}/api-docs`);
-  console.log(`🩺 Health Check: http://localhost:${port}/health`);
-  console.log(`👥 Auth: http://localhost:${port}/api/auth`);
-  console.log(`📊 Requisitions: http://localhost:${port}/api/requisitions`);
-  console.log(`💼 Jobs: http://localhost:${port}/api/jobs`);
-  console.log(`👤 Candidates: http://localhost:${port}/api/candidates`);
-  console.log(`🗓️ Interviews: http://localhost:${port}/api/interviews`);
+  console.log(`Swagger Docs: http://localhost:${port}/api-docs`);
+  console.log(`Health Check: http://localhost:${port}/health`);
+  console.log(`Auth: http://localhost:${port}/api/auth`);
+  console.log(`Requisitions: http://localhost:${port}/api/requisitions`);
+  console.log(`Jobs: http://localhost:${port}/api/jobs`);
+  console.log(`Candidates: http://localhost:${port}/api/candidates`);
+  console.log(`Interviews: http://localhost:${port}/api/interviews`);
 });
 
 // Handle unhandled promise rejections

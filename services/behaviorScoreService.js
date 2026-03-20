@@ -3,7 +3,6 @@ const IncrementPolicy = require('../models/HR/IncrementPolicy');
 const mongoose = require('mongoose');
 
 class BehaviorScoreService {
-  
   /**
    * Calculate behavior score for an employee for a given year
    */

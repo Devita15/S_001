@@ -1,18 +1,916 @@
-﻿const express = require('express');
-const router = express.Router();
-const {
-  getCustomers,
-  getCustomer,
-  createCustomer,
-  updateCustomer,
-  deleteCustomer
-} = require('../../controllers/CRM/customerController');
+﻿'use strict';
+const express     = require('express');
+const router      = express.Router();
+const cc          = require('../../controllers/CRM/customerController');
+const validate    = require('../../middleware/validate');
 const { protect } = require('../../middleware/authMiddleware');
+const v           = require('../../validators/leadValidators');
 
-router.get('/',protect, getCustomers);
-router.get('/:id', protect,getCustomer);
-router.post('/', protect,createCustomer);
-router.put('/:id', protect,updateCustomer);
-router.delete('/:id', protect,deleteCustomer);
+router.use(protect);
+
+/**
+ * @swagger
+ * tags:
+ *   name: Customers
+ *   description: Customer master — created on lead conversion or standalone
+ */
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *
+ *     Address:
+ *       type: object
+ *       required: [line1, city, state, state_code, pincode]
+ *       properties:
+ *         line1:      { type: string, example: "Kalwa Works, Thane" }
+ *         line2:      { type: string, example: "" }
+ *         city:       { type: string, example: "Thane" }
+ *         district:   { type: string, example: "Thane" }
+ *         state:      { type: string, example: "Maharashtra" }
+ *         state_code: { type: integer, minimum: 1, maximum: 37, example: 27 }
+ *         pincode:    { type: string, example: "400605" }
+ *         country:    { type: string, default: "India" }
+ *
+ *     ShippingAddress:
+ *       allOf:
+ *         - $ref: '#/components/schemas/Address'
+ *         - type: object
+ *           required: [label]
+ *           properties:
+ *             _id:        { type: string }
+ *             label:      { type: string, example: "Pune Plant" }
+ *             is_default: { type: boolean, example: false }
+ *
+ *     ContactPerson:
+ *       type: object
+ *       required: [name]
+ *       properties:
+ *         _id:         { type: string }
+ *         name:        { type: string, example: "Rajesh Sharma" }
+ *         designation: { type: string, example: "Purchase Manager" }
+ *         department:  { type: string, example: "Procurement" }
+ *         phone:       { type: string, example: "02012345678" }
+ *         mobile:      { type: string, example: "9876543210" }
+ *         email:       { type: string, format: email, example: "rajesh@siemens.com" }
+ *         is_primary:  { type: boolean, example: true }
+ *
+ *     BankDetails:
+ *       type: object
+ *       properties:
+ *         bank_name:    { type: string, example: "HDFC Bank" }
+ *         account_no:   { type: string, example: "12345678901234" }
+ *         ifsc:         { type: string, example: "HDFC0001234" }
+ *         branch:       { type: string, example: "Thane West" }
+ *         account_name: { type: string, example: "Siemens India Ltd" }
+ *
+ *     Customer:
+ *       type: object
+ *       properties:
+ *         _id:
+ *           type: string
+ *           example: "64f8e9b7a1b2c3d4e5f6a7b8"
+ *         customer_id:
+ *           type: string
+ *           example: "CUST-202503-0001"
+ *         customer_code:
+ *           type: string
+ *           example: "SIEMENS-001"
+ *         customer_name:
+ *           type: string
+ *           example: "Siemens India Ltd"
+ *         customer_type:
+ *           type: string
+ *           enum: [OEM, Dealer, Distributor, Direct, Government, Export, Other]
+ *           example: "OEM"
+ *         industry_segment:
+ *           type: string
+ *           enum: [Automotive, Electronics, Energy, Switchgear, EV, Defence, General, ""]
+ *           example: "Switchgear"
+ *         priority:
+ *           type: string
+ *           enum: ["Key Account", Regular, Prospect, Dormant, ""]
+ *           example: "Key Account"
+ *         gstin:
+ *           type: string
+ *           example: "27AAECS7112G1Z5"
+ *         pan:
+ *           type: string
+ *           example: "AAECS7112G"
+ *         tan:
+ *           type: string
+ *         msme_number:
+ *           type: string
+ *         is_sez:
+ *           type: boolean
+ *           example: false
+ *         is_export:
+ *           type: boolean
+ *           example: false
+ *         credit_limit:
+ *           type: number
+ *           example: 500000
+ *           description: "0 = unlimited"
+ *         credit_days:
+ *           type: integer
+ *           example: 45
+ *         payment_terms:
+ *           type: string
+ *           enum: [Advance, "On Delivery", "Net 15", "Net 30", "Net 45", "Net 60", "Net 90", LC, Custom]
+ *           example: "Net 45"
+ *         currency:
+ *           type: string
+ *           enum: [INR, USD, EUR, GBP, AED, JPY]
+ *           example: "INR"
+ *         credit_outstanding:
+ *           type: number
+ *           example: 125000
+ *         is_credit_hold:
+ *           type: boolean
+ *           example: false
+ *         bank_details:
+ *           $ref: '#/components/schemas/BankDetails'
+ *         billing_address:
+ *           $ref: '#/components/schemas/Address'
+ *         shipping_addresses:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/ShippingAddress'
+ *         contacts:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/ContactPerson'
+ *         assigned_to:
+ *           type: object
+ *           properties:
+ *             _id:        { type: string }
+ *             first_name: { type: string }
+ *             last_name:  { type: string }
+ *             email:      { type: string }
+ *         territory:
+ *           type: string
+ *           example: "West India"
+ *         source_lead_id:
+ *           type: string
+ *         source_lead_no:
+ *           type: string
+ *           example: "LEAD-202503-0001"
+ *         is_active:
+ *           type: boolean
+ *           example: true
+ *         is_blacklisted:
+ *           type: boolean
+ *           example: false
+ *         primary_contact:
+ *           type: object
+ *           description: Virtual — first is_primary contact
+ *         billing_address_default:
+ *           type: object
+ *           description: Virtual — primary billing address
+ *         credit_available:
+ *           type: string
+ *           description: Virtual — Unlimited if credit_limit=0, else limit - outstanding
+ *         createdAt:
+ *           type: string
+ *           format: date-time
+ *         updatedAt:
+ *           type: string
+ *           format: date-time
+ *
+ *     CustomerCreate:
+ *       type: object
+ *       required: [customer_code, customer_name, customer_type, billing_address]
+ *       properties:
+ *         customer_code:
+ *           type: string
+ *           example: "SIEMENS-001"
+ *         customer_name:
+ *           type: string
+ *           example: "Siemens India Ltd"
+ *         customer_type:
+ *           type: string
+ *           enum: [OEM, Dealer, Distributor, Direct, Government, Export, Other]
+ *           example: "OEM"
+ *         industry_segment:
+ *           type: string
+ *           enum: [Automotive, Electronics, Energy, Switchgear, EV, Defence, General, ""]
+ *         priority:
+ *           type: string
+ *           enum: ["Key Account", Regular, Prospect, Dormant, ""]
+ *           default: Regular
+ *         gstin:
+ *           type: string
+ *           example: "27AAECS7112G1Z5"
+ *         pan:
+ *           type: string
+ *           example: "AAECS7112G"
+ *         tan:
+ *           type: string
+ *         msme_number:
+ *           type: string
+ *         is_sez:
+ *           type: boolean
+ *           default: false
+ *         is_export:
+ *           type: boolean
+ *           default: false
+ *         credit_limit:
+ *           type: number
+ *           default: 0
+ *           description: "0 = unlimited"
+ *         credit_days:
+ *           type: integer
+ *           default: 30
+ *         payment_terms:
+ *           type: string
+ *           enum: [Advance, "On Delivery", "Net 15", "Net 30", "Net 45", "Net 60", "Net 90", LC, Custom]
+ *           default: "Net 30"
+ *         currency:
+ *           type: string
+ *           enum: [INR, USD, EUR, GBP, AED, JPY]
+ *           default: INR
+ *         bank_details:
+ *           $ref: '#/components/schemas/BankDetails'
+ *         billing_address:
+ *           $ref: '#/components/schemas/Address'
+ *         shipping_addresses:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/ShippingAddress'
+ *         contacts:
+ *           type: array
+ *           items:
+ *             $ref: '#/components/schemas/ContactPerson'
+ *         assigned_to:
+ *           type: string
+ *           description: Employee ObjectId
+ *         territory:
+ *           type: string
+ *         internal_remarks:
+ *           type: string
+ *
+ *     CustomerUpdate:
+ *       type: object
+ *       minProperties: 1
+ *       description: All fields optional — at least one required. customer_code is immutable.
+ *       properties:
+ *         customer_name:    { type: string }
+ *         customer_type:    { type: string, enum: [OEM, Dealer, Distributor, Direct, Government, Export, Other] }
+ *         industry_segment: { type: string }
+ *         priority:         { type: string, enum: ["Key Account", Regular, Prospect, Dormant, ""] }
+ *         gstin:            { type: string }
+ *         pan:              { type: string }
+ *         tan:              { type: string }
+ *         msme_number:      { type: string }
+ *         is_sez:           { type: boolean }
+ *         is_export:        { type: boolean }
+ *         credit_limit:     { type: number, minimum: 0 }
+ *         credit_days:      { type: integer, minimum: 0 }
+ *         payment_terms:    { type: string }
+ *         currency:         { type: string }
+ *         bank_details:     { $ref: '#/components/schemas/BankDetails' }
+ *         billing_address:  { $ref: '#/components/schemas/Address' }
+ *         assigned_to:      { type: string }
+ *         territory:        { type: string }
+ *         internal_remarks: { type: string }
+ *         is_credit_hold:   { type: boolean }
+ *
+ *     ManageShipping:
+ *       type: object
+ *       required: [action]
+ *       properties:
+ *         action:
+ *           type: string
+ *           enum: [add, update, remove]
+ *           example: "add"
+ *         address_id:
+ *           type: string
+ *           description: Required for update and remove
+ *         address:
+ *           $ref: '#/components/schemas/ShippingAddress'
+ *           description: Required for add and update
+ *
+ *     ManageContact:
+ *       type: object
+ *       required: [action]
+ *       properties:
+ *         action:
+ *           type: string
+ *           enum: [add, update, remove, set_primary]
+ *           example: "add"
+ *         contact_id:
+ *           type: string
+ *           description: Required for update, remove, set_primary
+ *         contact:
+ *           $ref: '#/components/schemas/ContactPerson'
+ *           description: Required for add and update
+ *
+ *     CreditHold:
+ *       type: object
+ *       required: [is_credit_hold]
+ *       properties:
+ *         is_credit_hold:
+ *           type: boolean
+ *           example: true
+ *         reason:
+ *           type: string
+ *           example: "Outstanding overdue > 90 days"
+ *
+ *   responses:
+ *     CustomerNotFound:
+ *       description: Customer not found
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               success: { type: boolean, example: false }
+ *               message: { type: string, example: "Customer not found" }
+ *     DuplicateCustomer:
+ *       description: customer_code or GSTIN already exists
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               success: { type: boolean, example: false }
+ *               message: { type: string, example: "GSTIN already registered: Siemens India Ltd (SIEMENS-001)" }
+ */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE CRUD
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /api/customers:
+ *   post:
+ *     summary: Create a new customer
+ *     description: |
+ *       GSTIN is sparse-unique — null/empty allowed (unregistered dealer), but if
+ *       provided must be unique across all customers.
+ *       `customer_id` is auto-generated as `CUST-YYYYMM-XXXX`.
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CustomerCreate'
+ *           examples:
+ *             oem_customer:
+ *               summary: Full OEM customer
+ *               value:
+ *                 customer_code: "SIEMENS-001"
+ *                 customer_name: "Siemens India Ltd"
+ *                 customer_type: "OEM"
+ *                 industry_segment: "Switchgear"
+ *                 priority: "Key Account"
+ *                 gstin: "27AAECS7112G1Z5"
+ *                 pan: "AAECS7112G"
+ *                 credit_limit: 500000
+ *                 credit_days: 45
+ *                 payment_terms: "Net 45"
+ *                 billing_address:
+ *                   line1: "Kalwa Works, Thane"
+ *                   city: "Thane"
+ *                   state: "Maharashtra"
+ *                   state_code: 27
+ *                   pincode: "400605"
+ *                 contacts:
+ *                   - name: "Rajesh Sharma"
+ *                     designation: "Purchase Manager"
+ *                     mobile: "9876543210"
+ *                     email: "rajesh@siemens.com"
+ *                     is_primary: true
+ *             export_customer:
+ *               summary: Export customer with USD currency
+ *               value:
+ *                 customer_code: "ACME-US-001"
+ *                 customer_name: "ACME Corporation"
+ *                 customer_type: "Export"
+ *                 is_export: true
+ *                 currency: "USD"
+ *                 billing_address:
+ *                   line1: "123 Industrial Ave"
+ *                   city: "Detroit"
+ *                   state: "Michigan"
+ *                   state_code: 1
+ *                   pincode: "48201"
+ *                   country: "USA"
+ *     responses:
+ *       201:
+ *         description: Customer created
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   $ref: '#/components/schemas/Customer'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       409:
+ *         $ref: '#/components/responses/DuplicateCustomer'
+ *       500:
+ *         description: Server error
+ */
+router.post('/', validate(v.createCustomerSchema), cc.createCustomer);
+
+/**
+ * @swagger
+ * /api/customers:
+ *   get:
+ *     summary: List customers with pagination and filters
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20, maximum: 100 }
+ *       - in: query
+ *         name: sort
+ *         schema: { type: string, default: "-createdAt" }
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *         description: Regex search on customer_name, customer_code, gstin
+ *       - in: query
+ *         name: customer_type
+ *         schema:
+ *           type: string
+ *           enum: [OEM, Dealer, Distributor, Direct, Government, Export, Other]
+ *       - in: query
+ *         name: industry_segment
+ *         schema:
+ *           type: string
+ *           enum: [Automotive, Electronics, Energy, Switchgear, EV, Defence, General]
+ *       - in: query
+ *         name: priority
+ *         schema:
+ *           type: string
+ *           enum: ["Key Account", Regular, Prospect, Dormant]
+ *       - in: query
+ *         name: territory
+ *         schema: { type: string }
+ *         description: Partial match
+ *       - in: query
+ *         name: assigned_to
+ *         schema: { type: string }
+ *         description: Employee ObjectId
+ *       - in: query
+ *         name: currency
+ *         schema: { type: string, enum: [INR, USD, EUR, GBP, AED, JPY] }
+ *       - in: query
+ *         name: is_credit_hold
+ *         schema: { type: boolean }
+ *       - in: query
+ *         name: is_sez
+ *         schema: { type: boolean }
+ *       - in: query
+ *         name: is_export
+ *         schema: { type: boolean }
+ *     responses:
+ *       200:
+ *         description: Customers list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/Customer'
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     page:  { type: integer, example: 1 }
+ *                     limit: { type: integer, example: 20 }
+ *                     total: { type: integer, example: 42 }
+ *                     pages: { type: integer, example: 3 }
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/', cc.getCustomers);
+
+/**
+ * @swagger
+ * /api/customers/{id}:
+ *   get:
+ *     summary: Get full customer detail
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *         description: MongoDB ObjectId
+ *     responses:
+ *       200:
+ *         description: Customer detail
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   $ref: '#/components/schemas/Customer'
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/:id', cc.getCustomerById);
+
+/**
+ * @swagger
+ * /api/customers/{id}:
+ *   put:
+ *     summary: Partial update — customer_code and customer_id are immutable
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CustomerUpdate'
+ *           example:
+ *             priority: "Key Account"
+ *             credit_limit: 1000000
+ *             credit_days: 60
+ *             payment_terms: "Net 60"
+ *     responses:
+ *       200:
+ *         description: Customer updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   $ref: '#/components/schemas/Customer'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       409:
+ *         $ref: '#/components/responses/DuplicateCustomer'
+ *       500:
+ *         description: Server error
+ */
+router.put('/:id', validate(v.updateCustomerSchema), cc.updateCustomer);
+
+/**
+ * @swagger
+ * /api/customers/{id}:
+ *   delete:
+ *     summary: Soft-delete — sets is_active=false, no hard delete
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Customer deactivated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: "Customer deactivated" }
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.delete('/:id', cc.deleteCustomer);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHIPPING ADDRESSES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /api/customers/{id}/shipping-addresses:
+ *   put:
+ *     summary: Add / update / remove a shipping address
+ *     description: |
+ *       `action: add` — push new address to shipping_addresses[]
+ *       `action: update` — update by address_id (subdoc _id)
+ *       `action: remove` — remove by address_id
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/ManageShipping'
+ *           examples:
+ *             add:
+ *               summary: Add new plant address
+ *               value:
+ *                 action: "add"
+ *                 address:
+ *                   label: "Aurangabad Plant"
+ *                   line1: "Plot 42, MIDC"
+ *                   city: "Aurangabad"
+ *                   state: "Maharashtra"
+ *                   state_code: 27
+ *                   pincode: "431001"
+ *                   is_default: false
+ *             update:
+ *               summary: Update existing address
+ *               value:
+ *                 action: "update"
+ *                 address_id: "64f8e9b7a1b2c3d4e5f6a7b8"
+ *                 address:
+ *                   label: "Aurangabad Plant (Updated)"
+ *                   pincode: "431002"
+ *             remove:
+ *               summary: Remove address
+ *               value:
+ *                 action: "remove"
+ *                 address_id: "64f8e9b7a1b2c3d4e5f6a7b8"
+ *     responses:
+ *       200:
+ *         description: Updated shipping_addresses[] array
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/ShippingAddress'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.put('/:id/shipping-addresses', validate(v.manageShippingSchema), cc.manageShipping);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTACTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /api/customers/{id}/contacts:
+ *   put:
+ *     summary: Add / update / remove / set_primary a contact person
+ *     description: |
+ *       `action: add` — push new contact (if is_primary=true, demotes previous primary)
+ *       `action: update` — update by contact_id
+ *       `action: remove` — remove by contact_id
+ *       `action: set_primary` — set one contact as primary (demotes all others)
+ *
+ *       Pre-save hook enforces max one is_primary contact.
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/ManageContact'
+ *           examples:
+ *             add:
+ *               summary: Add new contact
+ *               value:
+ *                 action: "add"
+ *                 contact:
+ *                   name: "Priya Mehta"
+ *                   designation: "Technical Manager"
+ *                   mobile: "9123456780"
+ *                   email: "priya@siemens.com"
+ *                   is_primary: false
+ *             set_primary:
+ *               summary: Change primary contact
+ *               value:
+ *                 action: "set_primary"
+ *                 contact_id: "64f8e9b7a1b2c3d4e5f6a7b8"
+ *             remove:
+ *               summary: Remove contact
+ *               value:
+ *                 action: "remove"
+ *                 contact_id: "64f8e9b7a1b2c3d4e5f6a7b8"
+ *     responses:
+ *       200:
+ *         description: Updated contacts[] array
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/ContactPerson'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.put('/:id/contacts', validate(v.manageContactSchema), cc.manageContacts);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDIT HOLD
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /api/customers/{id}/credit-hold:
+ *   put:
+ *     summary: Apply or release credit hold
+ *     description: |
+ *       When `is_credit_hold=true`, new Sales Orders for this customer
+ *       will be blocked at SO creation (Phase 03 enforces this).
+ *       Optionally provide `reason` — saved to internal_remarks.
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CreditHold'
+ *           examples:
+ *             apply:
+ *               summary: Apply credit hold
+ *               value:
+ *                 is_credit_hold: true
+ *                 reason: "Outstanding overdue > 90 days"
+ *             release:
+ *               summary: Release credit hold
+ *               value:
+ *                 is_credit_hold: false
+ *                 reason: "Payment received — outstanding cleared"
+ *     responses:
+ *       200:
+ *         description: Credit hold applied or released
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 message: { type: string, example: "Credit hold applied" }
+ *                 data:
+ *                   $ref: '#/components/schemas/Customer'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.put('/:id/credit-hold', validate(v.creditHoldSchema), cc.toggleCreditHold);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CREDIT OUTSTANDING
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /api/customers/{id}/credit-outstanding:
+ *   get:
+ *     summary: Get credit limit vs outstanding summary
+ *     description: |
+ *       Returns `credit_available` = credit_limit - credit_outstanding.
+ *       If `credit_limit = 0`, returns `"Unlimited"`.
+ *       `credit_outstanding` is maintained by the AR module (Phase 12).
+ *     tags: [Customers]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Credit summary
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     customer_id:
+ *                       type: string
+ *                       example: "CUST-202503-0001"
+ *                     customer_code:
+ *                       type: string
+ *                       example: "SIEMENS-001"
+ *                     customer_name:
+ *                       type: string
+ *                       example: "Siemens India Ltd"
+ *                     credit_limit:
+ *                       type: number
+ *                       example: 500000
+ *                     credit_outstanding:
+ *                       type: number
+ *                       example: 125000
+ *                     credit_available:
+ *                       oneOf:
+ *                         - type: number
+ *                           example: 375000
+ *                         - type: string
+ *                           example: "Unlimited"
+ *                     credit_days:
+ *                       type: integer
+ *                       example: 45
+ *                     payment_terms:
+ *                       type: string
+ *                       example: "Net 45"
+ *                     currency:
+ *                       type: string
+ *                       example: "INR"
+ *                     is_credit_hold:
+ *                       type: boolean
+ *                       example: false
+ *       404:
+ *         $ref: '#/components/responses/CustomerNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/:id/credit-outstanding', cc.getCreditOutstanding);
 
 module.exports = router;

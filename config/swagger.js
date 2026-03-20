@@ -69,9 +69,9 @@ const options = {
 const specs = swaggerJsdoc(options);
 
 // Log to verify it's working
-console.log('✅ Swagger JSDoc initialized');
-console.log('📁 Looking for route files in:', options.apis);
-console.log('📊 Found endpoints:', Object.keys(specs.paths || {}).length);
+console.log(' Swagger JSDoc initialized');
+console.log(' Looking for route files in:', options.apis);
+console.log(' Found endpoints:', Object.keys(specs.paths || {}).length);
 
 // Swagger UI configuration with JAKARTA FONT
 const swaggerUiOptions = {
