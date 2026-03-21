@@ -1,332 +1,288 @@
+
+// controllers/roleController.js
+'use strict';
+
+const mongoose    = require('mongoose');
 const Role = require('../../models/user\'s & setting\'s/Role');
+const Permission = require('../../models/user\'s & setting\'s/Permission');
+const User = require('../../models/user\'s & setting\'s/User');
+const { sidebarStructure } = require('../../scripts/bootstrapPermissions');
 
-// @desc    Get all roles
-// @route   GET /api/roles
-// @access  Public
-const getRoles = async (req, res) => {
-  try {
-    const { 
-      page = 1, 
-      limit = 10, 
-      search, 
-      isActive,
-      sortBy = 'CreatedAt',
-      sortOrder = 'desc'
-    } = req.query;
+// ── Serialise nested Maps → plain objects for JSON ───────────────────────────
+function mapToObj(val) {
+  if (val instanceof Map) {
+    const out = {};
+    for (const [k, v] of val.entries()) out[k] = mapToObj(v);
+    return out;
+  }
+  if (val && typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) out[k] = mapToObj(v);
+    return out;
+  }
+  return val;
+}
 
-    const query = {};
+function formatRole(role) {
+  return {
+    _id:              role._id,
+    RoleName:         role.RoleName,
+    Description:      role.Description || '',
+    isSuperAdmin:     role.isSuperAdmin,
+    IsActive:         role.IsActive,
+    moduleAccess:     mapToObj(role.moduleAccess),
+    pageAccess:       mapToObj(role.pageAccess),
+    permissions:      role.permissions || [],
+    permissionsCount: (role.permissions || []).length,
+    CreatedAt:        role.CreatedAt,
+    UpdatedAt:        role.UpdatedAt
+  };
+}
 
-    // Filter by search term
-    if (search) {
-      query.$or = [
-        { RoleName: { $regex: search, $options: 'i' } },
-        { Description: { $regex: search, $options: 'i' } }
-      ];
-    }
+// ── Resolve Permission IDs from the access payload ───────────────────────────
+//
+// moduleAccess  { "COMPANY_MASTER": true, "DASHBOARD": true }
+// pageAccess    { "COMPANY_MASTER": { "Organization / Company": ["VIEW","CREATE"] } }
+//
+// Rules:
+//  - Module false  → skip entirely
+//  - Module true   → only generate perms for pages that are explicitly listed
+//  - Page actions  → find-or-create Permission docs for each action
+//
+async function resolvePermissionIds(moduleAccess = {}, pageAccess = {}, createdBy) {
+  const ids = [];
 
-    // Filter by active status
-    if (isActive !== undefined) {
-      query.IsActive = isActive === 'true';
-    }
+  for (const [moduleKey, enabled] of Object.entries(moduleAccess)) {
+    if (!enabled) continue;
 
-    // Sort configuration
-    const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
+    const pagesForModule = pageAccess[moduleKey] || {};
 
-    // Execute query with pagination
-    const roles = await Role.find(query)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort(sort);
+    for (const [pageName, actions] of Object.entries(pagesForModule)) {
+      if (!Array.isArray(actions) || actions.length === 0) continue;
 
-    // Get total count
-    const total = await Role.countDocuments(query);
-
-    res.json({
-      success: true,
-      data: roles,
-      pagination: {
-        currentPage: Number(page),
-        totalPages: Math.ceil(total / limit),
-        totalItems: total,
-        itemsPerPage: Number(limit)
+      for (const action of actions) {
+        const perm = await Permission.findOrCreate(moduleKey, pageName, action, createdBy);
+        ids.push(perm._id);
       }
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
+    }
   }
-};
 
-// @desc    Get single role
-// @route   GET /api/roles/:id
-// @access  Public
-const getRole = async (req, res) => {
-  try {
-    const role = await Role.findById(req.params.id);
+  // Deduplicate by string comparison
+  const seen = new Set();
+  return ids.filter(id => {
+    const s = id.toString();
+    if (seen.has(s)) return false;
+    seen.add(s);
+    return true;
+  });
+}
 
-    if (!role) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
-      });
+// ── pageAccess object → nested Map for storage ───────────────────────────────
+function buildPageAccessMap(pageAccess = {}) {
+  const outer = new Map();
+  for (const [mod, pages] of Object.entries(pageAccess)) {
+    const inner = new Map();
+    for (const [page, actions] of Object.entries(pages || {})) {
+      inner.set(page, Array.isArray(actions) ? actions : []);
     }
-
-    res.json({
-      success: true,
-      data: role
-    });
-
-  } catch (error) {
-    console.error(error);
-    
-    if (error.kind === 'ObjectId') {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
-      });
-    }
-
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
+    outer.set(mod, inner);
   }
-};
+  return outer;
+}
 
-// @desc    Create role
-// @route   POST /api/roles
-// @access  Public
-const createRole = async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// CREATE ROLE
+// POST /api/roles
+// Body: { RoleName, Description?, isSuperAdmin?, moduleAccess, pageAccess }
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.createRole = async (req, res, next) => {
   try {
-    const { RoleName, Description, IsActive = true } = req.body;
-
-    // Check if role already exists
-    const existingRole = await Role.findOne({ 
-      RoleName: { $regex: new RegExp(`^${RoleName}$`, 'i') } 
-    });
-
-    if (existingRole) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Role name already exists' 
-      });
-    }
-
-    // Create role
-    const role = await Role.create({
+    const {
       RoleName,
+      Description  = '',
+      isSuperAdmin = false,
+      moduleAccess = {},
+      pageAccess   = {}
+    } = req.body;
+
+    if (!RoleName?.trim()) {
+      return res.status(400).json({ success: false, message: 'RoleName is required' });
+    }
+
+    const exists = await Role.findOne({ RoleName: RoleName.trim() });
+    if (exists) return res.status(409).json({ success: false, message: 'Role already exists' });
+
+    const role = await Role.create({
+      RoleName:     RoleName.trim(),
       Description,
-      IsActive
+      isSuperAdmin: !!isSuperAdmin,
+      IsActive:     true,
+      moduleAccess: new Map(Object.entries(moduleAccess).map(([k, v]) => [k, !!v])),
+      pageAccess:   buildPageAccessMap(pageAccess),
+      permissions:  [],
+      CreatedBy:    req.user._id
     });
 
-    res.status(201).json({
-      success: true,
-      data: role,
-      message: 'Role created successfully'
-    });
-
-  } catch (error) {
-    console.error(error);
-    
-    if (error.code === 11000) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Role name already exists' 
-      });
+    // SuperAdmin role: no permission list needed — bypass is handled in User.getAllPermissions()
+    if (!isSuperAdmin) {
+      role.permissions = await resolvePermissionIds(moduleAccess, pageAccess, req.user._id);
+      await role.save();
     }
 
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(val => val.message);
-      return res.status(400).json({ 
-        success: false, 
-        message: messages.join(', ') 
-      });
-    }
+    const populated = await Role.findById(role._id)
+      .populate({ path: 'permissions', select: 'module page action name' });
 
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
-  }
+    return res.status(201).json({ success: true, data: formatRole(populated) });
+
+  } catch (err) { next(err); }
 };
 
-// @desc    Update role
-// @route   PUT /api/roles/:id
-// @access  Public
-const updateRole = async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET ALL ROLES
+// GET /api/roles?search=&isActive=&page=&limit=
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.getAllRoles = async (req, res, next) => {
   try {
-    let role = await Role.findById(req.params.id);
+    const { search, isActive, page = 1, limit = 50 } = req.query;
 
-    if (!role) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
-      });
-    }
+    const filter = {};
+    if (search)             filter.RoleName = { $regex: search, $options: 'i' };
+    if (isActive !== undefined) filter.IsActive = isActive === 'true';
 
-    // Check if role name is being changed and if new name already exists
-    if (req.body.RoleName && req.body.RoleName !== role.RoleName) {
-      const existingRole = await Role.findOne({ 
-        RoleName: { $regex: new RegExp(`^${req.body.RoleName}$`, 'i') },
-        _id: { $ne: role._id }
-      });
+    const [roles, total] = await Promise.all([
+      Role.find(filter)
+        .populate({ path: 'permissions', select: 'module page action name' })
+        .sort({ CreatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(Number(limit)),
+      Role.countDocuments(filter)
+    ]);
 
-      if (existingRole) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Role name already exists' 
-        });
-      }
-    }
-
-    // Update role
-    role = await Role.findByIdAndUpdate(
-      req.params.id,
-      { 
-        ...req.body,
-        UpdatedAt: Date.now()
-      },
-      { new: true, runValidators: true }
-    );
-
-    res.json({
+    return res.status(200).json({
       success: true,
-      data: role,
-      message: 'Role updated successfully'
+      total,
+      data:    roles.map(formatRole)
     });
-
-  } catch (error) {
-    console.error(error);
-    
-    if (error.kind === 'ObjectId') {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
-      });
-    }
-
-    if (error.code === 11000) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Role name already exists' 
-      });
-    }
-
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(val => val.message);
-      return res.status(400).json({ 
-        success: false, 
-        message: messages.join(', ') 
-      });
-    }
-
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
-  }
+  } catch (err) { next(err); }
 };
 
-// @desc    Delete role
-// @route   DELETE /api/roles/:id
-// @access  Public
-const deleteRole = async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET ONE ROLE
+// GET /api/roles/:id
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.getRole = async (req, res, next) => {
+  try {
+    const role = await Role.findById(req.params.id)
+      .populate({ path: 'permissions', select: 'module page action name is_active' });
+
+    if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
+
+    return res.status(200).json({ success: true, data: formatRole(role) });
+  } catch (err) { next(err); }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UPDATE ROLE
+// PATCH /api/roles/:id
+// Partial update — send only what you want to change
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.updateRole = async (req, res, next) => {
   try {
     const role = await Role.findById(req.params.id);
+    if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
 
-    if (!role) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
+    const { RoleName, Description, IsActive, isSuperAdmin, moduleAccess, pageAccess } = req.body;
+
+    if (RoleName !== undefined) {
+      const clash = await Role.findOne({ RoleName: RoleName.trim(), _id: { $ne: role._id } });
+      if (clash) return res.status(409).json({ success: false, message: 'Role name already taken' });
+      role.RoleName = RoleName.trim();
+    }
+    if (Description  !== undefined) role.Description  = Description;
+    if (IsActive     !== undefined) role.IsActive      = IsActive;
+    if (isSuperAdmin !== undefined) role.isSuperAdmin  = !!isSuperAdmin;
+
+    // If access maps are being updated, regenerate the permission list
+    if (moduleAccess !== undefined || pageAccess !== undefined) {
+      const ma = moduleAccess ?? mapToObj(role.moduleAccess);
+      const pa = pageAccess   ?? mapToObj(role.pageAccess);
+
+      role.moduleAccess = new Map(Object.entries(ma).map(([k, v]) => [k, !!v]));
+      role.pageAccess   = buildPageAccessMap(pa);
+      role.permissions  = role.isSuperAdmin
+        ? []
+        : await resolvePermissionIds(ma, pa, req.user._id);
+    }
+
+    role.UpdatedBy = req.user._id;
+    await role.save();
+
+    const populated = await Role.findById(role._id)
+      .populate({ path: 'permissions', select: 'module page action name' });
+
+    return res.status(200).json({ success: true, data: formatRole(populated) });
+  } catch (err) { next(err); }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DELETE ROLE
+// DELETE /api/roles/:id
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.deleteRole = async (req, res, next) => {
+  try {
+    const role = await Role.findById(req.params.id);
+    if (!role) return res.status(404).json({ success: false, message: 'Role not found' });
+
+    if (role.isSuperAdmin) {
+      return res.status(400).json({ success: false, message: 'Cannot delete a SuperAdmin role' });
+    }
+
+    const activeUsers = await User.countDocuments({ RoleID: role._id, Status: 'active' });
+    if (activeUsers > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete — ${activeUsers} active user(s) still hold this role`
       });
     }
 
-    // Delete role
     await role.deleteOne();
+    return res.status(200).json({ success: true, message: 'Role deleted' });
+  } catch (err) { next(err); }
+};
 
-    res.json({
-      success: true,
-      message: 'Role deleted successfully'
-    });
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET ALL PERMISSIONS  —  for the role-builder UI
+// GET /api/roles/permissions
+// Returns flat array + grouped by module→page→actions
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.getAllPermissions = async (req, res, next) => {
+  try {
+    const perms = await Permission.find({ is_active: true })
+      .select('module page action name')
+      .sort({ module: 1, page: 1, action: 1 })
+      .lean();
 
-  } catch (error) {
-    console.error(error);
-    
-    if (error.kind === 'ObjectId') {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Role not found' 
-      });
+    // Group for easy frontend consumption when building role form
+    const grouped = {};
+    for (const p of perms) {
+      if (!grouped[p.module])         grouped[p.module] = {};
+      if (!grouped[p.module][p.page]) grouped[p.module][p.page] = [];
+      grouped[p.module][p.page].push(p.action);
     }
 
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
-  }
-};
-
-// @desc    Get role statistics
-// @route   GET /api/roles/stats
-// @access  Public
-const getRoleStats = async (req, res) => {
-  try {
-    const totalRoles = await Role.countDocuments();
-    const activeRoles = await Role.countDocuments({ IsActive: true });
-    const inactiveRoles = await Role.countDocuments({ IsActive: false });
-
-    res.json({
+    return res.status(200).json({
       success: true,
-      data: {
-        totalRoles,
-        activeRoles,
-        inactiveRoles
-      }
+      total:   perms.length,
+      flat:    perms,      // [ { module, page, action, name }, … ]
+      grouped              // { MODULE: { page: [actions] } }
     });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
-  }
+  } catch (err) { next(err); }
 };
 
-// @desc    Get active roles dropdown
-// @route   GET /api/roles/dropdown
-// @access  Public
-const getRolesDropdown = async (req, res) => {
-  try {
-    const roles = await Role.find({ IsActive: true })
-      .select('RoleName Description')
-      .sort({ RoleName: 1 });
-
-    res.json({
-      success: true,
-      data: roles
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Server error' 
-    });
-  }
-};
-
-module.exports = {
-  getRoles,
-  getRole,
-  createRole,
-  updateRole,
-  deleteRole,
-  getRoleStats,
-  getRolesDropdown
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET SIDEBAR STRUCTURE  —  for admin UI to build the role toggle form
+// GET /api/roles/sidebar-structure
+// ═══════════════════════════════════════════════════════════════════════════════
+exports.getSidebarStructure = (req, res) => {
+  res.status(200).json({ success: true, data: sidebarStructure });
 };

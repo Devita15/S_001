@@ -1,133 +1,146 @@
-const jwt = require('jsonwebtoken');
+
+
+
+// middleware/authMiddleware.js
+'use strict';
+
+const jwt  = require('jsonwebtoken');
 const User = require('../models/user\'s & setting\'s/User');
-const protect = async (req, res, next) => {
-  let token;
+const { AsyncLocalStorage } = require('async_hooks');
 
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    try {
-      token = req.headers.authorization.split(' ')[1];
+// ── Request-scoped storage — no shared global state between requests ──────────
+const als = new AsyncLocalStorage();
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-      req.user = await User.findById(decoded.id)
-        .select('-PasswordHash -RefreshToken -ResetPasswordToken -ResetPasswordExpire')
-        .populate('RoleID', 'RoleName Permissions');
-
-      if (!req.user) {
-        return res.status(401).json({
-          success: false,
-          message: 'User not found'
-        });
-      }
-
-      if (req.user.Status !== 'active') {
-        return res.status(401).json({
-          success: false,
-          message: 'Account is inactive. Please contact administrator.'
-        });
-      }
-
-      // Add role name and permissions to user object
-      req.user.RoleName = req.user.RoleID ? req.user.RoleID.RoleName : null;
-      req.user.Permissions = req.user.RoleID ? req.user.RoleID.Permissions : [];
-
-      next();
-    } catch (error) {
-      console.error('Auth error:', error);
-      return res.status(401).json({
-        success: false,
-        message: 'Not authorized'
-      });
-    }
-  }
-
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: 'Not authorized, no token'
-    });
-  }
+const getCurrentUser = () => {
+  const store = als.getStore();
+  return store ? store.get('user') : null;
 };
 
-// Role-based authorization - CEO/SuperAdmin have all access
-const authorize = (...roles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Not authorized'
-      });
-    }
-
-    const userRole = req.user.RoleName;
-    
-    // SuperAdmin (CEO) has access to everything
-    if (userRole === 'SuperAdmin' || userRole === 'CEO') {
-      return next();
-    }
-    
-    if (!userRole || !roles.includes(userRole)) {
-      return res.status(403).json({
-        success: false,
-        message: `Access denied. Required roles: ${roles.join(', ')}`
-      });
-    }
-
-    next();
-  };
-};
-
-// Permission-based authorization
-const hasPermission = (permission) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Not authorized'
-      });
-    }
-
-    // SuperAdmin (CEO) has all permissions
-    if (req.user.RoleName === 'SuperAdmin' || req.user.RoleName === 'CEO') {
-      return next();
-    }
-
-    if (!req.user.Permissions || !req.user.Permissions.includes(permission)) {
-      return res.status(403).json({
-        success: false,
-        message: `Access denied. Required permission: ${permission}`
-      });
-    }
-
-    next();
-  };
-};
-
-const generateToken = (user) => {
-  return jwt.sign(
-    {
-      id: user._id,
-      username: user.Username,
-      email: user.Email,
-      role: user.RoleName
-    },
+// ── Token helpers ─────────────────────────────────────────────────────────────
+const generateToken = (user) =>
+  jwt.sign(
+    { id: user._id, username: user.Username, email: user.Email },
     process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRE }
+    { expiresIn: process.env.JWT_EXPIRE || '8h' }
   );
-};
 
-const generateRefreshToken = (user) => {
-  return jwt.sign(
+const generateRefreshToken = (user) =>
+  jwt.sign(
     { id: user._id },
-    process.env.JWT_SECRET + user.PasswordHash,
+    process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET + '_refresh',
     { expiresIn: '30d' }
   );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// protect  —  verify JWT, attach user to req
+// ═══════════════════════════════════════════════════════════════════════════════
+const protect = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header?.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'Not authorized — no token provided' });
+    }
+
+    const token   = header.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Always re-read from DB — stale tokens can't grant access after role/status change
+    const user = await User.findById(decoded.id)
+      .select('-PasswordHash -RefreshToken -ResetPasswordToken -ResetPasswordExpire')
+      .populate({ path: 'RoleID', select: 'RoleName isSuperAdmin IsActive' });
+
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'User no longer exists' });
+    }
+    if (user.Status !== 'active') {
+      return res.status(401).json({ success: false, message: 'Account is inactive — contact admin' });
+    }
+    if (user.RoleID && !user.RoleID.IsActive) {
+      return res.status(401).json({ success: false, message: 'Assigned role is inactive' });
+    }
+
+    // Convenience shortcuts
+    user.RoleName = user.RoleID?.RoleName || null;
+    user._isSA    = !!(user.RoleID?.isSuperAdmin);
+
+    req.user = user;
+
+    // Store in ALS so getCurrentUser() works anywhere in this request
+    const store = new Map();
+    store.set('user', user);
+    als.run(store, () => next());
+
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ success: false, message: 'Token expired — please log in again' });
+    }
+    if (err.name === 'JsonWebTokenError') {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
+    console.error('protect error:', err);
+    return res.status(500).json({ success: false, message: 'Authentication error' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// authorize  —  role-name gate
+// Usage:  router.get('/admin', protect, authorize('SuperAdmin', 'HR Manager'), handler)
+// ═══════════════════════════════════════════════════════════════════════════════
+const authorize = (...allowedRoles) => (req, res, next) => {
+  if (!req.user) return res.status(401).json({ success: false, message: 'Not authorized' });
+  if (req.user._isSA) return next();   // SuperAdmin always passes
+
+  if (!allowedRoles.includes(req.user.RoleName)) {
+    return res.status(403).json({
+      success: false,
+      message: `Access denied. Required role(s): ${allowedRoles.join(', ')}`
+    });
+  }
+  next();
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// can  —  module + page + action gate (mirrors frontend hasSafePagePermission)
+//
+// Usage:
+//   protect, can('COMPANY_MASTER', 'Organization / Company', 'VIEW')
+//   protect, can('EMPLOYEE_MASTER', 'Employee Registry', 'DELETE')
+//   protect, can('QUOTATION_MASTER', 'Quotation', 'APPROVE')
+// ═══════════════════════════════════════════════════════════════════════════════
+const can = (module, page, action) => async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ success: false, message: 'Not authorized' });
+    if (req.user._isSA) return next();
+
+    const allowed = await req.user.can(module, page, action);
+    if (!allowed) {
+      return res.status(403).json({
+        success: false,
+        message: `Access denied — missing permission: ${module} → ${page} → ${action}`
+      });
+    }
+    next();
+  } catch (err) {
+    console.error('can middleware error:', err);
+    return res.status(500).json({ success: false, message: 'Permission check error' });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// requireSuperAdmin  —  hard gate, only isSuperAdmin role passes
+// ═══════════════════════════════════════════════════════════════════════════════
+const requireSuperAdmin = (req, res, next) => {
+  if (!req.user)     return res.status(401).json({ success: false, message: 'Not authorized' });
+  if (!req.user._isSA) return res.status(403).json({ success: false, message: 'SuperAdmin access required' });
+  next();
 };
 
 module.exports = {
   protect,
   authorize,
-  hasPermission,
+  can,
+  requireSuperAdmin,
   generateToken,
-  generateRefreshToken
+  generateRefreshToken,
+  getCurrentUser
 };

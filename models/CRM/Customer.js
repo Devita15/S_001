@@ -101,12 +101,19 @@ const customerSchema = new mongoose.Schema({
   // ── §1.6.2  Tax & Compliance ───────────────────────────────────────────────
   gstin: {
     type: String,
-    default: null,
-    // Sparse unique — null allowed (unregistered), set must be valid
-    match: [
-      /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/,
-      'Invalid GSTIN format',
-    ],
+    sparse: true,  // This allows multiple nulls in unique index
+    unique: true,
+    trim: true,
+    uppercase: true,
+    validate: {
+      validator: function(v) {
+        // If value is null, empty, or undefined, skip validation (allow null)
+        if (!v || v === '') return true;
+        // Validate GSTIN format
+        return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/.test(v);
+      },
+      message: 'Invalid GSTIN format - expected e.g. 27AAECS7112G1Z5'
+    }
   },
   pan: {
     type: String,
@@ -188,7 +195,14 @@ const customerSchema = new mongoose.Schema({
 
 
 // ── Indexes ───────────────────────────────────────────────────────────────────
-customerSchema.index({ gstin: 1 }, { unique: true, sparse: true });
+customerSchema.index(
+  { gstin: 1 }, 
+  { 
+    unique: true, 
+    sparse: true,
+    partialFilterExpression: { gstin: { $exists: true, $ne: null, $ne: "" } }
+  }
+);
 customerSchema.index({ customer_code: 1 }, { unique: true });
 customerSchema.index({ customer_name: 'text' });
 customerSchema.index({ customer_type: 1, priority: 1 });

@@ -216,16 +216,48 @@ const multerErr = (err, req, res, next) => {
  *             billing_address:
  *               type: object
  *               required: [line1, city, state, state_code, pincode]
- *               description: "Required — Customer model needs state and state_code (min 1)"
  *               properties:
  *                 line1:      { type: string, example: "Kalwa Works, Plot No 12" }
  *                 line2:      { type: string, example: "MIDC Industrial Area" }
  *                 city:       { type: string, example: "Thane" }
  *                 district:   { type: string, example: "Thane" }
  *                 state:      { type: string, example: "Maharashtra" }
- *                 state_code: { type: integer, minimum: 1, maximum: 37, example: 27, description: "GST state code — Maharashtra=27, Gujarat=24, Delhi=07" }
+ *                 state_code: { type: integer, minimum: 1, maximum: 37, example: 27 }
  *                 pincode:    { type: string, example: "400605" }
  *                 country:    { type: string, default: "India", example: "India" }
+ *
+ *     PipelineFunnelStage:
+ *       type: object
+ *       properties:
+ *         status:      { type: string, example: "New" }
+ *         count:       { type: integer, example: 12 }
+ *         total_value: { type: number, example: 450000 }
+ *         pct:         { type: number, example: 24.5, description: "Percentage of all leads at this stage" }
+ *
+ *     ConversionHistory:
+ *       type: object
+ *       properties:
+ *         lead_id:      { type: string, example: "LEAD-202503-0001" }
+ *         is_converted: { type: boolean, example: true }
+ *         converted_at: { type: string, format: date-time }
+ *         customer:
+ *           type: object
+ *           nullable: true
+ *           properties:
+ *             customer_id:   { type: string, example: "CUST-202503-0001" }
+ *             customer_code: { type: string, example: "SIEMENS-001" }
+ *             customer_name: { type: string, example: "Siemens India Ltd" }
+ *             gstin:         { type: string, example: "27AAECS7112G1Z5" }
+ *         audit_trail:
+ *           type: array
+ *           items:
+ *             type: object
+ *             properties:
+ *               changed_by:    { type: string }
+ *               changed_at:    { type: string, format: date-time }
+ *               field_changed: { type: string, example: "is_converted" }
+ *               old_value:     { type: boolean, example: false }
+ *               new_value:     { type: boolean, example: true }
  *
  *   responses:
  *     LeadNotFound:
@@ -303,10 +335,60 @@ router.get('/dashboard', lc.getDashboard);
  *     responses:
  *       200:
  *         description: Overdue leads list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 count:   { type: integer, example: 5 }
+ *                 data:    { type: array, items: { $ref: '#/components/schemas/Lead' } }
  *       401:
  *         $ref: '#/components/responses/Unauthorized'
  */
 router.get('/overdue-followups', lc.getOverdueFollowups);
+
+/**
+ * @swagger
+ * /api/leads/pipeline-funnel:
+ *   get:
+ *     summary: Pipeline funnel — lead count and value at each stage in order
+ *     description: |
+ *       Returns all 8 pipeline stages in order (New → Contacted → Qualified →
+ *       Proposal Sent → Negotiation → Won → Lost → Junk) with count, total_value,
+ *       and percentage of all leads at each stage.
+ *     tags: [Leads]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Pipeline funnel data
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:      { type: boolean, example: true }
+ *                 total_leads:  { type: integer, example: 49 }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/PipelineFunnelStage'
+ *                   example:
+ *                     - { status: "New",           count: 12, total_value: 450000,  pct: 24.5 }
+ *                     - { status: "Contacted",     count: 9,  total_value: 320000,  pct: 18.4 }
+ *                     - { status: "Qualified",     count: 8,  total_value: 280000,  pct: 16.3 }
+ *                     - { status: "Proposal Sent", count: 7,  total_value: 210000,  pct: 14.3 }
+ *                     - { status: "Negotiation",   count: 5,  total_value: 185000,  pct: 10.2 }
+ *                     - { status: "Won",           count: 4,  total_value: 160000,  pct: 8.2  }
+ *                     - { status: "Lost",          count: 3,  total_value: 90000,   pct: 6.1  }
+ *                     - { status: "Junk",          count: 1,  total_value: 0,       pct: 2.0  }
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/pipeline-funnel', lc.getPipelineFunnel);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -547,12 +629,6 @@ router.delete('/:id', lc.deleteLead);
  *             to_contacted:
  *               summary: Move to Contacted
  *               value: { status: "Contacted" }
- *             to_qualified:
- *               summary: Move to Qualified
- *               value: { status: "Qualified" }
- *             to_proposal_sent:
- *               summary: Move to Proposal Sent
- *               value: { status: "Proposal Sent" }
  *             to_won:
  *               summary: Mark as Won
  *               value: { status: "Won", win_remarks: "Won on quality and delivery" }
@@ -617,12 +693,6 @@ router.put('/:id/status', validate(v.statusTransitionSchema), lc.updateStatus);
  *                 outcome: "Positive"
  *                 next_action: "Send revised quotation with 5% discount"
  *                 next_action_date: "2025-03-27T10:00:00Z"
- *             email:
- *               summary: Email sent
- *               value:
- *                 channel: "Email"
- *                 summary: "Sent quotation QT-202503-0042 to customer"
- *                 outcome: "Neutral"
  *     responses:
  *       200:
  *         description: Follow-up logged
@@ -644,7 +714,7 @@ router.post('/:id/followup', validate(v.followUpSchema), lc.addFollowUp);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DRAWING UPLOAD
+// DRAWING UPLOAD & LIST
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -692,6 +762,52 @@ router.post('/:id/followup', validate(v.followUpSchema), lc.addFollowUp);
  */
 router.post('/:id/drawing', upload.single('drawing'), multerErr, lc.uploadDrawing);
 
+/**
+ * @swagger
+ * /api/leads/{id}/drawings:
+ *   get:
+ *     summary: List all drawing revisions for a lead
+ *     description: |
+ *       Returns all drawings split into `latest` (is_latest=true) and
+ *       `revisions` (is_latest=false), plus the full `all` array.
+ *       Use this to render the drawing revision history table in the UI.
+ *     tags: [Leads]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: string }, description: "Lead MongoDB ObjectId" }
+ *     responses:
+ *       200:
+ *         description: Drawing list with revision history
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:   { type: boolean, example: true }
+ *                 lead_id:   { type: string, example: "LEAD-202503-0001" }
+ *                 count:     { type: integer, example: 3, description: "Total drawings including all revisions" }
+ *                 latest:
+ *                   type: array
+ *                   description: "Only is_latest=true drawings — one per drawing_no"
+ *                   items: { $ref: '#/components/schemas/Drawing' }
+ *                 revisions:
+ *                   type: array
+ *                   description: "Older revisions — is_latest=false"
+ *                   items: { $ref: '#/components/schemas/Drawing' }
+ *                 all:
+ *                   type: array
+ *                   description: "Complete list — latest + revisions combined"
+ *                   items: { $ref: '#/components/schemas/Drawing' }
+ *       404:
+ *         $ref: '#/components/responses/LeadNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/:id/drawings', lc.getDrawings);
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FEASIBILITY — TWO-LAYER DESIGN
@@ -702,18 +818,6 @@ router.post('/:id/drawing', upload.single('drawing'), multerErr, lc.uploadDrawin
  * /api/leads/{id}/feasibility-check:
  *   get:
  *     summary: Layer 1 — System auto-check (no human input needed)
- *     description: |
- *       Reads enquired_items[] from the lead and runs 5 checks per item in parallel.
- *       No body required. Response in ~200ms.
- *
- *       **Checks per item:**
- *       - Item Master — does part_no exist?
- *       - RawMaterial Master — is material_grade registered with current ₹/kg rate?
- *       - DimensionWeight Master — is T×W×L record available?
- *       - Process Master — are active processes registered?
- *       - Stock Ledger — is RM of this grade in stock?
- *
- *       **Status values:** pass | fail | conditional | skip
  *     tags: [Leads]
  *     security:
  *       - bearerAuth: []
@@ -722,28 +826,6 @@ router.post('/:id/drawing', upload.single('drawing'), multerErr, lc.uploadDrawin
  *     responses:
  *       200:
  *         description: Auto-check result
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success: { type: boolean, example: true }
- *                 data:
- *                   type: object
- *                   properties:
- *                     lead_id:          { type: string }
- *                     overall_feasible: { type: boolean }
- *                     overall_verdict:  { type: string, enum: [Feasible, "Conditionally Feasible", "Not Feasible"] }
- *                     summary:
- *                       type: object
- *                       properties:
- *                         total_items:            { type: integer }
- *                         feasible_items:         { type: integer }
- *                         conditionally_feasible: { type: integer }
- *                         not_feasible_items:     { type: integer }
- *                     items:      { type: array, items: { $ref: '#/components/schemas/FeasibilityItemResult' } }
- *                     checked_at: { type: string, format: date-time }
- *                     note:       { type: string }
  *       400:
  *         description: No enquired items on this lead
  *       404:
@@ -758,13 +840,6 @@ router.get('/:id/feasibility-check', lc.getFeasibilityCheck);
  * /api/leads/{id}/feasibility:
  *   post:
  *     summary: Layer 2 — Production confirm or override
- *     description: |
- *       Internally runs Layer 1 auto-check, saves engineer's decision, returns both side by side.
- *
- *       **Use cases:**
- *       - Confirm → feasibility_status: "Feasible"
- *       - Override with condition → feasibility_status: "Conditionally Feasible" + notes
- *       - Reject system pass → feasibility_status: "Not Feasible" + reason
  *     tags: [Leads]
  *     security:
  *       - bearerAuth: []
@@ -776,33 +851,9 @@ router.get('/:id/feasibility-check', lc.getFeasibilityCheck);
  *         application/json:
  *           schema:
  *             $ref: '#/components/schemas/FeasibilitySubmit'
- *           examples:
- *             feasible:
- *               summary: Confirm Feasible
- *               value:
- *                 feasibility_status: "Feasible"
- *                 feasibility_notes: "C11000 available. Existing 80T press fits. 3-week delivery."
- *             conditional:
- *               summary: Conditionally Feasible
- *               value:
- *                 feasibility_status: "Conditionally Feasible"
- *                 feasibility_notes: "Feasible if customer bears tooling cost Rs 45000. 2-week new punch lead time."
- *             not_feasible:
- *               summary: Not Feasible
- *               value:
- *                 feasibility_status: "Not Feasible"
- *                 feasibility_notes: "Tolerance 0.02mm not achievable on current press."
  *     responses:
  *       200:
- *         description: Feasibility saved — decision + auto-check result both returned
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:           { type: boolean, example: true }
- *                 data:              { $ref: '#/components/schemas/Lead' }
- *                 auto_check_result: { type: object, description: "Layer 1 result run at submission time" }
+ *         description: Feasibility saved
  *       400:
  *         $ref: '#/components/responses/ValidationError'
  *       404:
@@ -821,16 +872,7 @@ router.post('/:id/feasibility', validate(v.feasibilitySchema), lc.submitFeasibil
  * @swagger
  * /api/leads/{id}/convert:
  *   post:
- *     summary: Convert Won lead to Customer — atomic MongoDB transaction
- *     description: |
- *       Lead must have status = Won. Runs inside MongoDB transaction.
- *
- *       **3 ways to call:**
- *       1. Send existing_customer_id → links lead to that customer
- *       2. Send new_customer.customer_code → auto-detects by GSTIN then company name. Links if found, creates if not.
- *       3. Empty body {} → auto-detect only
- *
- *       Response includes is_existing_customer: true/false.
+ *     summary: Convert Won lead to Customer
  *     tags: [Leads]
  *     security:
  *       - bearerAuth: []
@@ -842,59 +884,9 @@ router.post('/:id/feasibility', validate(v.feasibilitySchema), lc.submitFeasibil
  *         application/json:
  *           schema:
  *             $ref: '#/components/schemas/ConvertLead'
- *           examples:
- *             new_customer_minimum:
- *               summary: New customer — minimum required fields
- *               value:
- *                 new_customer:
- *                   customer_code: "SIEMENS-001"
- *                   customer_type: "OEM"
- *                   billing_address:
- *                     line1: "Kalwa Works, Plot No 12"
- *                     city: "Thane"
- *                     state: "Maharashtra"
- *                     state_code: 27
- *                     pincode: "400605"
- *             new_customer_full:
- *               summary: New customer — full details
- *               value:
- *                 new_customer:
- *                   customer_code: "SIEMENS-001"
- *                   customer_type: "OEM"
- *                   gstin: "27AAECS7112G1Z5"
- *                   priority: "Key Account"
- *                   credit_limit: 500000
- *                   credit_days: 45
- *                   payment_terms: "Net 45"
- *                   billing_address:
- *                     line1: "Kalwa Works, Plot No 12"
- *                     line2: "MIDC Industrial Area"
- *                     city: "Thane"
- *                     district: "Thane"
- *                     state: "Maharashtra"
- *                     state_code: 27
- *                     pincode: "400605"
- *                     country: "India"
- *             link_existing:
- *               summary: Link to existing customer
- *               value:
- *                 existing_customer_id: "64f8e9b7a1b2c3d4e5f6a7b8"
- *             auto_detect:
- *               summary: Auto-detect by GSTIN or company name
- *               value: {}
  *     responses:
  *       201:
  *         description: Lead converted or linked
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:              { type: boolean, example: true }
- *                 message:              { type: string, example: "Lead converted — new customer created" }
- *                 is_existing_customer: { type: boolean, example: false }
- *                 customer:             { type: object }
- *                 lead_id:              { type: string }
  *       400:
  *         description: Lead not Won or already converted
  *       409:
@@ -905,5 +897,69 @@ router.post('/:id/feasibility', validate(v.feasibilitySchema), lc.submitFeasibil
  *         $ref: '#/components/responses/Unauthorized'
  */
 router.post('/:id/convert', lc.convertLead);
+
+/**
+ * @swagger
+ * /api/leads/{id}/conversion-history:
+ *   get:
+ *     summary: Get conversion audit trail for a lead
+ *     description: |
+ *       Returns whether the lead was converted, when it was converted,
+ *       which customer it was linked to, and the full audit log entries
+ *       for the conversion event.
+ *
+ *       Useful for compliance, dispute resolution, and conversion timeline display.
+ *     tags: [Leads]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: string }, description: "Lead MongoDB ObjectId" }
+ *     responses:
+ *       200:
+ *         description: Conversion history
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:    { $ref: '#/components/schemas/ConversionHistory' }
+ *             examples:
+ *               converted:
+ *                 summary: Lead that has been converted
+ *                 value:
+ *                   success: true
+ *                   data:
+ *                     lead_id: "LEAD-202503-0001"
+ *                     is_converted: true
+ *                     converted_at: "2025-03-15T09:30:00.000Z"
+ *                     customer:
+ *                       customer_id: "CUST-202503-0001"
+ *                       customer_code: "SIEMENS-001"
+ *                       customer_name: "Siemens India Ltd"
+ *                       gstin: "27AAECS7112G1Z5"
+ *                     audit_trail:
+ *                       - field_changed: "is_converted"
+ *                         old_value: false
+ *                         new_value: true
+ *                         changed_at: "2025-03-15T09:30:00.000Z"
+ *               not_converted:
+ *                 summary: Lead not yet converted
+ *                 value:
+ *                   success: true
+ *                   data:
+ *                     lead_id: "LEAD-202503-0042"
+ *                     is_converted: false
+ *                     converted_at: null
+ *                     customer: null
+ *                     audit_trail: []
+ *       404:
+ *         $ref: '#/components/responses/LeadNotFound'
+ *       401:
+ *         $ref: '#/components/responses/Unauthorized'
+ *       500:
+ *         description: Server error
+ */
+router.get('/:id/conversion-history', lc.getConversionHistory);
 
 module.exports = router;

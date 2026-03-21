@@ -1,86 +1,44 @@
-﻿const express = require('express');
-const router = express.Router();
+﻿// routes/user's & setting's/userRoutes.js
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+
 const {
   getAllUsers,
   getUserById,
   updateUser,
   deleteUser,
+  grantPermissions,
+  revokePermissions,
+  getUserPermissions
 } = require("../../controllers/user's & setting's/userController");
-const { protect, authorize } = require('../../middleware/authMiddleware');
+
+const { protect, can, requireSuperAdmin } = require('../../middleware/authMiddleware');
+
+/**
+ * @swagger
+ * tags:
+ *   name: Users
+ *   description: User management — list, detail, update, delete, permission management
+ */
 
 /**
  * @swagger
  * components:
  *   schemas:
- *     RoleResponse:
+ *
+ *     UserListItem:
  *       type: object
  *       properties:
  *         _id:
  *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7b8"
- *         RoleName:
- *           type: string
- *           example: "SuperAdmin"
- *         Description:
- *           type: string
- *           example: "Full system access"
- *         Permissions:
- *           type: array
- *           items:
- *             type: string
- *           example: ["manage_users", "manage_roles", "view_reports"]
- * 
- *     EmployeeResponse:
- *       type: object
- *       properties:
- *         _id:
- *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7b9"
- *         FirstName:
- *           type: string
- *           example: "John"
- *         LastName:
- *           type: string
- *           example: "Doe"
- *         Email:
- *           type: string
- *           example: "john.doe@company.com"
- *         EmployeeID:
- *           type: string
- *           example: "EMP001"
- *         DepartmentID:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *             DepartmentName:
- *               type: string
- *         DesignationID:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *             DesignationName:
- *               type: string
- *             Level:
- *               type: number
- * 
- *     UserResponse:
- *       type: object
- *       properties:
- *         _id:
- *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7c0"
  *         Username:
  *           type: string
- *           example: "john_doe"
+ *           example: "hr_manager_01"
  *         Email:
  *           type: string
- *           example: "john@example.com"
- *         RoleID:
- *           $ref: '#/components/schemas/RoleResponse'
- *         EmployeeID:
- *           $ref: '#/components/schemas/EmployeeResponse'
+ *           example: "hr@company.com"
  *         Status:
  *           type: string
  *           enum: [active, inactive, blocked]
@@ -88,9 +46,8 @@ const { protect, authorize } = require('../../middleware/authMiddleware');
  *         LastLogin:
  *           type: string
  *           format: date-time
- *           example: "2024-01-15T10:30:00.000Z"
  *         LoginAttempts:
- *           type: number
+ *           type: integer
  *           example: 0
  *         LockUntil:
  *           type: string
@@ -99,44 +56,125 @@ const { protect, authorize } = require('../../middleware/authMiddleware');
  *         CreatedAt:
  *           type: string
  *           format: date-time
- *           example: "2024-01-15T10:30:00.000Z"
  *         UpdatedAt:
  *           type: string
  *           format: date-time
- *           example: "2024-01-15T10:30:00.000Z"
- * 
- *     UserUpdateRequest:
+ *         RoleID:
+ *           $ref: '#/components/schemas/RoleRef'
+ *
+ *     UserDetail:
  *       type: object
  *       properties:
+ *         _id:
+ *           type: string
  *         Username:
  *           type: string
- *           example: "john_doe_updated"
- *           minLength: 3
- *           maxLength: 50
  *         Email:
  *           type: string
- *           format: email
- *           example: "john.updated@example.com"
- *         RoleID:
- *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7b8"
- *         EmployeeID:
- *           type: string
- *           nullable: true
- *           example: "64f8e9b7a1b2c3d4e5f6a7b9"
- *           description: "Set to null or empty string to remove employee link"
  *         Status:
  *           type: string
  *           enum: [active, inactive, blocked]
- *         LoginAttempts:
- *           type: number
- *           example: 0
- *         LockUntil:
+ *         LastLogin:
+ *           type: string
+ *           format: date-time
+ *         CreatedAt:
+ *           type: string
+ *           format: date-time
+ *         UpdatedAt:
+ *           type: string
+ *           format: date-time
+ *         isSuperAdmin:
+ *           type: boolean
+ *           example: false
+ *         role:
+ *           $ref: '#/components/schemas/RoleRef'
+ *         permissions:
+ *           type: array
+ *           description: >
+ *             Final resolved permissions saved at creation time.
+ *             Includes source field — role | direct.
+ *           items:
+ *             $ref: '#/components/schemas/PermissionItem'
+ *         permissionsCount:
+ *           type: integer
+ *           example: 9
+ *
+ *     UserUpdateRequest:
+ *       type: object
+ *       description: All fields optional — send only what you want to change
+ *       properties:
+ *         Username:
+ *           type: string
+ *           minLength: 3
+ *           maxLength: 50
+ *           example: "hr_manager_01_updated"
+ *         Email:
+ *           type: string
+ *           format: email
+ *           example: "hr.updated@company.com"
+ *         RoleID:
+ *           type: string
+ *           example: "665abc000000000000000001"
+ *         Status:
+ *           type: string
+ *           enum: [active, inactive, blocked]
+ *           example: "inactive"
+ *
+ *     GrantRequest:
+ *       type: object
+ *       description: >
+ *         Grant permissions to a user. Use moduleAccess/pageAccess (preferred)
+ *         or raw permission IDs (fallback).
+ *       properties:
+ *         moduleAccess:
+ *           type: object
+ *           description: "Preferred: same format as role creation"
+ *           example:
+ *             EMPLOYEE_MASTER: true
+ *         pageAccess:
+ *           type: object
+ *           description: "Required when moduleAccess is provided"
+ *           example:
+ *             EMPLOYEE_MASTER:
+ *               "Employee Registry": ["DELETE"]
+ *         permissions:
+ *           type: array
+ *           description: "Fallback: raw Permission document IDs"
+ *           items:
+ *             type: string
+ *           example: ["665abc000000000000000010"]
+ *         expiresAt:
  *           type: string
  *           format: date-time
  *           nullable: true
- * 
- *     PaginationInfo:
+ *           description: "Optional expiry. Null = permanent."
+ *           example: "2025-12-31T23:59:59.000Z"
+ *
+ *     RevokeRequest:
+ *       type: object
+ *       required: [permissions]
+ *       properties:
+ *         permissions:
+ *           type: array
+ *           description: Permission document IDs to remove
+ *           items:
+ *             type: string
+ *           example: ["665abc000000000000000010"]
+ *
+ *     GrantRevokeResponse:
+ *       type: object
+ *       properties:
+ *         success:
+ *           type: boolean
+ *           example: true
+ *         message:
+ *           type: string
+ *           example: "2 permission(s) granted"
+ *         permissionsCount:
+ *           type: integer
+ *           example: 11
+ *
+ *     Pagination:
  *       type: object
  *       properties:
  *         currentPage:
@@ -147,73 +185,22 @@ const { protect, authorize } = require('../../middleware/authMiddleware');
  *           example: 5
  *         totalItems:
  *           type: integer
- *           example: 45
+ *           example: 48
  *         itemsPerPage:
  *           type: integer
  *           example: 10
- *         hasNextPage:
- *           type: boolean
- *           example: true
- *         hasPrevPage:
- *           type: boolean
- *           example: false
- * 
- *     UsersListResponse:
- *       type: object
- *       properties:
- *         success:
- *           type: boolean
- *           example: true
- *         data:
- *           type: object
- *           properties:
- *             users:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/UserResponse'
- *             pagination:
- *               $ref: '#/components/schemas/PaginationInfo'
- *         message:
- *           type: string
- *           example: "Users retrieved successfully"
- * 
- *     BulkUpdateRequest:
- *       type: object
- *       required:
- *         - userIds
- *         - status
- *       properties:
- *         userIds:
- *           type: array
- *           items:
- *             type: string
- *           example: ["64f8e9b7a1b2c3d4e5f6a7c0", "64f8e9b7a1b2c3d4e5f6a7c1"]
- *         status:
- *           type: string
- *           enum: [active, inactive, blocked]
- *           example: "active"
- * 
- *   securitySchemes:
- *     bearerAuth:
- *       type: http
- *       scheme: bearer
- *       bearerFormat: JWT
  */
 
-/**
- * @swagger
- * tags:
- *   name: User Management
- *   description: User management and administration endpoints
- */
-
+// ══════════════════════════════════════════════════════════════════════════════
+// GET /api/users
+// ══════════════════════════════════════════════════════════════════════════════
 /**
  * @swagger
  * /api/users:
  *   get:
- *     summary: Get all users with filtering and pagination
- *     tags: [User Management]
- *     description: Retrieve paginated list of users with optional filtering (Admin/SuperAdmin only)
+ *     summary: List all users (paginated)
+ *     tags: [Users]
+ *     description: Requires **USERS → Users → VIEW** permission.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -228,82 +215,78 @@ const { protect, authorize } = require('../../middleware/authMiddleware');
  *         schema:
  *           type: integer
  *           default: 10
- *         description: Number of items per page
+ *         description: Items per page
  *       - in: query
  *         name: search
  *         schema:
  *           type: string
- *         description: Search by username or email
+ *         description: Search by Username or Email
  *       - in: query
  *         name: status
  *         schema:
  *           type: string
  *           enum: [active, inactive, blocked]
- *         description: Filter by user status
+ *         description: Filter by status
  *       - in: query
  *         name: roleId
  *         schema:
  *           type: string
- *         description: Filter by role ID
+ *         description: Filter by Role ID
  *       - in: query
  *         name: sortBy
  *         schema:
  *           type: string
  *           default: CreatedAt
  *           enum: [CreatedAt, UpdatedAt, Username, Email, Status, LastLogin]
- *         description: Field to sort by
+ *         description: Sort field
  *       - in: query
  *         name: sortOrder
  *         schema:
  *           type: string
  *           default: desc
  *           enum: [asc, desc]
- *         description: Sort order
+ *         description: Sort direction
  *     responses:
  *       200:
- *         description: Users retrieved successfully
+ *         description: Users list
  *         content:
  *           application/json:
  *             schema:
- *               $ref: '#/components/schemas/UsersListResponse'
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/UserListItem'
+ *                 pagination:
+ *                   $ref: '#/components/schemas/Pagination'
  *       401:
  *         description: Not authenticated
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "Not authorized, no token"
  *       403:
- *         description: Not authorized
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "Not authorized to access this route"
+ *         description: Missing USERS → Users → VIEW permission
  *       500:
  *         description: Server error
  */
-router.get('/', getAllUsers);
+router.get('/', protect, can('USERS', 'Users', 'VIEW'), getAllUsers);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// GET /api/users/:id
+// ══════════════════════════════════════════════════════════════════════════════
 /**
  * @swagger
  * /api/users/{id}:
  *   get:
- *     summary: Get user by ID
- *     tags: [User Management]
- *     description: Retrieve detailed user information by ID (Admin/SuperAdmin only)
+ *     summary: Get one user with their final resolved permissions
+ *     tags: [Users]
+ *     description: |
+ *       Returns the user record with their permissions.
+ *
+ *       Permissions are **exactly what was saved at creation time** — no dynamic
+ *       role resolution. The `source` field on each permission tells you whether
+ *       it came from `role` or `direct` override.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -315,7 +298,7 @@ router.get('/', getAllUsers);
  *         description: User ID
  *     responses:
  *       200:
- *         description: User retrieved successfully
+ *         description: User detail
  *         content:
  *           application/json:
  *             schema:
@@ -325,52 +308,34 @@ router.get('/', getAllUsers);
  *                   type: boolean
  *                   example: true
  *                 data:
- *                   $ref: '#/components/schemas/UserResponse'
- *                 message:
- *                   type: string
- *                   example: "User retrieved successfully"
+ *                   $ref: '#/components/schemas/UserDetail'
  *       400:
- *         description: Invalid user ID format
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "Invalid user ID format"
+ *         description: Invalid user ID
  *       401:
  *         description: Not authenticated
  *       403:
- *         description: Not authorized
+ *         description: Missing USERS → Users → VIEW permission
  *       404:
  *         description: User not found
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "User not found"
  *       500:
  *         description: Server error
  */
-router.get('/:id', getUserById);
+router.get('/:id', protect, can('USERS', 'Users', 'VIEW'), getUserById);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// PATCH /api/users/:id
+// ══════════════════════════════════════════════════════════════════════════════
 /**
  * @swagger
  * /api/users/{id}:
- *   put:
- *     summary: Update user details
- *     tags: [User Management]
- *     description: Update user information (Admin/SuperAdmin only)
+ *   patch:
+ *     summary: Update user (username / email / role / status)
+ *     tags: [Users]
+ *     description: |
+ *       All body fields are optional — send only what you want to change.
+ *
+ *       **Note:** Changing `RoleID` does NOT automatically update the user's saved
+ *       permissions. Use the grant/revoke endpoints to update permissions separately.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -386,6 +351,8 @@ router.get('/:id', getUserById);
  *         application/json:
  *           schema:
  *             $ref: '#/components/schemas/UserUpdateRequest'
+ *           example:
+ *             Status: "inactive"
  *     responses:
  *       200:
  *         description: User updated successfully
@@ -397,42 +364,38 @@ router.get('/:id', getUserById);
  *                 success:
  *                   type: boolean
  *                   example: true
- *                 data:
- *                   $ref: '#/components/schemas/UserResponse'
  *                 message:
  *                   type: string
  *                   example: "User updated successfully"
+ *                 data:
+ *                   $ref: '#/components/schemas/UserListItem'
  *       400:
- *         description: Bad request - validation error or username/email taken
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "Username or Email is already taken"
+ *         description: Validation error or role inactive
  *       401:
  *         description: Not authenticated
  *       403:
- *         description: Not authorized
+ *         description: Missing USERS → Users → UPDATE permission
  *       404:
- *         description: User, Role, or Employee not found
+ *         description: User not found
+ *       409:
+ *         description: Username or Email already taken
  *       500:
  *         description: Server error
  */
-router.put('/:id', updateUser);
+router.patch('/:id', protect, can('USERS', 'Users', 'UPDATE'), updateUser);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// DELETE /api/users/:id
+// ══════════════════════════════════════════════════════════════════════════════
 /**
  * @swagger
  * /api/users/{id}:
  *   delete:
- *     summary: Soft delete user
- *     tags: [User Management]
- *     description: Soft delete user by setting status to inactive (Admin/SuperAdmin only)
+ *     summary: Soft-delete user (sets Status to inactive)
+ *     tags: [Users]
+ *     description: |
+ *       Sets the user's status to `inactive`. Cannot delete your own account
+ *       or any user with a SuperAdmin role.
  *     security:
  *       - bearerAuth: []
  *     parameters:
@@ -444,7 +407,7 @@ router.put('/:id', updateUser);
  *         description: User ID
  *     responses:
  *       200:
- *         description: User deleted successfully
+ *         description: User deactivated successfully
  *         content:
  *           application/json:
  *             schema:
@@ -455,13 +418,44 @@ router.put('/:id', updateUser);
  *                   example: true
  *                 message:
  *                   type: string
- *                   example: "User deleted successfully"
+ *                   example: "User deactivated successfully"
  *       400:
- *         description: Invalid user ID format
+ *         description: Cannot delete your own account
  *       401:
  *         description: Not authenticated
  *       403:
- *         description: Not authorized or cannot delete SuperAdmin
+ *         description: Missing USERS → Users → DELETE permission or target is SuperAdmin
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
+router.delete('/:id', protect, can('USERS', 'Users', 'DELETE'), deleteUser);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GET /api/users/:id/permissions
+// ══════════════════════════════════════════════════════════════════════════════
+/**
+ * @swagger
+ * /api/users/{id}/permissions:
+ *   get:
+ *     summary: Get a user's full resolved permissions
+ *     tags: [Users]
+ *     description: |
+ *       Returns the user's saved permission list with source tagging.
+ *       This is the same list returned by `getMe` and `login`.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User ID
+ *     responses:
+ *       200:
+ *         description: User permissions
  *         content:
  *           application/json:
  *             schema:
@@ -469,15 +463,157 @@ router.put('/:id', updateUser);
  *               properties:
  *                 success:
  *                   type: boolean
- *                   example: false
- *                 message:
- *                   type: string
- *                   example: "Cannot delete SuperAdmin users"
+ *                   example: true
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     userId:
+ *                       type: string
+ *                     Username:
+ *                       type: string
+ *                     RoleName:
+ *                       type: string
+ *                     isSuperAdmin:
+ *                       type: boolean
+ *                     permissions:
+ *                       type: array
+ *                       items:
+ *                         $ref: '#/components/schemas/PermissionItem'
+ *                     total:
+ *                       type: integer
+ *                       example: 9
+ *       400:
+ *         description: Invalid user ID
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: Missing USERS → Users → VIEW permission
  *       404:
  *         description: User not found
  *       500:
  *         description: Server error
  */
-router.delete('/:id', deleteUser);
+router.get('/:id/permissions', protect, can('USERS', 'Users', 'VIEW'), getUserPermissions);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// POST /api/users/:id/permissions/grant
+// ══════════════════════════════════════════════════════════════════════════════
+/**
+ * @swagger
+ * /api/users/{id}/permissions/grant:
+ *   post:
+ *     summary: Grant permissions to a user
+ *     tags: [Users]
+ *     description: |
+ *       **SuperAdmin only.** Adds permissions to the user's saved list.
+ *
+ *       ### Two ways to grant:
+ *       - **Preferred** — send `moduleAccess` + `pageAccess` (same format as role creation)
+ *       - **Fallback** — send raw `permissions` ID array
+ *
+ *       Pass `expiresAt` to make the grant temporary.
+ *       Duplicate permissions are silently skipped.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/GrantRequest'
+ *           examples:
+ *             grantWithMaps:
+ *               summary: "Grant using moduleAccess/pageAccess (preferred)"
+ *               value:
+ *                 moduleAccess:
+ *                   EMPLOYEE_MASTER: true
+ *                 pageAccess:
+ *                   EMPLOYEE_MASTER:
+ *                     "Employee Registry": ["DELETE", "EXPORT"]
+ *             grantWithIds:
+ *               summary: "Grant using raw Permission IDs (fallback)"
+ *               value:
+ *                 permissions: ["665abc000000000000000010", "665abc000000000000000011"]
+ *                 expiresAt: null
+ *             grantTemporary:
+ *               summary: "Temporary grant with expiry"
+ *               value:
+ *                 permissions: ["665abc000000000000000010"]
+ *                 expiresAt: "2025-12-31T23:59:59.000Z"
+ *     responses:
+ *       200:
+ *         description: Permissions granted successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/GrantRevokeResponse'
+ *       400:
+ *         description: Invalid permission IDs or empty request
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: SuperAdmin access required
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
+router.post('/:id/permissions/grant', protect, requireSuperAdmin, grantPermissions);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// POST /api/users/:id/permissions/revoke
+// ══════════════════════════════════════════════════════════════════════════════
+/**
+ * @swagger
+ * /api/users/{id}/permissions/revoke:
+ *   post:
+ *     summary: Revoke permissions from a user
+ *     tags: [Users]
+ *     description: |
+ *       **SuperAdmin only.** Removes permissions from the user's saved list by Permission ID.
+ *       Both `role` and `direct` sourced permissions can be revoked.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/RevokeRequest'
+ *           example:
+ *             permissions: ["665abc000000000000000010"]
+ *     responses:
+ *       200:
+ *         description: Permissions revoked successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/GrantRevokeResponse'
+ *       400:
+ *         description: permissions array is required
+ *       401:
+ *         description: Not authenticated
+ *       403:
+ *         description: SuperAdmin access required
+ *       404:
+ *         description: User not found
+ *       500:
+ *         description: Server error
+ */
+router.post('/:id/permissions/revoke', protect, requireSuperAdmin, revokePermissions);
 
 module.exports = router;

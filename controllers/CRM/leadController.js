@@ -593,3 +593,84 @@ exports.getOverdueFollowups = async (req, res) => {
     res.json({ success: true, count: leads.length, data: leads });
   } catch (e) { err500(res, e); }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/leads/pipeline-funnel
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getPipelineFunnel = async (req, res) => {
+  try {
+    const ORDER = ['New','Contacted','Qualified','Proposal Sent','Negotiation','Won','Lost','Junk'];
+
+    const counts = await Lead.aggregate([
+      { $match: { is_active: true } },
+      { $group: { _id: '$status', count: { $sum: 1 }, total_value: { $sum: '$estimated_value' } } },
+    ]);
+
+    // map into ordered array
+    const map = Object.fromEntries(counts.map(c => [c._id, c]));
+    const funnel = ORDER.map(status => ({
+      status,
+      count:       map[status]?.count       || 0,
+      total_value: map[status]?.total_value || 0,
+    }));
+
+    const total = funnel.reduce((s, f) => s + f.count, 0);
+    const funnelWithPct = funnel.map(f => ({
+      ...f,
+      pct: total ? parseFloat(((f.count / total) * 100).toFixed(1)) : 0,
+    }));
+
+    res.json({ success: true, data: funnelWithPct });
+  } catch (e) { err500(res, e); }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/leads/:id/drawings
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getDrawings = async (req, res) => {
+  try {
+    const lead = await Lead.findOne({ _id: req.params.id, is_active: true })
+      .select('drawings lead_id')
+      .lean();
+
+    if (!lead) return err404(res);
+
+    res.json({
+      success: true,
+      count:   lead.drawings.length,
+      data:    lead.drawings,
+      latest:  lead.drawings.filter(d => d.is_latest),
+    });
+  } catch (e) { err500(res, e); }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/leads/:id/conversion-history
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getConversionHistory = async (req, res) => {
+  try {
+    const lead = await Lead.findOne({ _id: req.params.id, is_active: true })
+      .select('lead_id is_converted converted_at customer_id audit_log')
+      .populate('customer_id', 'customer_id customer_code customer_name gstin')
+      .lean();
+
+    if (!lead) return err404(res);
+
+    const conversionLogs = (lead.audit_log || []).filter(
+      log => log.field_changed === 'is_converted'
+    );
+
+    res.json({
+      success: true,
+      data: {
+        lead_id:      lead.lead_id,
+        is_converted: lead.is_converted,
+        converted_at: lead.converted_at,
+        customer:     lead.customer_id || null,
+        audit_trail:  conversionLogs,
+      },
+    });
+  } catch (e) { err500(res, e); }
+};
