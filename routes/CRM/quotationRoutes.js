@@ -1,17 +1,33 @@
-﻿const express = require('express');
-const router = express.Router();
+﻿'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { protect } = require('../../middleware/authMiddleware');
+
 const {
   getQuotations,
+  getQuotationTemplates,
+  getQuotationsByTemplate,
   getQuotation,
-  createQuotation
+  createQuotation,
+  duplicateQuotation,
+  downloadQuotationAsTemplate,
 } = require('../../controllers/CRM/quotationController');
-const { protect } = require('../../middleware/authMiddleware');
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORTANT — route order matters in Express.
+// Static paths (/templates, /by-template) MUST be registered BEFORE /:id
+// otherwise Express will treat "templates" as an :id parameter value.
+// ─────────────────────────────────────────────────────────────────────────────
+
 
 /**
  * @swagger
  * components:
  *   schemas:
- *     VendorInfo:
+ *
+ *     CustomerInfo:
  *       type: object
  *       required:
  *         - type
@@ -22,47 +38,41 @@ const { protect } = require('../../middleware/authMiddleware');
  *           example: "Existing"
  *         id:
  *           type: string
- *           example: "699edad52668ad28b8854111"
- *           description: "Required if type is 'Existing'"
+ *           example: "64f8e9b7a1b2c3d4e5f6a7c1"
+ *           description: "Required when type is Existing"
+ *         new:
+ *           $ref: '#/components/schemas/NewCustomerDetails'
+ *           description: "Required when type is New"
  *
- *     NewVendorDetails:
+ *     NewCustomerDetails:
  *       type: object
  *       required:
- *         - vendor_name
- *         - state
- *         - state_code
- *         - address
- *         - city
- *         - pincode
- *         - contact_person
- *         - phone
- *         - email
+ *         - customer_name
+ *         - billing_address
  *       properties:
- *         vendor_name:
+ *         customer_name:
  *           type: string
  *           example: "ABC Engineering Works"
- *         vendor_type:
+ *         customer_type:
  *           type: string
- *           enum: [Both, Vendor, Customer]
- *           example: "Both"
+ *           enum: [OEM, Dealer, Distributor, Direct, Government, Export, Other]
+ *           example: "Direct"
  *         gstin:
  *           type: string
  *           example: "27ABCDE1234F1Z5"
- *         state:
+ *         pan:
  *           type: string
- *           example: "Maharashtra"
- *         state_code:
- *           type: number
- *           example: 27
- *         address:
- *           type: string
- *           example: "Plot No. 123, MIDC Industrial Area"
- *         city:
- *           type: string
- *           example: "Mumbai"
- *         pincode:
- *           type: string
- *           example: "400001"
+ *           example: "ABCDE1234F"
+ *         billing_address:
+ *           type: object
+ *           required: [line1, city, state, state_code, pincode]
+ *           properties:
+ *             line1:       { type: string, example: "Plot 123, MIDC" }
+ *             line2:       { type: string, example: "" }
+ *             city:        { type: string, example: "Pune" }
+ *             state:       { type: string, example: "Maharashtra" }
+ *             state_code:  { type: number, example: 27 }
+ *             pincode:     { type: string, example: "411001" }
  *         contact_person:
  *           type: string
  *           example: "Rajesh Kumar"
@@ -72,9 +82,6 @@ const { protect } = require('../../middleware/authMiddleware');
  *         email:
  *           type: string
  *           example: "rajesh@abcengineering.com"
- *         pan:
- *           type: string
- *           example: "ABCDE1234F"
  *
  *     RemarksInfo:
  *       type: object
@@ -84,7 +91,7 @@ const { protect } = require('../../middleware/authMiddleware');
  *           example: "Urgent delivery required within 2 weeks"
  *         customer:
  *           type: string
- *           example: "Please ensure all parts are tested before dispatch and provide test certificates"
+ *           example: "Please provide test certificates with each lot"
  *
  *     FinancialsInfo:
  *       type: object
@@ -120,38 +127,30 @@ const { protect } = require('../../middleware/authMiddleware');
  *         ohp_percent_on_material:
  *           type: number
  *           example: 0.10
- *           default: 0.10
  *         ohp_percent_on_labour:
  *           type: number
  *           example: 0.15
- *           default: 0.15
  *         inspection_cost_per_nos:
  *           type: number
  *           example: 0.20
- *           default: 0.20
  *         tool_maintenance_cost_per_nos:
  *           type: number
  *           example: 0.20
- *           default: 0.20
  *         packing_cost_per_nos:
  *           type: number
  *           example: 5.00
- *           default: 5.00
  *         plating_cost_per_kg:
  *           type: number
  *           example: 70.00
- *           default: 70.00
  *         margin_percent:
  *           type: number
  *           example: 15
- *           default: 15
  *
  *     ItemProcess:
  *       type: object
  *       required:
  *         - process_id
  *         - rate_per_hour
- *         - hours
  *       properties:
  *         process_id:
  *           type: string
@@ -162,10 +161,14 @@ const { protect } = require('../../middleware/authMiddleware');
  *         hours:
  *           type: number
  *           example: 1.5
+ *           default: 1
  *         outsourced_vendor_id:
  *           type: string
  *           nullable: true
  *           example: null
+ *         machine:
+ *           type: string
+ *           example: "CNC Laser"
  *
  *     QuotationItem:
  *       type: object
@@ -190,21 +193,19 @@ const { protect } = require('../../middleware/authMiddleware');
  *     QuotationCreateRequest:
  *       type: object
  *       required:
- *         - vendor
+ *         - customer
+ *         - template_id
  *         - items
  *       properties:
- *         vendor:
- *           $ref: '#/components/schemas/VendorInfo'
- *         new_vendor_details:
- *           $ref: '#/components/schemas/NewVendorDetails'
- *           description: "Required if vendor.type is 'New'"
+ *         customer:
+ *           $ref: '#/components/schemas/CustomerInfo'
  *         template_id:
  *           type: string
  *           example: "69a81713603b3e061ae69284"
  *         valid_till:
  *           type: string
  *           format: date
- *           example: "2025-04-30"
+ *           example: "2026-06-30"
  *         remarks:
  *           $ref: '#/components/schemas/RemarksInfo'
  *         financials:
@@ -217,323 +218,18 @@ const { protect } = require('../../middleware/authMiddleware');
  *           items:
  *             $ref: '#/components/schemas/QuotationItem'
  *
- *     QuotationItemProcess:
+ *     DuplicateRequest:
  *       type: object
  *       properties:
- *         _id:
+ *         customer:
+ *           $ref: '#/components/schemas/CustomerInfo'
+ *           description: "Omit to keep the same customer as the source quotation"
+ *         valid_till:
  *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7d0"
- *         qip_id:
- *           type: string
- *           example: "QIP-20240215-001"
- *         process_id:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *               example: "64f8e9b7a1b2c3d4e5f6a7b8"
- *             ProcessName:
- *               type: string
- *               example: "Cutting"
- *             RateType:
- *               type: string
- *               example: "Per Nos"
- *         process_name:
- *           type: string
- *           example: "Cutting"
- *         rate_type:
- *           type: string
- *           enum: [Per Nos, Per Kg, Per Hour, Fixed]
- *           example: "Per Nos"
- *         rate_entered:
- *           type: number
- *           example: 5
- *         quantity:
- *           type: number
- *           example: 100
- *         weight:
- *           type: number
- *           example: 0.044
- *         hours:
- *           type: number
- *           example: 2
- *         calculated_cost:
- *           type: number
- *           example: 500
- *
- *     QuotationItem:
- *       type: object
- *       properties:
- *         _id:
- *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7c5"
- *         PartNo:
- *           type: string
- *           example: "BR-009"
- *         PartName:
- *           type: string
- *           example: "Copper Bushing"
- *         Description:
- *           type: string
- *           example: "Copper bushing for motor application"
- *         HSNCode:
- *           type: string
- *           example: "741421"
- *         Unit:
- *           type: string
- *           enum: [Nos, Kg, Meter, Set, Piece]
- *           example: "Nos"
- *         Quantity:
- *           type: number
- *           example: 100
- *         Thickness:
- *           type: number
- *           example: 5
- *         Width:
- *           type: number
- *           example: 50
- *         Length:
- *           type: number
- *           example: 100
- *         Weight:
- *           type: number
- *           example: 0.044
- *         RMCost:
- *           type: number
- *           example: 37.40
- *         ProcessCost:
- *           type: number
- *           example: 13.88
- *         OverheadPercent:
- *           type: number
- *           example: 10
- *         OverheadAmount:
- *           type: number
- *           example: 5.13
- *         MarginPercent:
- *           type: number
- *           example: 15
- *         MarginAmount:
- *           type: number
- *           example: 7.69
- *         SubCost:
- *           type: number
- *           example: 51.28
- *         FinalRate:
- *           type: number
- *           example: 64.10
- *         Amount:
- *           type: number
- *           example: 6410
- *         processes:
- *           type: array
- *           items:
- *             $ref: '#/components/schemas/QuotationItemProcess'
- *
- *     Quotation:
- *       type: object
- *       properties:
- *         _id:
- *           type: string
- *           example: "64f8e9b7a1b2c3d4e5f6a7b8"
- *         QuotationNo:
- *           type: string
- *           example: "QT-202402-1234"
- *         QuotationDate:
- *           type: string
- *           format: date-time
- *           example: "2024-02-15T10:30:00.000Z"
- *         ValidTill:
- *           type: string
- *           format: date-time
- *           example: "2024-03-15T10:30:00.000Z"
- *         TemplateID:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *             template_name:
- *               type: string
- *             template_code:
- *               type: string
- *         TemplateName:
- *           type: string
- *           example: "Detailed Busbar Quotation"
- *         CompanyID:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *               example: "64f8e9b7a1b2c3d4e5f6a7c0"
- *             CompanyName:
- *               type: string
- *               example: "ABC Manufacturing Co."
- *             GSTIN:
- *               type: string
- *               example: "27ABCDE1234F1Z5"
- *         VendorID:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *               example: "64f8e9b7a1b2c3d4e5f6a7c1"
- *             VendorName:
- *               type: string
- *               example: "XYZ Suppliers"
- *         VendorName:
- *           type: string
- *           example: "XYZ Suppliers"
- *         VendorGSTIN:
- *           type: string
- *           example: "27XYZAB1234C1D2"
- *         VendorState:
- *           type: string
- *           example: "Gujarat"
- *         VendorStateCode:
- *           type: number
- *           example: 24
- *         VendorType:
- *           type: string
- *           enum: [Existing, New]
- *           example: "Existing"
- *         GSTType:
- *           type: string
- *           enum: [CGST/SGST, IGST]
- *           example: "IGST"
- *         Items:
- *           type: array
- *           items:
- *             $ref: '#/components/schemas/QuotationItem'
- *         SubTotal:
- *           type: number
- *           example: 6410
- *         GSTPercentage:
- *           type: number
- *           example: 18
- *         GSTAmount:
- *           type: number
- *           example: 1153.80
- *         GrandTotal:
- *           type: number
- *           example: 7563.80
- *         AmountInWords:
- *           type: string
- *           example: "Seven Thousand Five Hundred Sixty Three Rupees and Eighty Paise Only"
- *         TermsConditions:
- *           type: array
- *           items:
- *             type: object
- *         InternalRemarks:
- *           type: string
- *           example: "Urgent delivery required within 2 weeks"
- *         CustomerRemarks:
- *           type: string
- *           example: "Please ensure all parts are tested before dispatch and provide test certificates"
- *         Status:
- *           type: string
- *           enum: [Draft, Sent, Approved, Rejected, Cancelled]
- *           example: "Draft"
- *         IsActive:
- *           type: boolean
- *           example: true
- *         CreatedBy:
- *           type: object
- *           properties:
- *             _id:
- *               type: string
- *               example: "64f8e9b7a1b2c3d4e5f6a7c2"
- *             Username:
- *               type: string
- *               example: "john.doe"
- *         CreatedAt:
- *           type: string
- *           format: date-time
- *           example: "2024-02-15T10:30:00.000Z"
- *
- *   responses:
- *     QuotationNotFound:
- *       description: Quotation not found
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "Quotation not found"
- *
- *     CompanyNotFound:
- *       description: Company not found
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "No active company found"
- *
- *     VendorNotFound:
- *       description: Vendor not found
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "Vendor not found or inactive"
- *
- *     ItemNotFound:
- *       description: Item not found
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "Item \"BR-009\" not found in Item master"
- *
- *     ProcessNotFound:
- *       description: Process not found
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "Process not found: 69a720ecfde48ece6e502ab3"
- *
- *     ValidationError:
- *       description: Validation error
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               success:
- *                 type: boolean
- *                 example: false
- *               message:
- *                 type: string
- *                 example: "Vendor information is required"
+ *           format: date
+ *           example: "2026-06-30"
+ *         remarks:
+ *           $ref: '#/components/schemas/RemarksInfo'
  *
  *   securitySchemes:
  *     bearerAuth:
@@ -546,104 +242,58 @@ const { protect } = require('../../middleware/authMiddleware');
  * @swagger
  * tags:
  *   name: Quotations
- *   description: Quotation management with dynamic calculation
+ *   description: Quotation management — costing, Excel generation, template filtering
  */
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /quotations
+// ─────────────────────────────────────────────────────────────────────────────
 /**
  * @swagger
  * /api/quotations:
  *   get:
- *     summary: Get all quotations with pagination and filtering
+ *     summary: Get all quotations with pagination, filtering and stats
  *     tags: [Quotations]
  *     security:
  *       - bearerAuth: []
  *     parameters:
  *       - in: query
  *         name: page
- *         schema:
- *           type: integer
- *           default: 1
- *         description: Page number
+ *         schema: { type: integer, default: 1 }
  *       - in: query
  *         name: limit
- *         schema:
- *           type: integer
- *           default: 10
- *         description: Items per page
+ *         schema: { type: integer, default: 10 }
  *       - in: query
  *         name: status
- *         schema:
- *           type: string
- *           enum: [Draft, Sent, Approved, Rejected, Cancelled]
- *         description: Filter by status
+ *         schema: { type: string, enum: [Draft, Sent, Approved, Rejected, Cancelled] }
  *       - in: query
- *         name: vendorId
- *         schema:
- *           type: string
- *         description: Filter by vendor ID
+ *         name: customerId
+ *         schema: { type: string }
+ *         description: Filter by Customer ObjectId
  *       - in: query
  *         name: templateId
- *         schema:
- *           type: string
- *         description: Filter by template ID
+ *         schema: { type: string }
+ *         description: Filter by Template ObjectId
  *       - in: query
  *         name: startDate
- *         schema:
- *           type: string
- *           format: date
- *         description: Start date
+ *         schema: { type: string, format: date }
  *       - in: query
  *         name: endDate
- *         schema:
- *           type: string
- *           format: date
- *         description: End date
+ *         schema: { type: string, format: date }
  *       - in: query
  *         name: search
- *         schema:
- *           type: string
- *         description: Search in QuotationNo or VendorName
+ *         schema: { type: string }
+ *         description: Search in QuotationNo or CustomerName
+ *       - in: query
+ *         name: sortBy
+ *         schema: { type: string, default: createdAt }
+ *       - in: query
+ *         name: sortOrder
+ *         schema: { type: string, enum: [asc, desc], default: desc }
  *     responses:
  *       200:
- *         description: Quotations retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 data:
- *                   type: array
- *                   items:
- *                     $ref: '#/components/schemas/Quotation'
- *                 pagination:
- *                   type: object
- *                   properties:
- *                     currentPage:
- *                       type: integer
- *                     totalPages:
- *                       type: integer
- *                     totalItems:
- *                       type: integer
- *                     itemsPerPage:
- *                       type: integer
- *                 statistics:
- *                   type: object
- *                   properties:
- *                     totalQuotations:
- *                       type: integer
- *                     totalAmount:
- *                       type: number
- *                     avgAmount:
- *                       type: number
- *                     draftCount:
- *                       type: integer
- *                     sentCount:
- *                       type: integer
- *                     approvedCount:
- *                       type: integer
+ *         description: Quotations list with pagination and statistics
  *       401:
  *         description: Not authenticated
  *       500:
@@ -651,11 +301,111 @@ const { protect } = require('../../middleware/authMiddleware');
  */
 router.get('/', protect, getQuotations);
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /quotations/templates   ← MUST be before /:id
+// ─────────────────────────────────────────────────────────────────────────────
 /**
  * @swagger
- * /api/quotations/{id}:
+ * /api/quotations/templates:
  *   get:
- *     summary: Get single quotation by ID
+ *     summary: List all active templates (for dropdown)
+ *     tags: [Quotations]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: |
+ *           {
+ *             success: true,
+ *             count: 3,
+ *             data: [
+ *               { _id, template_code, template_name, formula_engine,
+ *                 excel_layout, default_margin_percent, description }
+ *             ]
+ *           }
+ *       401:
+ *         description: Not authenticated
+ */
+router.get('/templates', protect, getQuotationTemplates);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /quotations/by-template   ← MUST be before /:id
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @swagger
+ * /api/quotations/by-template:
+ *   get:
+ *     summary: Get paginated quotations filtered by template_id
+ *     tags: [Quotations]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: template_id
+ *         required: true
+ *         schema: { type: string }
+ *         description: Template ObjectId
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 10 }
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *         description: Search in QuotationNo or CustomerName
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [Draft, Sent, Approved, Rejected, Cancelled] }
+ *       - in: query
+ *         name: sortBy
+ *         schema: { type: string, default: createdAt }
+ *       - in: query
+ *         name: sortOrder
+ *         schema: { type: string, enum: [asc, desc], default: desc }
+ *     responses:
+ *       200:
+ *         description: |
+ *           {
+ *             success: true,
+ *             template: { _id, template_code, template_name, formula_engine },
+ *             data: Quotation[],
+ *             pagination: { currentPage, totalPages, totalItems, itemsPerPage },
+ *             statistics: { totalQuotations, totalAmount, avgAmount,
+ *                           draftCount, sentCount, approvedCount }
+ *           }
+ *       400:
+ *         description: template_id query parameter is required
+ *       404:
+ *         description: Template not found or inactive
+ *       401:
+ *         description: Not authenticated
+ */
+router.get('/by-template', protect, getQuotationsByTemplate);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /quotations/:id/download?template_id=<id>   ← MUST be before /:id
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @swagger
+ * /api/quotations/{id}/download:
+ *   get:
+ *     summary: Download an existing quotation as ANY template format
+ *     description: |
+ *       Re-renders the stored quotation data through whichever template you
+ *       choose — without changing the DB record or recalculating any numbers.
+ *
+ *       Example use cases:
+ *         - Same quotation → busbar layout for internal review
+ *         - Same quotation → landed_cost layout for customer presentation
+ *         - Same quotation → cost_breakup layout for costing audit
+ *
+ *       Pass the target template's ObjectId as ?template_id= in the query string.
+ *       The downloaded filename will be <TEMPLATE_CODE>_<QUOTATION_NO>.xlsx
  *     tags: [Quotations]
  *     security:
  *       - bearerAuth: []
@@ -663,36 +413,74 @@ router.get('/', protect, getQuotations);
  *       - in: path
  *         name: id
  *         required: true
- *         schema:
- *           type: string
- *         description: Quotation ID
+ *         schema: { type: string }
+ *         description: Quotation ObjectId
+ *       - in: query
+ *         name: template_id
+ *         required: true
+ *         schema: { type: string }
+ *         description: Target Template ObjectId (can differ from the quotation's own template)
  *     responses:
  *       200:
- *         description: Quotation retrieved successfully
+ *         description: Excel file (.xlsx) rendered in the requested template format
  *         content:
- *           application/json:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
  *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 data:
- *                   $ref: '#/components/schemas/Quotation'
+ *               type: string
+ *               format: binary
+ *         headers:
+ *           Content-Disposition:
+ *             schema:
+ *               type: string
+ *               example: "attachment; filename=BUSBAR_QT-202503-0042.xlsx"
+ *       400:
+ *         description: template_id query parameter missing or invalid ID format
  *       404:
- *         $ref: '#/components/responses/QuotationNotFound'
+ *         description: Quotation or target template not found
  *       401:
  *         description: Not authenticated
  *       500:
  *         description: Server error
  */
+router.get('/:id/download', protect, downloadQuotationAsTemplate);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /quotations/:id
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @swagger
+ * /api/quotations/{id}:
+ *   get:
+ *     summary: Get a single quotation with all items and processes
+ *     tags: [Quotations]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *         description: Quotation ObjectId
+ *     responses:
+ *       200:
+ *         description: Quotation with Items[] (each item includes processes[])
+ *       404:
+ *         description: Quotation not found
+ *       401:
+ *         description: Not authenticated
+ */
 router.get('/:id', protect, getQuotation);
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /quotations
+// ─────────────────────────────────────────────────────────────────────────────
 /**
  * @swagger
  * /api/quotations:
  *   post:
- *     summary: Create a new quotation with dynamic calculation and download Excel
+ *     summary: Create a new quotation — runs full costing and returns Excel download
  *     tags: [Quotations]
  *     security:
  *       - bearerAuth: []
@@ -703,14 +491,14 @@ router.get('/:id', protect, getQuotation);
  *           schema:
  *             $ref: '#/components/schemas/QuotationCreateRequest'
  *           example:
- *             vendor:
+ *             customer:
  *               type: "Existing"
  *               id: "699edad52668ad28b8854111"
  *             template_id: "69a81713603b3e061ae69284"
- *             valid_till: "2025-04-30"
+ *             valid_till: "2026-06-30"
  *             remarks:
- *               internal: "Urgent delivery required within 2 weeks"
- *               customer: "Please ensure all parts are tested before dispatch and provide test certificates"
+ *               internal: "Urgent — deliver within 2 weeks"
+ *               customer: "Provide test certificates with each lot"
  *             financials:
  *               gst_percentage: 18
  *             icc:
@@ -734,13 +522,10 @@ router.get('/:id', protect, getQuotation);
  *                     rate_per_hour: 252.50
  *                     hours: 1.5
  *                     outsourced_vendor_id: null
- *                   - process_id: "69a72113fde48ece6e502acd"
- *                     rate_per_hour: 45.75
- *                     hours: 2.0
- *                     outsourced_vendor_id: null
+ *                     machine: "CNC Laser"
  *     responses:
  *       200:
- *         description: Quotation created successfully and Excel file downloaded
+ *         description: Excel file download (.xlsx)
  *         content:
  *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
  *             schema:
@@ -750,24 +535,70 @@ router.get('/:id', protect, getQuotation);
  *           Content-Disposition:
  *             schema:
  *               type: string
- *               example: attachment; filename=TEMPLATE_CODE_QT-202402-1234.xlsx
+ *               example: "attachment; filename=TMPL_QT-202503-0042.xlsx"
  *       400:
- *         description: Bad request
- *         content:
- *           application/json:
- *             oneOf:
- *               - $ref: '#/components/responses/ValidationError'
- *               - $ref: '#/components/responses/ItemNotFound'
- *               - $ref: '#/components/responses/ProcessNotFound'
+ *         description: Validation error or master record not found
  *       404:
- *         oneOf:
- *           - $ref: '#/components/responses/CompanyNotFound'
- *           - $ref: '#/components/responses/VendorNotFound'
+ *         description: Company / Customer / Template not found
  *       401:
  *         description: Not authenticated
  *       500:
  *         description: Server error
  */
 router.post('/', protect, createQuotation);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /quotations/:id/duplicate
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * @swagger
+ * /api/quotations/{id}/duplicate:
+ *   post:
+ *     summary: Clone an existing quotation, optionally swapping the customer
+ *     description: |
+ *       Copies all costing fields verbatim — no recalculation.
+ *       A new QuotationNo is auto-generated and Status is set to Draft.
+ *       Pass body.customer to use a different customer; omit it to keep the same one.
+ *     tags: [Quotations]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *         description: Source quotation ObjectId
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/DuplicateRequest'
+ *           example:
+ *             customer:
+ *               type: "Existing"
+ *               id: "64f8e9b7a1b2c3d4e5f6a7c1"
+ *             valid_till: "2026-09-30"
+ *             remarks:
+ *               internal: "Duplicate of QT-202503-0042 for new customer"
+ *               customer: ""
+ *     responses:
+ *       200:
+ *         description: New quotation saved + Excel file downloaded
+ *         content:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+ *             schema:
+ *               type: string
+ *               format: binary
+ *       404:
+ *         description: Source quotation or template not found
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Not authenticated
+ */
+router.post('/:id/duplicate', protect, duplicateQuotation);
+
 
 module.exports = router;

@@ -3,9 +3,6 @@ const mongoose = require('mongoose');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTATION ITEM SUB-SCHEMA
-//
-// ⚠️  Every field that the Excel generator reads MUST be listed here.
-//     Mongoose silently strips any field NOT in the schema during save/toObject.
 // ─────────────────────────────────────────────────────────────────────────────
 const quotationItemSchema = new mongoose.Schema({
 
@@ -26,42 +23,39 @@ const quotationItemSchema = new mongoose.Schema({
   pitch:        { type: Number, default: 0 },
   no_of_cavity: { type: Number, default: 1 },
 
-  // ── Dimensions (from DimensionWeight master) ──────────────────────────────
+  // ── Dimensions ───────────────────────────────────────────────────────────
   Thickness: { type: Number, default: 0 },
   Width:     { type: Number, default: 0 },
   Length:    { type: Number, default: 0 },
 
-  // ── Raw material (from RawMaterial master) ────────────────────────────────
-  density:                 { type: Number, default: 8.96 },  // g/cm³
-  rm_rate:                 { type: Number, default: 0 },     // RatePerKG Rs/kg
-  profile_conversion_rate: { type: Number, default: 0 },     // Rs/kg
-  total_rm_rate:           { type: Number, default: 0 },     // rm_rate + profile_conversion_rate
-  scrap_rate_per_kg:       { type: Number, default: 0 },     // Rs/kg
-  transport_rate_per_kg:   { type: Number, default: 0 },     // Rs/kg — RawMaterial.transport_rate_per_kg
+  // ── Raw material ──────────────────────────────────────────────────────────
+  density:                 { type: Number, default: 8.96 },
+  rm_rate:                 { type: Number, default: 0 },
+  profile_conversion_rate: { type: Number, default: 0 },
+  total_rm_rate:           { type: Number, default: 0 },
+  scrap_rate_per_kg:       { type: Number, default: 0 },
+  transport_rate_per_kg:   { type: Number, default: 0 },
 
-  // ── Item-level percentages (from Item master) ─────────────────────────────
-  // Stored as plain percent numbers e.g. 2 means 2%, 85 means 85%
-  // Excel generator divides by 100 when using them
-  rm_rejection_percent:      { type: Number, default: 2  },  // Item.rm_rejection_percent
-  scrap_realisation_percent: { type: Number, default: 85 },  // Item.scrap_realisation_percent
+  // ── Item-level percentages ────────────────────────────────────────────────
+  rm_rejection_percent:      { type: Number, default: 2  },
+  scrap_realisation_percent: { type: Number, default: 85 },
 
-  // ── GST (from Tax master by HSNCode) ─────────────────────────────────────
-  // Stored as plain percent e.g. 18 means 18%
-  gst_percentage: { type: Number, default: 18 },  // Tax.GSTPercentage
+  // ── GST ───────────────────────────────────────────────────────────────────
+  gst_percentage: { type: Number, default: 18 },
 
-  // ── Weight calculations ───────────────────────────────────────────────────
-  gross_weight_kg: { type: Number, default: 0 },  // T×W×L×density/1e6
-  net_weight_kg:   { type: Number, default: 0 },  // DimensionWeight.WeightInKG
-  scrap_kgs:       { type: Number, default: 0 },  // gross - net
+  // ── Weight ────────────────────────────────────────────────────────────────
+  gross_weight_kg: { type: Number, default: 0 },
+  net_weight_kg:   { type: Number, default: 0 },
+  scrap_kgs:       { type: Number, default: 0 },
 
-  // ── Cost calculations ─────────────────────────────────────────────────────
+  // ── Cost ──────────────────────────────────────────────────────────────────
   gross_rm_cost: { type: Number, default: 0 },
   scrap_cost:    { type: Number, default: 0 },
   net_rm_cost:   { type: Number, default: 0 },
 
   // ── Legacy aliases ────────────────────────────────────────────────────────
-  Weight:  { type: Number, default: 0 },   // = gross_weight_kg
-  RMCost:  { type: Number, default: 0 },   // = gross_rm_cost
+  Weight:  { type: Number, default: 0 },
+  RMCost:  { type: Number, default: 0 },
 
   // ── Process total ─────────────────────────────────────────────────────────
   ProcessCost: { type: Number, default: 0 },
@@ -105,64 +99,52 @@ const quotationSchema = new mongoose.Schema({
   TemplateID:   { type: mongoose.Schema.Types.ObjectId, ref: 'Template', default: null },
   TemplateName: { type: String, default: null },
 
-  // ── Company (auto from Company master) ────────────────────────────────────
+  // ── Company ───────────────────────────────────────────────────────────────
   CompanyID:        { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
   CompanyName:      { type: String, required: true },
   CompanyGSTIN:     { type: String, required: true },
   CompanyState:     { type: String, required: true },
   CompanyStateCode: { type: Number, required: true },
 
-  // ── Vendor ────────────────────────────────────────────────────────────────
-  VendorID:            { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor' },
-  VendorName:          { type: String, required: true },
-  VendorGSTIN:         { type: String, default: '' },
-  VendorState:         { type: String, required: true },
-  VendorStateCode:     { type: Number, required: true },
-  VendorAddress:       { type: String, default: '' },
-  VendorCity:          { type: String, default: '' },
-  VendorPincode:       { type: String, default: '' },
-  VendorContactPerson: { type: String, default: '' },
-  VendorPhone:         { type: String, default: '' },
-  VendorEmail:         { type: String, default: '' },
-  VendorPAN:           { type: String, default: '' },
-  VendorType:          { type: String, enum: ['Existing','New'], default: 'Existing' },
+  // ── Customer ──────────────────────────────────────────────────────────────
+  CustomerID:            { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
+  CustomerName:          { type: String, required: true },
+  CustomerGSTIN:         { type: String, default: '' },
+  CustomerState:         { type: String, required: true },
+  CustomerStateCode:     { type: Number, required: true },
+  CustomerAddress:       { type: String, default: '' },
+  CustomerCity:          { type: String, default: '' },
+  CustomerPincode:       { type: String, default: '' },
+  CustomerContactPerson: { type: String, default: '' },
+  CustomerPhone:         { type: String, default: '' },
+  CustomerEmail:         { type: String, default: '' },
+  CustomerPAN:           { type: String, default: '' },
+  CustomerType:          { type: String, enum: ['Existing', 'New'], default: 'Existing' },
 
-  // ── GST type (auto from state code comparison) ────────────────────────────
-  GSTType: { type: String, enum: ['CGST/SGST','IGST'], default: 'CGST/SGST' },
+  // ── GST type (IGST vs CGST/SGST based on state comparison) ───────────────
+  GSTType: { type: String, enum: ['CGST/SGST', 'IGST'], default: 'CGST/SGST' },
 
   // ── Items ─────────────────────────────────────────────────────────────────
   Items: [quotationItemSchema],
 
-  // ── Quotation totals ──────────────────────────────────────────────────────
+  // ── Totals ────────────────────────────────────────────────────────────────
   SubTotal:      { type: Number, default: 0 },
   GSTPercentage: { type: Number, default: 0 },
   GSTAmount:     { type: Number, default: 0 },
   GrandTotal:    { type: Number, default: 0 },
   AmountInWords: { type: String, default: '' },
 
-  // ── LANDED COST SETTINGS (user provides at quotation creation time) ────────
-  //
-  //  These go into the request body when creating a quotation.
-  //  The Excel generator reads them from quotationData directly.
-  //  All have sensible defaults so they are optional in the request.
-  //
-  //  What comes from MASTERS (stored per item above, not here):
-  //    item.rm_rejection_percent      ← Item.rm_rejection_percent       (C17)
-  //    item.scrap_realisation_percent ← Item.scrap_realisation_percent  (C22)
-  //    item.transport_rate_per_kg     ← RawMaterial.transport_rate_per_kg (C30)
-  //    item.gst_percentage            ← Tax.GSTPercentage by HSNCode    (C26)
-  //
-  //  What user sends (stored here at quotation level):
-  icc_credit_on_input_days: { type: Number, default: -30  },  // D48
-  icc_wip_fg_days:          { type: Number, default:  30  },  // D49
-  icc_credit_given_days:    { type: Number, default:  45  },  // D50
-  icc_cost_of_capital:      { type: Number, default:  0.10 }, // B52  (0.10 = 10%)
-  ohp_percent_on_matl:      { type: Number, default:  0.10 }, // B55  (0.10 = 10%)
-  ohp_on_labour_pct:        { type: Number, default:  0.15 }, // C63  (0.15 = 15%)
-  inspection_cost:          { type: Number, default:  0.2  }, // D64
-  tool_maintenance_cost:    { type: Number, default:  0.2  }, // D65
-  packing_cost_per_nos:     { type: Number, default:  5    }, // C66
-  plating_cost_per_kg:      { type: Number, default:  70   }, // C68
+  // ── Landed Cost / ICC Settings ────────────────────────────────────────────
+  icc_credit_on_input_days: { type: Number, default: -30   },
+  icc_wip_fg_days:          { type: Number, default:  30   },
+  icc_credit_given_days:    { type: Number, default:  45   },
+  icc_cost_of_capital:      { type: Number, default:  0.10 },
+  ohp_percent_on_matl:      { type: Number, default:  0.10 },
+  ohp_on_labour_pct:        { type: Number, default:  0.15 },
+  inspection_cost:          { type: Number, default:  0.2  },
+  tool_maintenance_cost:    { type: Number, default:  0.2  },
+  packing_cost_per_nos:     { type: Number, default:  5    },
+  plating_cost_per_kg:      { type: Number, default:  70   },
 
   // ── Terms & Conditions ────────────────────────────────────────────────────
   TermsConditions: [{ Title: String, Description: String, Sequence: Number }],
@@ -185,7 +167,7 @@ const quotationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 
-// ── Auto-generate QuotationNo + recalculate totals ────────────────────────────
+// ── Auto-generate QuotationNo + recalculate totals ───────────────────────────
 quotationSchema.pre('save', function (next) {
   if (!this.QuotationNo) {
     const y = new Date().getFullYear();
@@ -196,11 +178,11 @@ quotationSchema.pre('save', function (next) {
   this.SubTotal   = Math.round(this.Items.reduce((t, i) => t + (i.Amount || 0), 0) * 100) / 100;
   this.GSTAmount  = Math.round((this.SubTotal * this.GSTPercentage) / 100 * 100) / 100;
   this.GrandTotal = Math.round((this.SubTotal + this.GSTAmount) * 100) / 100;
-  this.GSTType    = this.VendorStateCode !== this.CompanyStateCode ? 'IGST' : 'CGST/SGST';
+  this.GSTType    = this.CustomerStateCode !== this.CompanyStateCode ? 'IGST' : 'CGST/SGST';
   next();
 });
 
-// ── Auto-set ValidTill (+30 days from QuotationDate) ─────────────────────────
+// ── Auto-set ValidTill (+30 days) if not provided ────────────────────────────
 quotationSchema.pre('save', function (next) {
   if (!this.ValidTill) {
     const d = new Date(this.QuotationDate);
@@ -210,14 +192,14 @@ quotationSchema.pre('save', function (next) {
   next();
 });
 
-// ── Amount in words ────────────────────────────────────────────────────────────
+// ── Amount in words ───────────────────────────────────────────────────────────
 quotationSchema.methods.getAmountInWords = function () {
   const rupees = Math.floor(this.GrandTotal);
   const paise  = Math.round((this.GrandTotal - rupees) * 100);
   const ones   = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten',
                   'Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen'];
-  const tensArr= ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
-  const scale  = ['','Thousand','Lakh','Crore'];
+  const tensArr = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
+  const scale   = ['','Thousand','Lakh','Crore'];
   const cvt = n => {
     let r = '';
     if (n >= 100) { r += ones[Math.floor(n / 100)] + ' Hundred '; n %= 100; }

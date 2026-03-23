@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const path = require('path');
 const dotenv = require('dotenv');
 const cors = require('cors');
+// const bomRoutes = require('./routes/BOM');
 
 // Load env vars
 dotenv.config();
@@ -71,6 +72,18 @@ const employeeHistoryRoutes = require('./routes/HR/employeeHistoryRoutes');
 const templateRoutes = require('./routes/CRM/templateRoutes');
 const leadRoutes = require('./routes/CRM/leadRoutes');
 const leadNotificationRoutes = require('./routes/CRM/leadnotificationroutes');
+const purchaseRequisitionRoutes = require('./routes/Procurement/purchaseRequisitionRoutes');
+const rfqRoutes = require('./routes/Procurement/rfqRoutes');
+const purchaseOrderRoutes = require('./routes/Procurement/purchaseOrderRoutes');
+const grnRoutes = require('./routes/Procurement/grnRoutes');
+const ncrRoutes = require('./routes/Quality/ncrRoutes');
+const purchaseInvoiceRoutes = require('./routes/Procurement/purchaseInvoiceRoutes');
+const vendorPaymentRoutes = require('./routes/Procurement/vendorPaymentRoutes');
+// Import Phase 04 extension routes
+const routingRoutes = require('./routes/BOM/routingRoutes');
+const machineRoutes = require('./routes/BOM/machineRoutes');
+const processMasterRoutes = require('./routes/BOM/processMasterRoutes');
+const bomRoutes = require('./routes/BOM/bomRoutes');
 
 const app = express();
 
@@ -139,7 +152,17 @@ app.use('/api/vendors', vendorRoutes);
 app.use('/api/employee-history', employeeHistoryRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/lead-notifications', leadNotificationRoutes);
-
+app.use('/api/purchase-requisitions',purchaseRequisitionRoutes);
+app.use('/api/rfqs',rfqRoutes);
+app.use('/api/purchase-orders', purchaseOrderRoutes);
+app.use('/api/grns', grnRoutes);
+app.use('/api/ncr', ncrRoutes);
+app.use('/api/purchase-invoices', purchaseInvoiceRoutes);
+app.use('/api/vendor-payments',vendorPaymentRoutes);
+app.use('/api/boms', bomRoutes);
+app.use('/api/routings', routingRoutes);
+app.use('/api/machines', machineRoutes);
+app.use('/api/process-master', processMasterRoutes);
 // Default route
 app.get('/', (req, res) => {
   res.json({

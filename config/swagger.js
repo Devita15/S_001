@@ -62,7 +62,13 @@ const options = {
     ]
   },
   // This catches all .js files in routes and subdirectories
-  apis: ['./routes/**/*.js']
+    apis: ['./routes/*.js',
+    './routes/CRM/*.js' ,
+    './routes/HR/*.js' ,
+    './routes/Quality/*.js' ,
+    './routes/Procurement/*.js',
+    "./routes/user's & setting's/*.js",
+  ]
 };
 
 // Generate Swagger specification

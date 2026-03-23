@@ -287,6 +287,126 @@ class EmailService {
     }
   }
 
+  
+// Send RFQ email to vendors
+async sendRFQEmail(vendor, rfq, pdfPath = null) {
+  try {
+    const emailHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+          .header { background: #003366; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+          .content { padding: 20px; background: #f9f9f9; border: 1px solid #ddd; border-radius: 0 0 5px 5px; }
+          .button { 
+            display: inline-block; 
+            background: #28a745; 
+            color: white; 
+            padding: 12px 30px; 
+            text-decoration: none; 
+            border-radius: 5px;
+            margin: 20px 0;
+            font-weight: bold;
+          }
+          .button:hover { background: #218838; }
+          table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+          th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+          th { background: #003366; color: white; }
+          .footer { margin-top: 20px; text-align: center; color: #666; font-size: 12px; }
+          .warning { background: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 15px; border-radius: 5px; margin: 15px 0; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h2>REQUEST FOR QUOTATION</h2>
+            <h3>${rfq.rfq_number}</h3>
+          </div>
+          <div class="content">
+            <p>Dear ${vendor.vendor_name},</p>
+            
+            <p>We would like to request a quotation for the following items:</p>
+            
+            <table>
+              <thead>
+                <tr>
+                  <th>Part No</th>
+                  <th>Description</th>
+                  <th>Quantity</th>
+                  <th>Unit</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rfq.items.map(item => `
+                  <tr>
+                    <td>${item.part_no}</td>
+                    <td>${item.description || '-'}</td>
+                    <td>${item.required_qty}</td>
+                    <td>${item.unit}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+            
+            <p><strong>Valid Till:</strong> ${new Date(rfq.valid_till).toLocaleDateString('en-IN')}</p>
+            <p><strong>RFQ Date:</strong> ${new Date(rfq.rfq_date).toLocaleDateString('en-IN')}</p>
+            
+            <div class="warning">
+              <strong>📋 Please Note:</strong>
+              <ul style="margin-top: 10px;">
+                <li>Quotes must be submitted before the valid till date</li>
+                <li>Please mention delivery timeline</li>
+                <li>Include GST details in your quote</li>
+                <li>Mention payment terms (e.g., Net 30, Net 45)</li>
+              </ul>
+            </div>
+            
+            
+            <p>If you have any questions or need clarifications, please contact:</p>
+            <p>
+              <strong>Purchase Department</strong><br>
+              Email: purchase@suyashenterprises.com<br>
+              Phone: +91-XXXXXXXXXX
+            </p>
+            
+            <p>Thank you for your prompt response.</p>
+            
+            <p>Best regards,<br>
+            <strong>Purchase Team</strong><br>
+            Suyash Enterprises</p>
+          </div>
+          <div class="footer">
+            <p>This is an automated email from Suyash Enterprises. Please do not reply to this message.</p>
+            <p>&copy; ${new Date().getFullYear()} Suyash Enterprises. All rights reserved.</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    const attachments = pdfPath ? [{
+      filename: `RFQ_${rfq.rfq_number}.pdf`,
+      path: pdfPath
+    }] : [];
+
+    console.log(`📧 Sending RFQ email to ${vendor.vendor_name} (${vendor.email})`);
+    
+    return await this.sendEmail({
+      to: vendor.email,
+      subject: `${rfq.rfq_number} - Request for Quotation - Suyash Enterprises`,
+      html: emailHtml,
+      attachments
+    });
+    
+  } catch (error) {
+    console.error('❌ Send RFQ email error:', error);
+    throw error;
+  }
+}
+
+
   // Send simple notification when PDF generation fails
   async sendSimpleNotification(offer, candidate) {
     try {

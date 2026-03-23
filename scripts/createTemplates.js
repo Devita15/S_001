@@ -3,7 +3,7 @@
 
 require('dotenv').config();
 const mongoose = require('mongoose');
-const Template = require('../models/Template');
+const Template = require('../models/CRM/Template');
 
 async function upsertTemplate(data) {
   return Template.findOneAndUpdate(
