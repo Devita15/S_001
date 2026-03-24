@@ -594,9 +594,9 @@ const getRequisitions = async (req, res) => {
     const userRole = user.RoleName;
 
     // SuperAdmin/CEO sees all, others see only their own
-    if (!['SuperAdmin', 'CEO', 'HR'].includes(userRole)) {
-      filter.createdBy = user._id;
-    }
+    // if (!['SuperAdmin', 'CEO', 'HR'].includes(userRole)) {
+    //   filter.createdBy = user._id;
+    // }
 
     const pageNumber = parseInt(page);
     const pageSize = parseInt(limit);
@@ -683,13 +683,13 @@ const getRequisitionById = async (req, res) => {
     const user = req.user;
     const userRole = user.RoleName;
     
-    if (!['SuperAdmin', 'CEO', 'HR'].includes(userRole) &&
-        requisition.createdBy.toString() !== user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'You do not have permission to view this requisition'
-      });
-    }
+    // if (!['SuperAdmin', 'CEO', 'HR'].includes(userRole) &&
+    //     requisition.createdBy.toString() !== user._id.toString()) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: 'You do not have permission to view this requisition'
+    //   });
+    // }
 
     const approvalFlow = await ApprovalFlow.findOne({ requisitionId: requisition._id });
     const auditLogs = await auditService.getEntityAuditLogs('Requisition', requisition._id, 1, 20);
@@ -735,13 +735,13 @@ const updateRequisition = async (req, res) => {
     }
 
     // SuperAdmin/CEO can update any requisition in draft
-    if (req.user.RoleName !== 'SuperAdmin' && req.user.RoleName !== 'CEO' &&
-        requisition.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'You can only update your own requisitions'
-      });
-    }
+    // if (req.user.RoleName !== 'SuperAdmin' && req.user.RoleName !== 'CEO' &&
+    //     requisition.createdBy.toString() !== req.user._id.toString()) {
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: 'You can only update your own requisitions'
+    //   });
+    // }
 
     if (requisition.status !== 'draft') {
       return res.status(400).json({

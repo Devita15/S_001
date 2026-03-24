@@ -2,10 +2,23 @@
 const mongoose = require('mongoose');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUOTATION ITEM SUB-SCHEMA
+// PROCESS SUB-SCHEMA (Embedded in quotation items)
+// ─────────────────────────────────────────────────────────────────────────────
+const processSubSchema = new mongoose.Schema({
+  process_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Process', required: true },
+  process_name: { type: String, required: true },
+  rate_type: { type: String, enum: ['Per Nos', 'Per Kg', 'Per Hour'], required: true },
+  rate_used: { type: Number, required: true, min: 0 },
+  calculated_cost: { type: Number, required: true, min: 0 },
+  hours: { type: Number, default: 1, min: 0 },
+  machine: { type: String, default: '' },
+  vendor_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor', default: null },
+}, { _id: true });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUOTATION ITEM SUB-SCHEMA (With embedded processes)
 // ─────────────────────────────────────────────────────────────────────────────
 const quotationItemSchema = new mongoose.Schema({
-
   // ── Identity ──────────────────────────────────────────────────────────────
   PartNo:      { type: String, required: [true, 'Part number is required'] },
   PartName:    { type: String, required: [true, 'Part name is required']   },
@@ -71,8 +84,8 @@ const quotationItemSchema = new mongoose.Schema({
   FinalRate: { type: Number, required: [true, 'Final rate is required'], min: 0 },
   Amount:    { type: Number, default: 0 },
 
-  // ── Process refs ──────────────────────────────────────────────────────────
-  processes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'QuotationItemProcess' }],
+  // ── Processes (EMBEDDED - not references) ─────────────────────────────────
+  processes: [processSubSchema],
 });
 
 quotationItemSchema.pre('save', function (next) {
@@ -84,12 +97,10 @@ quotationItemSchema.pre('save', function (next) {
   next();
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // QUOTATION SCHEMA
 // ─────────────────────────────────────────────────────────────────────────────
 const quotationSchema = new mongoose.Schema({
-
   // ── Auto-generated ────────────────────────────────────────────────────────
   QuotationNo:   { type: String, unique: true, index: true },
   QuotationDate: { type: Date, default: Date.now, required: true },
@@ -98,14 +109,14 @@ const quotationSchema = new mongoose.Schema({
   // ── Template ──────────────────────────────────────────────────────────────
   TemplateID:   { type: mongoose.Schema.Types.ObjectId, ref: 'Template', default: null },
   TemplateName: { type: String, default: null },
-
+  
   // ── Company ───────────────────────────────────────────────────────────────
   CompanyID:        { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
   CompanyName:      { type: String, required: true },
   CompanyGSTIN:     { type: String, required: true },
   CompanyState:     { type: String, required: true },
   CompanyStateCode: { type: Number, required: true },
-
+  
   // ── Customer ──────────────────────────────────────────────────────────────
   CustomerID:            { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
   CustomerName:          { type: String, required: true },
@@ -124,7 +135,7 @@ const quotationSchema = new mongoose.Schema({
   // ── GST type (IGST vs CGST/SGST based on state comparison) ───────────────
   GSTType: { type: String, enum: ['CGST/SGST', 'IGST'], default: 'CGST/SGST' },
 
-  // ── Items ─────────────────────────────────────────────────────────────────
+  // ── Items with embedded processes ─────────────────────────────────────────
   Items: [quotationItemSchema],
 
   // ── Totals ────────────────────────────────────────────────────────────────
@@ -163,9 +174,22 @@ const quotationSchema = new mongoose.Schema({
   SentAt:     { type: Date },
   ApprovedAt: { type: Date },
   PDFPath:    { type: String, default: '' },
-
+  revision_no: { type: Number, default: 0 },
+  revision_history: [{
+    revision_no: Number,
+    revised_at: Date,
+    reason: String,
+    changed_by: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+    items_snapshot: [mongoose.Schema.Types.Mixed]
+  }],
+  email_log: [{
+    sent_at: Date,
+    sent_to: String,
+    sent_by: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+    status: String
+  }],
+  rejection_reason: { type: String, default: '' }
 }, { timestamps: true });
-
 
 // ── Auto-generate QuotationNo + recalculate totals ───────────────────────────
 quotationSchema.pre('save', function (next) {

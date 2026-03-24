@@ -1,354 +1,574 @@
-// utils/quotationCalculators.js
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// quotationCalculators.js
 //
-// One calculator per formula_engine.
-// Each calculator receives { item, itemDetails, rawMaterial, template }
-// and returns a fully-populated quotation item object ready to store.
+// Pure calculation functions for every costing template.
+// No DB calls, no side effects — these take raw data and return costed items.
 //
-// HOW TO ADD A NEW TEMPLATE:
-//   1. Write a new calcXxx(params) function below.
-//   2. Add it to the CALCULATORS map at the bottom.
-//   3. Add the matching formula_engine value in models/Template.js enum.
-//   4. Add a generateXxxExcel() in utils/excelGenerators.js.
+// Templates supported:
+//   busbar        → Copper/Aluminium busbar (horizontal table, multi-process cols)
+//   landed_cost   → Stamping/CT parts with full ICC financing overlay
+//   cost_breakup  → Simple RM + process + overhead (Steering bracket / proto style)
+//   part_wise     → Customer quotation with RM cost + conversion + margin + P&F
+//   nomex_paper   → Sheet-cut parts: weight-based RM + fabrication + wastage
+//   custom        → Generic template driven by template.columns[]
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+const n = (v, d = 6) => Math.round((parseFloat(v) || 0) * 10 ** d) / 10 ** d;
+const pct = (v) => (v > 1 ? v / 100 : v);   // normalise: 15 → 0.15, 0.15 stays
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.  BUSBAR TEMPLATE  (Busbar_cost__09_01_2026.xlsx)
 //
-
-const r2 = (n) => Math.round((parseFloat(n) || 0) * 100) / 100;
-const r6 = (n) => Math.round((parseFloat(n) || 0) * 1e6) / 1e6;
-
-// ─────────────────────────────────────────────────────────────────
-// TEMPLATE 1 — BUSBAR
+// Columns: SR | PartNo | Description | Drawing | Rev | RMGrade |
+//          T | W | L | S | GrossWt | RMRate | ProfileConvRate | TotalRMRate |
+//          GrossRMCost | NetWt | ScrapKgs | ScrapRate | ScrapCost |
+//          [dynamic process cols...] |
+//          SubTotal | Margin+OH% | FinalPartCost | Qty
 //
-// Formulas (match actual Excel):
-//   gross_weight_kg   = T × W × L × density / 1,000,000
-//   total_rm_rate     = rm_rate + profile_conversion_rate
-//   gross_rm_cost     = gross_weight_kg × total_rm_rate
-//   net_weight_kg     = user supplied (or = gross_weight_kg if not given)
-//   scrap_kgs         = gross_weight_kg − net_weight_kg
-//   scrap_cost        = scrap_kgs × scrap_rate_per_kg
-//   process_cost      = Σ calculated_cost per process
-//   sub_cost          = gross_rm_cost − scrap_cost + process_cost
-//   margin_amount     = sub_cost × (MarginPercent / 100)
-//   final_rate        = sub_cost + margin_amount
-//   amount            = Quantity × final_rate
-// ─────────────────────────────────────────────────────────────────
-function calcBusbar ({ item, itemDetails, rawMaterial, template, processResults }) {
-  const T  = parseFloat(item.Thickness) || 0;
-  const W  = parseFloat(item.Width)     || 0;
-  const L  = parseFloat(item.Length)    || 0;
-  const S  = parseFloat(itemDetails.density) || 8.93;
-  const qty = parseFloat(item.Quantity) || 0;
+// Formula chain:
+//   GrossWt = T * W * L * density / 1e6
+//   GrossRMCost = GrossWt * (RMRate + ProfileConvRate)
+//   ScrapKgs = GrossWt - NetWt
+//   ScrapCost = ScrapKgs * ScrapRate
+//   SubTotal = GrossRMCost - ScrapCost + sum(ProcessCosts)
+//   FinalRate = SubTotal * (1 + MarginOHpct)
+// ─────────────────────────────────────────────────────────────────────────────
+function calcBusbar(item, template) {
+  const T          = n(item.Thickness);
+  const W          = n(item.Width);
+  const L          = n(item.Length);
+  const density    = n(item.density || 8.93);
+  const grossWt    = n((T * W * L * density) / 1_000_000);
 
-  const rm_rate                 = r2(rawMaterial.RatePerKG || 0);
-  const profile_conversion_rate = r2(rawMaterial.profile_conversion_rate || 0);
-  const transport_rate          = r2(rawMaterial.transport_rate_per_kg || 0);
-  const scrap_rate              = r2(rawMaterial.scrap_rate_per_kg || 0);
+  const rmRate     = n(item.rm_rate || 0);
+  const profConv   = n(item.profile_conversion_rate || 0);
+  const totalRMRate = n(rmRate + profConv);
+  const grossRMCost = n(grossWt * totalRMRate);
 
-  const gross_weight_kg = r6(T * W * L * S / 1e6);
-  const net_weight_kg   = r6(parseFloat(item.net_weight_kg) || gross_weight_kg);
-  const total_rm_rate   = r2(rm_rate + profile_conversion_rate);       // RM Rate + Profile Conv
-  const gross_rm_cost   = r2(gross_weight_kg * total_rm_rate);
-  const scrap_kgs       = r6(Math.max(0, gross_weight_kg - net_weight_kg));
-  const scrap_cost      = r2(scrap_kgs * scrap_rate);
+  const netWt      = n(item.net_weight_kg || grossWt);
+  const scrapKgs   = n(Math.max(0, grossWt - netWt));
+  const scrapRate  = n(item.scrap_rate_per_kg || 0);
+  const scrapCost  = n(scrapKgs * scrapRate);
 
-  const process_cost    = r2(processResults.reduce((s, p) => s + (p.calculated_cost || 0), 0));
+  // Process costs  — each process in item.processes[] has {name, cost}
+  const processCosts = (item.processes || []).map(p => ({
+    name: p.process_name || p.name || 'Process',
+    cost: n(p.calculated_cost || p.cost || 0),
+  }));
+  const totalProcessCost = n(processCosts.reduce((s, p) => s + p.cost, 0));
 
-  const sub_cost        = r2(gross_rm_cost - scrap_cost + process_cost);
-  const margin_pct      = parseFloat(item.MarginPercent) || (template.default_margin_percent || 0);
-  const margin_amount   = r2(sub_cost * margin_pct / 100);
-  const final_rate      = r2(sub_cost + margin_amount);
-  const amount          = r2(qty * final_rate);
+  const subTotal   = n(grossRMCost - scrapCost + totalProcessCost);
+  const marginOH   = n(pct(item.MarginPercent || item.margin_percent || 0));
+  const finalRate  = n(subTotal * (1 + marginOH));
+  const qty        = n(item.Quantity || 1);
+  const amount     = n(finalRate * qty);
 
   return {
-    // identity
-    PartNo: item.PartNo, PartName: itemDetails.part_description,
-    Description: itemDetails.description || '', HSNCode: itemDetails.hsn_code,
-    Unit: itemDetails.unit, Quantity: qty,
-    // item master
-    item_no: itemDetails.item_no || item.PartNo,
-    drawing_no: itemDetails.drawing_no || '',
-    revision_no: itemDetails.revision_no || '0',
-    rm_grade: itemDetails.rm_grade || '',
-    material: itemDetails.material || rawMaterial.MaterialName || '',
-    rm_source: itemDetails.rm_source || '',
-    rm_type: itemDetails.rm_type || '',
-    rm_spec: itemDetails.rm_spec || itemDetails.rm_grade || '',
-    density: S,
-    // dimensions
-    Thickness: T, Width: W, Length: L,
-    // busbar calc
-    gross_weight_kg, net_weight_kg,
-    rm_rate, profile_conversion_rate, transport_rate,
-    total_rm_rate,
-    gross_rm_cost,
-    scrap_kgs, scrap_rate_per_kg: scrap_rate, scrap_cost,
-    // common
-    Weight: gross_weight_kg,
-    RMCost: gross_rm_cost,
-    ProcessCost: process_cost,
-    OverheadPercent: 0, OverheadAmount: 0,
-    MarginPercent: margin_pct, MarginAmount: margin_amount,
-    SubCost: sub_cost, FinalRate: final_rate, Amount: amount,
-    gst_percent: item.GSTPercentage || 0,
-    gst_amount: r2(amount * (item.GSTPercentage || 0) / 100),
-    processes: processResults
+    ...item,
+    gross_weight_kg:          grossWt,
+    total_rm_rate:            totalRMRate,
+    gross_rm_cost:            grossRMCost,
+    net_weight_kg:            netWt,
+    scrap_kgs:                scrapKgs,
+    scrap_cost:               scrapCost,
+    ProcessCost:              totalProcessCost,
+    process_breakdown:        processCosts,
+    SubTotal:                 subTotal,
+    MarginPercent:            marginOH * 100,
+    FinalRate:                finalRate,
+    Amount:                   amount,
+    Quantity:                 qty,
   };
 }
 
-// ─────────────────────────────────────────────────────────────────
-// TEMPLATE 2 — LANDED COST
+// ─────────────────────────────────────────────────────────────────────────────
+// 2.  LANDED COST TEMPLATE  (CB71942_43_45_-26_12_2025.xlsx)
 //
-// Formulas (match actual Excel CB71942):
-//   gross_wt           = strip_size × thickness × density / 1e6   [pitch-based]
-//   OR = T × W × L × density / 1e6                                [standard]
+// Vertical per-item layout. Includes ICC financing cost overlay.
 //
-//   gross_wt_incl_rej  = gross_wt × (1 + rm_rejection_percent)
-//   net_wt             = user supplied
-//   scrap_wt           = gross_wt_incl_rej − net_wt
-//   actual_scrap_wt    = scrap_wt × scrap_realisation_percent
-//
-//   gst_on_rm_amount   = basic_rm_rate × gst_percent_on_rm
-//   gross_rm_rate      = basic_rm_rate + transport_rate + gst_on_rm_amount (if applicable)
-//   gst_setoff_amount  = − gst_on_rm_amount (if gst_setoff_applicable)
-//   net_rm_rate        = gross_rm_rate + gst_setoff_amount
-//
-//   effective_scrap_rate = scrap_rate_per_kg × effective_scrap_rate_factor
-//   gross_rm_cost        = gross_wt_incl_rej × net_rm_rate
-//   scrap_recovery       = actual_scrap_wt × effective_scrap_rate
-//   net_rm_cost_per_pc   = gross_rm_cost − scrap_recovery
-//
-//   icc_net_days     = credit_on_input + wip_fg + credit_given_to_customer
-//   icc_percent      = icc_net_days / 365
-//   icc_amount       = net_rm_cost_per_pc × icc_percent × cost_of_capital
-//   ohp_amount_matl  = net_rm_cost_per_pc × ohp_percent_on_matl × icc_percent  [OHP on matl]
-//   net_matl_cost    = net_rm_cost_per_pc + icc_amount + ohp_amount_matl
-//
-//   total_mfg_cost         = Σ (process calculated_costs)
-//   rejection_on_labour    = total_mfg_cost × rejection_on_labour_pct
-//   ohp_on_labour          = total_mfg_cost × ohp_on_labour_pct
-//   mfg_sub_total          = total_mfg_cost + rejection + ohp + inspection + tool + packing
-//   plating_cost           = net_wt × plating_rate_per_kg
-//   total_rate_per_ea      = net_matl_cost + mfg_sub_total + plating_cost
-//   amount                 = qty × total_rate_per_ea
-// ─────────────────────────────────────────────────────────────────
-function calcLandedCost ({ item, itemDetails, rawMaterial, template, processResults }) {
-  const qty   = parseFloat(item.Quantity) || 0;
-  const T     = parseFloat(item.Thickness) || parseFloat(itemDetails.strip_size) || 0;
-  const W     = parseFloat(item.Width) || 0;
-  const L     = parseFloat(item.Length) || parseFloat(itemDetails.pitch) || 0;
-  const S     = parseFloat(itemDetails.density) || 8.93;
-  const rmRej = (parseFloat(itemDetails.rm_rejection_percent) || 2) / 100;
-  const scrapReal = (parseFloat(itemDetails.scrap_realisation_percent) || 98) / 100;
+// Formula chain:
+//   GrossWt = T * strip_width * pitch * density / 1e6   (for strip)
+//   GrossWtInclRej = GrossWt * (1 + rm_rejection_pct)
+//   ScrapWt = GrossWtInclRej - NetWt
+//   ScrapActual = ScrapWt * scrap_realisation_pct
+//   GrossRMRate = basic_rm_rate * (1 + GST%) + transport + LBT
+//   NetRMRate = GrossRMRate - GST_setoff
+//   GrossRMCost = GrossWtInclRej * NetRMRate
+//   ScrapCredit = ScrapActual * scrap_rate
+//   NetRMCost = GrossRMCost - ScrapCredit
+//   ICCCost = NetRMCost * icc_days_total/365 * cost_of_capital
+//   OHPmatl = NetRMCost * ohp_pct_matl
+//   ProcessCost = sum(process costs)
+//   OHPlabour = ProcessCost * ohp_pct_labour
+//   FinalLandedCost = NetRMCost + ICCCost + OHPmatl + ProcessCost + OHPlabour +
+//                     rejectionCost + packingCost + inspectionCost + toolMaintenanceCost + platingCost
+// ─────────────────────────────────────────────────────────────────────────────
+function calcLandedCost(item, template) {
+  const T          = n(item.Thickness || 0);
+  const W          = n(item.Width || item.strip_width || 0);      // strip width mm
+  const pitch      = n(item.pitch || item.Length || 0);           // pitch mm
+  const cavity     = Math.max(1, parseInt(item.no_of_cavity || 1));
+  const density    = n(item.density || 8.93);
 
-  // RM rates from master
-  const basic_rm_rate    = r2(rawMaterial.RatePerKG || 0);
-  const transport_rate   = r2(rawMaterial.transport_rate_per_kg || 0);
-  const gst_pct_on_rm    = parseFloat(rawMaterial.gst_percent_on_rm) || 0;    // e.g. 0.18
-  const gst_setoff_flag  = rawMaterial.gst_setoff_applicable !== false;
-  const scrap_rate_per_kg= r2(rawMaterial.scrap_rate_per_kg || 0);
-  const eff_scrap_factor = parseFloat(rawMaterial.effective_scrap_rate_factor) || 0.85;
+  // Gross weight per piece from strip dimensions
+  const grossWtPerPiece = n((T * W * pitch * density) / (1_000_000 * cavity));
+  const rejPct          = n(pct(item.rm_rejection_percent || 2));
+  const grossWtInclRej  = n(grossWtPerPiece * (1 + rejPct));
 
-  // Weights
-  let gross_wt;
-  if (itemDetails.strip_size && itemDetails.pitch && itemDetails.no_of_cavity) {
-    // pitch-based: (strip_size × thickness × pitch × no_of_cavity × density) / 1e6
-    gross_wt = r6(
-      itemDetails.strip_size * T * L * (itemDetails.no_of_cavity || 1) * S / 1e9
-    );
-  } else {
-    gross_wt = r6(T * W * L * S / 1e6);
-  }
-  const gross_wt_incl_rej = r6(gross_wt * (1 + rmRej));
-  const net_wt            = r6(parseFloat(item.net_weight_kg) || gross_wt);
-  const scrap_wt          = r6(Math.max(0, gross_wt_incl_rej - net_wt));
-  const actual_scrap_wt   = r6(scrap_wt * scrapReal);
+  const netWt           = n(item.net_weight_kg || grossWtPerPiece * 0.82);
+  const scrapWt         = n(Math.max(0, grossWtInclRej - netWt));
+  const scrapReal       = n(pct(item.scrap_realisation_percent || 98));
+  const scrapActual     = n(scrapWt * scrapReal);
 
-  // RM rates calc
-  const gst_on_rm_amount  = r2(basic_rm_rate * gst_pct_on_rm);
-  // Gross RM Rate = basic + transport + GST (LBT omitted if zero)
-  const gross_rm_rate     = r2(basic_rm_rate + transport_rate + gst_on_rm_amount);
-  const gst_setoff_amount = gst_setoff_flag ? -gst_on_rm_amount : 0;
-  const net_rm_rate       = r2(gross_rm_rate + gst_setoff_amount);
+  // RM Rate chain
+  const basicRM         = n(item.rm_rate || 0);
+  const gstPct          = n(pct(item.rm_gst_pct || 18));
+  const gstOnRM         = n(basicRM * gstPct);
+  const profileConv     = n(item.profile_conversion_rate || 0);
+  const transport       = n(item.transport_rate_per_kg || 0);
+  const grossRMRate     = n(basicRM + gstOnRM + profileConv + transport);
+  const gstSetoff       = n(item.use_gst_setoff !== false ? -gstOnRM : 0);
+  const netRMRate       = n(grossRMRate + gstSetoff);  // gstSetoff is negative
 
-  // RM cost calcs
-  const effective_scrap_rate = r2(scrap_rate_per_kg * eff_scrap_factor);
-  const gross_rm_cost        = r2(gross_wt_incl_rej * net_rm_rate);
-  const scrap_recovery       = r2(actual_scrap_wt * effective_scrap_rate);
-  const net_rm_cost_per_pc   = r2(gross_rm_cost - scrap_recovery);
+  const grossRMCost     = n(grossWtInclRej * netRMRate);
+  const scrapCredit     = n(scrapActual * n(item.scrap_rate_per_kg || 875));
+  const netRMCost       = n(grossRMCost - scrapCredit);
 
-  // ICC
-  const icc_credit_days  = parseInt(template.icc_credit_on_input_days) || -30;
-  const icc_wip_days     = parseInt(template.icc_wip_fg_days) || 30;
-  const icc_given_days   = parseInt(template.icc_credit_given_days) || 45;
-  const icc_net_days     = icc_credit_days + icc_wip_days + icc_given_days;
-  const cost_of_capital  = parseFloat(template.icc_cost_of_capital) || 0.10;
-  const icc_percent      = r6(icc_net_days / 365);
-  const icc_amount       = r6(net_rm_cost_per_pc * icc_percent * cost_of_capital);
+  // ICC financing
+  const iccDays  = n(item.icc_credit_on_input_days || template?.icc_credit_on_input_days || -30);
+  const wipDays  = n(item.icc_wip_fg_days || template?.icc_wip_fg_days || 30);
+  const crdDays  = n(item.icc_credit_given_days || template?.icc_credit_given_days || 45);
+  const totalDays = n(Math.abs(iccDays) + wipDays + crdDays);
+  const coc      = n(pct(item.icc_cost_of_capital || template?.icc_cost_of_capital || 0.10));
+  const iccCost  = n(netRMCost * (totalDays / 365) * coc);
 
   // OHP on material
-  const ohp_pct_matl     = parseFloat(item.ohp_percent_on_matl) || parseFloat(template.ohp_percent_on_matl) || 0.10;
-  const ohp_amount_matl  = r6(net_rm_cost_per_pc * icc_percent * ohp_pct_matl);
-  const net_matl_cost    = r2(net_rm_cost_per_pc + icc_amount + ohp_amount_matl);
+  const ohpMatl  = n(netRMCost * n(pct(item.ohp_percent_on_matl || template?.ohp_percent_on_matl || 0.10)));
 
-  // Manufacturing / tolling processes
-  const total_mfg_cost   = r2(processResults.reduce((s, p) => s + (p.calculated_cost || 0), 0));
-  const rej_pct          = parseFloat(template.rejection_on_labour_pct) || 0.02;
-  const ohp_labour_pct   = parseFloat(template.ohp_on_labour_pct) || 0.15;
-  const rejection_on_labour = r2(total_mfg_cost * rej_pct);
-  const ohp_on_labour       = r2(total_mfg_cost * ohp_labour_pct);
+  // Process costs
+  const processCosts = (item.processes || []).map(p => ({
+    name: p.process_name || p.name || 'Process',
+    cost: n(p.calculated_cost || p.cost || 0),
+  }));
+  const totalProcessCost = n(processCosts.reduce((s, p) => s + p.cost, 0));
 
-  // Fixed cost lines (passed in item or use defaults from template overhead_flags)
-  const inspection_cost     = r2(parseFloat(item.inspection_cost) || 0);
-  const tool_maintenance_cost= r2(parseFloat(item.tool_maintenance_cost) || 0);
-  const packing_rate_per_pc = r2(parseFloat(item.packing_rate_per_pc) || 0);
-  const packing_cost        = r2(packing_rate_per_pc);
+  // OHP on labour
+  const ohpLabour = n(totalProcessCost * n(pct(item.ohp_on_labour_pct || template?.ohp_on_labour_pct || 0.15)));
+  const rejCostLabour = n(totalProcessCost * n(pct(template?.rejection_on_labour_pct || 0.02)));
 
-  const mfg_sub_total = r2(
-    total_mfg_cost + rejection_on_labour + ohp_on_labour +
-    inspection_cost + tool_maintenance_cost + packing_cost
+  // Overhead additions
+  const packingCost   = n(item.packing_cost_per_nos   || template?.packing_cost_per_nos   || 5);
+  const inspCost      = n(item.inspection_cost        || template?.inspection_cost        || 0.2);
+  const toolMaintCost = n(item.tool_maintenance_cost  || template?.tool_maintenance_cost  || 0.2);
+  const platingCost   = n((item.plating_cost_per_kg   || template?.plating_cost_per_kg   || 70) * grossWtPerPiece);
+
+  const landedCostPerPiece = n(
+    netRMCost + iccCost + ohpMatl +
+    totalProcessCost + ohpLabour + rejCostLabour +
+    packingCost + inspCost + toolMaintCost + platingCost
   );
 
-  // Plating: rate_per_kg × net_wt
-  const plating_rate_per_kg = r2(parseFloat(item.plating_rate_per_kg) || 0);
-  const plating_cost        = r2(plating_rate_per_kg * net_wt);
-
-  const total_rate_per_ea = r2(net_matl_cost + mfg_sub_total + plating_cost);
-  const amount            = r2(qty * total_rate_per_ea);
+  const qty    = n(item.Quantity || 1);
+  const amount = n(landedCostPerPiece * qty);
 
   return {
-    // identity
-    PartNo: item.PartNo, PartName: itemDetails.part_description,
-    Description: itemDetails.description || '', HSNCode: itemDetails.hsn_code,
-    Unit: itemDetails.unit, Quantity: qty,
-    // item master
-    item_no: itemDetails.item_no || item.PartNo,
-    drawing_no: itemDetails.drawing_no || '',
-    revision_no: itemDetails.revision_no || '0',
-    rm_grade: itemDetails.rm_grade || '',
-    material: itemDetails.material || rawMaterial.MaterialName || '',
-    rm_source: itemDetails.rm_source || '',
-    rm_type: itemDetails.rm_type || '',
-    rm_spec: itemDetails.rm_spec || itemDetails.rm_grade || '',
-    strip_size: itemDetails.strip_size || 0,
-    pitch: itemDetails.pitch || 0,
-    no_of_cavity: itemDetails.no_of_cavity || 1,
-    density: S,
-    rm_rejection_percent: rmRej * 100,
-    scrap_realisation_percent: scrapReal * 100,
-    // dimensions
-    Thickness: T, Width: W, Length: L,
-    // landed cost calc
-    landed_cost_rate: r2(rawMaterial.landed_cost || 0),
-    basic_rm_rate, transport_rate,
-    gst_on_rm_amount, gst_setoff_amount,
-    gross_rm_rate, net_rm_rate,
-    gross_weight_kg: gross_wt,
-    gross_weight_incl_rej: gross_wt_incl_rej,
-    net_weight_kg: net_wt,
-    scrap_wt, actual_scrap_wt,
-    scrap_rate_per_kg, effective_scrap_rate,
-    gross_rm_cost, scrap_recovery, net_rm_cost_per_pc,
-    icc_net_days, icc_cost_of_capital: cost_of_capital,
-    icc_percent, icc_amount,
-    ohp_percent_on_matl: ohp_pct_matl, ohp_amount_on_matl: ohp_amount_matl,
-    net_matl_cost,
-    rejection_on_labour_pct: rej_pct, rejection_on_labour_amt: rejection_on_labour,
-    ohp_on_labour_pct: ohp_labour_pct, ohp_on_labour_amt: ohp_on_labour,
-    inspection_cost, tool_maintenance_cost,
-    packing_rate_per_pc, packing_cost,
-    plating_rate_per_kg, plating_cost,
-    mfg_sub_total, total_rate_per_ea,
-    // common
-    Weight: gross_wt,
-    RMCost: net_rm_cost_per_pc,
-    ProcessCost: total_mfg_cost,
-    OverheadPercent: 0, OverheadAmount: 0,
-    MarginPercent: 0, MarginAmount: 0,
-    SubCost: r2(net_matl_cost + mfg_sub_total),
-    FinalRate: total_rate_per_ea, Amount: amount,
-    gst_percent: item.GSTPercentage || 0,
-    gst_amount: r2(amount * (item.GSTPercentage || 0) / 100),
-    processes: processResults
+    ...item,
+    gross_weight_kg:          grossWtPerPiece,
+    gross_wt_incl_rejection:  grossWtInclRej,
+    net_weight_kg:            netWt,
+    scrap_wt_actual:          scrapActual,
+    gross_rm_rate:            grossRMRate,
+    gst_setoff:               gstSetoff,
+    net_rm_rate:              netRMRate,
+    gross_rm_cost:            grossRMCost,
+    scrap_credit:             scrapCredit,
+    net_rm_cost:              netRMCost,
+    icc_cost:                 iccCost,
+    ohp_on_material:          ohpMatl,
+    ProcessCost:              totalProcessCost,
+    process_breakdown:        processCosts,
+    ohp_on_labour:            ohpLabour,
+    rejection_cost_labour:    rejCostLabour,
+    packing_cost:             packingCost,
+    inspection_cost:          inspCost,
+    tool_maintenance_cost:    toolMaintCost,
+    plating_cost:             platingCost,
+    FinalRate:                landedCostPerPiece,
+    SubTotal:                 landedCostPerPiece,
+    Amount:                   amount,
+    Quantity:                 qty,
   };
 }
 
-// ─────────────────────────────────────────────────────────────────
-// TEMPLATE 3 — COST BREAKUP (simple)
+// ─────────────────────────────────────────────────────────────────────────────
+// 3.  COST BREAKUP TEMPLATE  (Steering_brackets_3191227_-_19_01_2026.xls)
 //
-// Formulas (match actual Excel Steering brackets):
-//   rm_cost_direct   = supplied per item (RM cost flat)
-//   operations_total = Σ (all operation amounts)
-//   total_before_oh  = rm_cost_direct + operations_total
-//   overhead_profit  = total_before_oh × overhead_profit_pct
-//   final_rate       = total_before_oh + overhead_profit
-//   amount           = qty × final_rate
-// ─────────────────────────────────────────────────────────────────
-function calcCostBreakup ({ item, itemDetails, rawMaterial, template, processResults }) {
-  const qty   = parseFloat(item.Quantity) || 0;
+// Vertical per-part sheet. Simple structure:
+//   RM Cost (laser cutting / material) + Processing Costs + Overhead% → Cost/piece
+//
+//   Total = RMCost + sum(OperationCosts)
+//   Overhead = Total * overhead_pct
+//   CostPerPiece = Total + Overhead
+// ─────────────────────────────────────────────────────────────────────────────
+function calcCostBreakup(item, template) {
+  const rmCost = n(item.gross_rm_cost || item.rm_cost || 0);
 
-  // RM cost is flat — from item.rm_cost_direct or from item-master/raw-material lookup
-  const rm_cost_direct = r2(
-    parseFloat(item.rm_cost_direct) ||
-    parseFloat(item.RMCost) ||
-    0
-  );
+  const processCosts = (item.processes || []).map(p => ({
+    name:        p.process_name || p.name || 'Operation',
+    operation:   p.operation    || '',
+    machine:     p.machine      || '',
+    days_mandays: p.days_mandays || 0,
+    amount:      n(p.calculated_cost || p.cost || 0),
+  }));
+  const totalProcessCost = n(processCosts.reduce((s, p) => s + p.amount, 0));
 
-  // Operations (laser cutting, proto tolling, etc.)
-  const operations_total = r2(processResults.reduce((s, p) => s + (p.calculated_cost || 0), 0));
+  const total          = n(rmCost + totalProcessCost);
+  const overheadPct    = n(pct(item.OverheadPercent || item.overhead_pct || 10));
+  const overheadAmount = n(total * overheadPct);
+  const costPerPiece   = n(total + overheadAmount);
 
-  const total_before_oh = r2(rm_cost_direct + operations_total);
-
-  const oh_pct = parseFloat(item.overhead_profit_pct) ||
-                 parseFloat(template.default_margin_percent) || 0;
-  const overhead_profit_amt = r2(total_before_oh * oh_pct / 100);
-
-  const final_rate = r2(total_before_oh + overhead_profit_amt);
-  const amount     = r2(qty * final_rate);
+  const qty    = n(item.Quantity || 1);
+  const amount = n(costPerPiece * qty);
 
   return {
-    // identity
-    PartNo: item.PartNo, PartName: itemDetails.part_description,
-    Description: itemDetails.description || '', HSNCode: itemDetails.hsn_code,
-    Unit: itemDetails.unit, Quantity: qty,
-    item_no: itemDetails.item_no || item.PartNo,
-    drawing_no: itemDetails.drawing_no || '',
-    revision_no: itemDetails.revision_no || '0',
-    rm_grade: itemDetails.rm_grade || '',
-    material: itemDetails.material || '',
-    // cost breakup specific
-    rm_cost_direct,
-    operations_total,
-    overhead_profit_pct: oh_pct,
-    overhead_profit_amt,
-    // common
-    Weight: 0, RMCost: rm_cost_direct, ProcessCost: operations_total,
-    OverheadPercent: oh_pct, OverheadAmount: overhead_profit_amt,
-    MarginPercent: 0, MarginAmount: 0,
-    SubCost: total_before_oh,
-    FinalRate: final_rate, Amount: amount,
-    gst_percent: item.GSTPercentage || 0,
-    gst_amount: r2(amount * (item.GSTPercentage || 0) / 100),
-    processes: processResults
+    ...item,
+    rm_cost:             rmCost,
+    ProcessCost:         totalProcessCost,
+    process_breakdown:   processCosts,
+    SubTotal:            total,
+    OverheadPercent:     overheadPct * 100,
+    OverheadAmount:      overheadAmount,
+    FinalRate:           costPerPiece,
+    Amount:              amount,
+    Quantity:            qty,
   };
 }
 
-// ─────────────────────────────────────────────────────────────────
-// ENGINE MAP — add new engines here as objects grow
-// ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 4.  PART-WISE COST SHEET  (Poly_sheet_-_thik__5_0_mm_-_22_02_2026.xls)
+//
+// Customer-facing quotation table: one row per part.
+// Columns: SR | PartDesc | DocNo | SAPNo | Sheet | Rev | Thk | RM_size |
+//          RM_type | RM_cost | Conv_cost | Rate/pc | Margin | P&F | Rate/pc_final | Qty
+//
+//   TotalWeight = L * W * thk * density / 1e6  (or given)
+//   RMCost = TotalWeight * rm_rate_per_kg
+//   ConvCost = given (conversion / fabrication cost per pc)
+//   RatePerPc = RMCost + ConvCost
+//   Margin = RatePerPc * margin_pct
+//   PF = pf_pct * RatePerPc
+//   FinalRate = RatePerPc + Margin + PF
+// ─────────────────────────────────────────────────────────────────────────────
+function calcPartWise(item, template) {
+  const L       = n(item.Length || 0);
+  const W       = n(item.Width  || 0);
+  const thk     = n(item.Thickness || 0);
+  const density = n(item.density || 1.2);   // polycarbonate default
+
+  // Weight either given or calculated
+  const netWt   = n(item.net_weight_kg || (L * W * thk * density) / 1_000_000);
+  const rmRate  = n(item.rm_rate || 0);
+  const rmCost  = n(netWt * rmRate);
+
+  const convCost   = n(item.conversion_cost || item.ProcessCost || 0);
+  const ratePerPc  = n(rmCost + convCost);
+
+  const marginPct  = n(pct(item.MarginPercent || item.margin_pct || 0.20));
+  const margin     = n(ratePerPc * marginPct);
+  const pfPct      = n(pct(item.pf_pct || 0.05));
+  const pf         = n(ratePerPc * pfPct);
+
+  const finalRate  = n(ratePerPc + margin + pf);
+  const qty        = n(item.Quantity || 1);
+  const amount     = n(finalRate * qty);
+
+  return {
+    ...item,
+    net_weight_kg:    netWt,
+    gross_rm_cost:    rmCost,
+    conversion_cost:  convCost,
+    rate_per_pc:      ratePerPc,
+    MarginAmount:     margin,
+    pf_amount:        pf,
+    FinalRate:        finalRate,
+    Amount:           amount,
+    Quantity:         qty,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5.  NOMEX / SHEET MATERIAL  (Nomex_Paper_Quotation_02_02_2026.xlsx)
+//
+// Sheet/paper cut parts. Weight-based RM cost + fabrication + wastage.
+// Columns: Sr | SAP | Drawing | SNo | Rev | L | W | Thk |
+//          TotalWt | Rate/kg | RMCost | Wastage | TotalRM |
+//          Fabrication | Total | Profit% | Total | P&F% | DevCost | Total |
+//          Qty | ToolCost
+//
+//   TotalWt = L * W * thk * density / 1e6  (gm → kg: / 1000)
+//   RMCost  = TotalWt * rm_rate_per_kg
+//   Wastage = RMCost * wastage_pct   (typically included in TotalRM)
+//   TotalRM = RMCost + Wastage
+//   FabCost = given per piece
+//   Sub1    = TotalRM + FabCost
+//   Profit  = Sub1 * profit_pct
+//   Sub2    = Sub1 + Profit
+//   PF      = Sub2 * pf_pct
+//   FinalRate = Sub2 + PF + dev_cost_per_pc
+// ─────────────────────────────────────────────────────────────────────────────
+function calcNomexSheet(item, template) {
+  const L       = n(item.Length || 0);       // mm
+  const W       = n(item.Width  || 0);       // mm
+  const thk     = n(item.Thickness || 0);    // mm
+  const density = n(item.density || 1.0);    // g/cm³  (Nomex ~1.0–1.4)
+
+  // weight in kg  (L mm * W mm * thk mm * density g/cm³ / 1e6 → kg)
+  const totalWt   = n((L * W * thk * density) / 1_000_000);
+  const rmRate    = n(item.rm_rate || 0);
+  const rmCost    = n(totalWt * rmRate);
+  const wastagePct = n(pct(item.wastage_pct || 0));
+  const wastage   = n(rmCost * wastagePct);
+  const totalRM   = n(rmCost + wastage);
+
+  const fabCost   = n(item.fabrication_cost || item.ProcessCost || 0);
+  const sub1      = n(totalRM + fabCost);
+
+  const profitPct = n(pct(item.MarginPercent || item.profit_pct || 15));
+  const profit    = n(sub1 * profitPct);
+  const sub2      = n(sub1 + profit);
+
+  const pfPct     = n(pct(item.pf_pct || 5));
+  const pf        = n(sub2 * pfPct);
+
+  const devCost   = n(item.dev_cost_per_pc || 0);
+  const finalRate = n(sub2 + pf + devCost);
+  const qty       = n(item.Quantity || 1);
+  const amount    = n(finalRate * qty);
+
+  return {
+    ...item,
+    total_weight_kg:  totalWt,
+    gross_rm_cost:    rmCost,
+    wastage_amount:   wastage,
+    total_rm_cost:    totalRM,
+    fabrication_cost: fabCost,
+    SubTotal_1:       sub1,
+    profit_amount:    profit,
+    SubTotal_2:       sub2,
+    pf_amount:        pf,
+    dev_cost:         devCost,
+    FinalRate:        finalRate,
+    Amount:           amount,
+    Quantity:         qty,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6.  REVISED CONVERSION / MULTI-PART ASSEMBLY  (26_02_2026-_Revised_Conversion.xlsx)
+//
+// Assembly-level quotation where each "item" is a BUSBAR SET.
+// Each set contains sub-parts (busbars), each costed individually.
+// Total AMT/SET = sum of all sub-part (Rate/pc * qty/set).
+//
+//   Per busbar: GrossWt = T * W * L * density / 1e6
+//   RMCost     = GrossWt * Cu_flat_rate  (or sheet rate based on rm_type)
+//   Margin     = RMCost * margin_pct
+//   PlatingCost = GrossWt * plating_rate  (Tin on Cu/Al)
+//   RatePerPc  = RMCost + Margin + PlatingCost + InsertCut
+//   AmtPerSet  = RatePerPc * qty_in_set
+// ─────────────────────────────────────────────────────────────────────────────
+function calcRevisedConversion(item, template) {
+  const subParts = (item.sub_parts || [item]).map(sp => {
+    const T       = n(sp.Thickness || 0);
+    const W       = n(sp.Width     || 0);
+    const L       = n(sp.Length    || 0);
+    const density = n(sp.density   || 8.9);
+    const grossWt = n((T * W * L * density) / 1_000_000);
+
+    // RM rate depends on material type (Cu Flat vs Cu Sheet vs Al Flat vs Al Sheet)
+    const rmType  = (sp.rm_type || 'Cu Flat').toLowerCase();
+    let rmRate;
+    if      (rmType.includes('cu') && rmType.includes('sheet')) rmRate = n(template?.cu_sheet_rate || sp.rm_rate || 1438.85);
+    else if (rmType.includes('al') && rmType.includes('sheet')) rmRate = n(template?.al_sheet_rate || sp.rm_rate || 442);
+    else if (rmType.includes('al'))                              rmRate = n(template?.al_flat_rate  || sp.rm_rate || 418);
+    else                                                         rmRate = n(template?.cu_flat_rate  || sp.rm_rate || 1357.85);
+
+    const rmCost       = n(grossWt * rmRate);
+    const marginPct    = n(pct(sp.MarginPercent || 15));
+    const margin       = n(rmCost * marginPct);
+
+    // Plating (Tin on Cu: 75/kg, Tin on Al: 160/kg)
+    const platingRate  = rmType.includes('al') ? 160 : 75;
+    const platingCost  = n(grossWt * platingRate);
+
+    const insertCut    = n(sp.insert_cut || sp.ProcessCost || 0);
+    const scrapCredit  = n(grossWt * 0.10 * rmRate * 0.10);  // 10% scrap deduction
+    const ratePerPc    = n(rmCost + margin + platingCost + insertCut - scrapCredit);
+    const qtyInSet     = parseInt(sp.qty_in_set || sp.Quantity || 1);
+    const amtPerSet    = n(ratePerPc * qtyInSet);
+
+    return { ...sp, grossWt, rmCost, margin, platingCost, insertCut, ratePerPc, qty_in_set: qtyInSet, amtPerSet };
+  });
+
+  const totalAmtPerSet = n(subParts.reduce((s, sp) => s + sp.amtPerSet, 0));
+  const qty            = n(item.Quantity || 1);
+  const amount         = n(totalAmtPerSet * qty);
+
+  return {
+    ...item,
+    sub_parts:    subParts,
+    FinalRate:    totalAmtPerSet,
+    SubTotal:     totalAmtPerSet,
+    Amount:       amount,
+    Quantity:     qty,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7.  LASER + FABRICATION SHEET  (27_02_2026__-___CC0L0005002___-.xlsx)
+//
+// Very detailed sheet metal cost sheet:
+//   Drawing Spec → RM Calculation → Laser Calc → Special Ops →
+//   Bending → Fabrication + Powder Coating → Total
+//
+//   NetWt    = L * W * thk / 1e6 * density
+//   Wastage  = NetWt * 10%
+//   TotalWt  = NetWt + Wastage
+//   RMCost   = TotalWt * rm_rate
+//   ScrapCredit = ScrapWt * scrap_rate
+//   NetMatCost = RMCost - ScrapCredit
+//   LaserCost = (path_length_sq * laser_rate) + (start_points * start_rate)
+//   SpecialOpsCost = drilling + flatting + tapping + csk + mach/grinding + hardware
+//   BendingCost = given
+//   FabCost = given
+//   TotalProcess = LaserCost + SpecialOpsCost + BendingCost + FabCost
+//   Overheads = (inspection + rejection + design_jig + packaging + OH_profit + transport)
+//   FinalCost = NetMatCost + TotalProcess + Overheads
+// ─────────────────────────────────────────────────────────────────────────────
+function calcLaserFabrication(item, template) {
+  const L       = n(item.Length || 0);      // mm
+  const W       = n(item.Width  || 0);      // mm
+  const thk     = n(item.Thickness || 0);   // mm
+  const density = n(item.density || 7.85);  // MS default
+  const qty     = parseInt(item.Quantity || 1);
+
+  const netWt     = n((L * W * thk * density) / 1_000_000);
+  const wastage   = n(netWt * 0.10);
+  const totalWt   = n(netWt + wastage);
+  const rmRate    = n(item.rm_rate || 75);
+  const rmCost    = n(totalWt * rmRate);
+  const scrapRate = n(item.scrap_rate_per_kg || 20);
+  const scrapWt   = n(totalWt * 0.10);
+  const scrapCredit = n(scrapWt * scrapRate);
+  const netMatCost = n(rmCost - scrapCredit);
+
+  // Laser calculation
+  const pathLengthSqMm = n(item.path_length_sq_mm || 0);
+  const laserRate      = n(item.laser_rate_per_sq_mm || 0.02);
+  const startPoints    = parseInt(item.start_points || 0);
+  const startRate      = n(item.start_point_rate || 2.5);
+  const laserCost      = n((pathLengthSqMm * laserRate) + (startPoints * startRate));
+
+  // Special operations
+  const flatningCost = n(item.flatning_cost || 0);
+  const drillingCost = n(item.drilling_cost || 0);
+  const tappingCost  = n(item.tapping_cost  || 0);
+  const cskCost      = n(item.csk_cost      || 0);
+  const machGrindCost= n(item.mach_grinding_cost || item.hardware_cost || 0);
+  const bendingCost  = n(item.bending_cost  || 0);
+  const fabCost      = n(item.fabrication_cost || item.ProcessCost || 0);
+
+  const totalProcessCost = n(laserCost + flatningCost + drillingCost + tappingCost +
+                              cskCost + machGrindCost + bendingCost + fabCost);
+
+  const totalPlusMatCost = n(netMatCost + totalProcessCost);
+
+  // Overhead rates (from template or defaults matching the CC0L0005002 file: 2% each)
+  const ovhPct = n(pct(template?.inspection_pct         || 2));
+  const rejPct = n(pct(template?.rejection_pct          || 2));
+  const dsnPct = n(pct(template?.design_jig_pct         || 2));
+  const pkgPct = n(pct(template?.packaging_pct          || 2));
+  const ohpPct = n(pct(template?.overhead_profit_pct    || 15));
+  const trsPct = n(pct(template?.transportation_pct     || 2));
+
+  const inspCost    = n(totalPlusMatCost * ovhPct);
+  const rejCost     = n(totalPlusMatCost * rejPct);
+  const designCost  = n(totalPlusMatCost * dsnPct);
+  const pkgCost     = n(totalPlusMatCost * pkgPct);
+  const ohpCost     = n(totalPlusMatCost * ohpPct);
+  const trsCost     = n(totalPlusMatCost * trsPct);
+  const totalOverheads = n(inspCost + rejCost + designCost + pkgCost + ohpCost + trsCost);
+
+  const finalCost   = n(totalPlusMatCost + totalOverheads);
+  const amount      = n(finalCost * qty);
+
+  return {
+    ...item,
+    net_weight_kg:        netWt,
+    wastage_kg:           wastage,
+    total_weight_kg:      totalWt,
+    rm_cost:              rmCost,
+    scrap_credit:         scrapCredit,
+    net_material_cost:    netMatCost,
+    laser_cost:           laserCost,
+    flatning_cost:        flatningCost,
+    drilling_cost:        drillingCost,
+    tapping_cost:         tappingCost,
+    csk_cost:             cskCost,
+    mach_grind_cost:      machGrindCost,
+    bending_cost:         bendingCost,
+    fabrication_cost:     fabCost,
+    ProcessCost:          totalProcessCost,
+    total_process_plus_mat: totalPlusMatCost,
+    inspection_cost:      inspCost,
+    rejection_cost:       rejCost,
+    design_jig_cost:      designCost,
+    packaging_cost:       pkgCost,
+    overhead_profit_cost: ohpCost,
+    transportation_cost:  trsCost,
+    total_overheads:      totalOverheads,
+    FinalRate:            finalCost,
+    SubTotal:             totalPlusMatCost,
+    Amount:               amount,
+    Quantity:             qty,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DISPATCHER — pick the right calculator by template formula_engine
+// ─────────────────────────────────────────────────────────────────────────────
 const CALCULATORS = {
-  busbar:       calcBusbar,
-  landed_cost:  calcLandedCost,
-  cost_breakup: calcCostBreakup,
-  custom:       calcBusbar   // fallback to busbar until custom is defined
+  busbar:              calcBusbar,
+  landed_cost:         calcLandedCost,
+  cost_breakup:        calcCostBreakup,
+  part_wise:           calcPartWise,
+  nomex_sheet:         calcNomexSheet,
+  revised_conversion:  calcRevisedConversion,
+  laser_fabrication:   calcLaserFabrication,
 };
 
-/**
- * Main entry point used by the controller.
- * @param {string} engine  - template.formula_engine
- * @param {object} params  - { item, itemDetails, rawMaterial, template, processResults }
- */
-function calculateItem (engine, params) {
-  const fn = CALCULATORS[engine];
-  if (!fn) throw new Error(`Unknown formula_engine: "${engine}". Add it to CALCULATORS in quotationCalculators.js`);
-  return fn(params);
+function calculateItem(item, template) {
+  const engine = template?.formula_engine || 'busbar';
+  const calc   = CALCULATORS[engine] || calcBusbar;
+  return calc(item, template);
 }
 
-module.exports = { calculateItem, CALCULATORS };
+function calculateAllItems(items, template) {
+  return items.map(item => calculateItem(item, template));
+}
+
+module.exports = {
+  calculateItem,
+  calculateAllItems,
+  calcBusbar,
+  calcLandedCost,
+  calcCostBreakup,
+  calcPartWise,
+  calcNomexSheet,
+  calcRevisedConversion,
+  calcLaserFabrication,
+  CALCULATORS,
+};
