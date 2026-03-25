@@ -27,7 +27,7 @@ async function createSuperAdmin() {
   const superAdminRole = await Role.findOne({ RoleName: 'SuperAdmin' });
 
   if (!superAdminRole) {
-    console.error('❌  SuperAdmin role not found.');
+    console.error(' SuperAdmin role not found.');
     console.error('    Run: node scripts/createInitialRoles.js first.\n');
     process.exit(1);
   }

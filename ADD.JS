@@ -1,5444 +1,13791 @@
+const Booking = require('../models/Booking');
+const mongoose = require('mongoose');
+const Quotation = require('../models/QuotationModel');
+const ExcelJS = require('exceljs');
+const moment = require('moment');
+const Ledger = require('../models/Ledger');
+const Receipt = require('../models/Receipt');
+const StockTransfer = require('../models/stockTransferModel');
 const Vehicle = require('../models/vehicleInwardModel');
 const Branch = require('../models/Branch');
+const Subdealer = require('../models/Subdealer');
 const AppError = require('../utils/appError');
 const logger = require('../config/logger');
-const mongoose = require('mongoose');
-const QRCode = require('qrcode');
-const User = require('../models/User');
-const Booking = require('../models/Booking');
-const Color = require('../models/Color');
-const { stringify } = require('csv-stringify');
-const Model = require('../models/ModelModel');
-const _ = require('lodash');
-const excel = require('excel4node');
-const ExcelJS = require('exceljs');
-const { generateVehicleQRCode } = require('../utils/qrGenerator');
-const VehicleWaitingList = require('../models/vehicleWaitingListModel');
-const vehicleFreezeService = require('../services/vehicleFreezeService')
-const { 
-  checkAndAssignFromWaitingList,
-} = require('../utils/vehicleStatusHelper');
-const populateOptions = [
-  {
-    path: 'unloadLocation',
-    model: 'Branch',
-    select: 'name address city state pincode phone email gst_number is_active'
-  },
-  {
-    path: 'subdealerLocation',
-    model: 'Subdealer',
-    select: 'name location'
-  },
-  {
-    path: 'addedBy',
-    model: 'User',
-    select: 'name email'
-  }
+const path = require('path');
+const User = require('../models/User')
+const DummyInvoice = require('../models/DummyInvoice')
+const Header = require('../models/HeaderModel')
+const Insurance = require('../models/insuranceModel');
+
+/**
+ * Generate branch sales report with proper allocation date filtering
+ * Shows only bookings with status = 'ALLOCATED' filtered by allocation date from vehicle history
+ */
+
+const rtoHeaderKeys = [
+  'RTO CHARGES',
+  'RTO TAX & REGISTRATION CHARGES',
+  'RTO Redg.CHARGES WITH SMART CARD',
+  'RTO CHARGES BH/CRTM',
+  'RTO Redg.CHARGES WITH SMART CARD',
+  'RTO'
 ];
+exports.generateBranchSalesReport = async (req, res) => {
+    try {
+      const { 
+        branchId, 
+        startDate, 
+        endDate, 
+        status, 
+        bookingType,
+        customerType,
+        modelType,
+        bookingSource,
+        sourceType = 'BRANCH',
+        subdealerId,
+        format = 'excel' 
+      } = req.query;
+  
+      // Validate required dates
+      if (!startDate || !endDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'Start date and end date are required'
+        });
+      }
+  
+      // Parse dates
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+  
+      // Validate date range
+      if (start > end) {
+        return res.status(400).json({
+          success: false,
+          message: 'Start date cannot be greater than end date'
+        });
+      }
+  
+      // Get user info from auth middleware
+      const userId = req.user.id;
+      
+      // Fetch user with all necessary data
+      const user = await User.findById(userId)
+        .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+        .populate({
+          path: 'roles',
+          select: 'name isSuperAdmin permissionsCount'
+        })
+        .populate('branch')
+        .populate({
+          path: 'accessibleBranches',
+          model: 'Branch',
+          select: '_id name address city state pincode phone email is_active logo1'
+        })
+        .populate({
+          path: 'assignedSubdealers',
+          model: 'Subdealer',
+          select: '_id name firmName type status branch'
+        })
+        .lean();
+  
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: 'User not found'
+        });
+      }
+  
+      console.log(`User: ${user.name} (${user.email})`);
+      console.log(`User's branch: ${user.branch?.name || 'None'}`);
+      console.log(`Branch Access Type: ${user.branchAccess || 'OWN'}`);
+      
+      // Check user roles
+      const userRoles = user.roles || [];
+      const roleNames = userRoles.map(role => role.name);
+      console.log('User roles:', roleNames);
+      
+      const isActualSuperAdmin = roleNames.includes("SUPERADMIN");
+      const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true);
+      const isADBDM = roleNames.includes("ADBDM");
+      console.log('Is ADBDM user:', isADBDM);
+      
+      const branchAccess = user.branchAccess || 'OWN';
+      
+      let hasAllBranchesAccess = false;
+      
+      if (isActualSuperAdmin) {
+        hasAllBranchesAccess = true;
+        console.log('User is SUPERADMIN - has access to all branches');
+      } else if (branchAccess === 'ALL') {
+        hasAllBranchesAccess = true;
+        console.log('User has ALL branch access permission');
+      } else if (isSuperAdminFlag) {
+        hasAllBranchesAccess = true;
+        console.log('User is ADMIN/GM - has access to all branches');
+      } else {
+        console.log('User has restricted branch access');
+      }
+  
+      // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+      let availableBranches = [];
+      
+      if (hasAllBranchesAccess) {
+        availableBranches = await Branch.find({ is_active: true })
+          .select('_id name address city')
+          .sort({ name: 1 })
+          .lean();
+        console.log(`Fetched ${availableBranches.length} total branches for dropdown`);
+      } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+        availableBranches = user.accessibleBranches.map(branch => ({
+          _id: branch._id,
+          name: branch.name,
+          address: branch.address,
+          city: branch.city
+        })).sort((a, b) => a.name.localeCompare(b.name));
+        console.log(`Using ${availableBranches.length} assigned branches for dropdown`);
+      } else if (user.branch) {
+        availableBranches = [{
+          _id: user.branch._id,
+          name: user.branch.name,
+          address: user.branch.address,
+          city: user.branch.city
+        }];
+        console.log('Using only own branch for dropdown');
+      }
+      
+      if (availableBranches.length > 1) {
+        availableBranches.unshift({
+          _id: 'all',
+          name: 'All Branches',
+          address: '',
+          city: ''
+        });
+        console.log('Added "All Branches" option to dropdown');
+      }
+  
+      // ========== GET AVAILABLE SUBDEALERS FOR DROPDOWN ==========
+      let availableSubdealers = [];
+      
+      if (isADBDM) {
+        if (user.assignedSubdealers && user.assignedSubdealers.length > 0) {
+          availableSubdealers = user.assignedSubdealers.map(subdealer => ({
+            _id: subdealer._id,
+            name: subdealer.firmName || subdealer.name,
+            type: subdealer.type,
+            status: subdealer.status
+          })).sort((a, b) => a.name.localeCompare(b.name));
+          console.log(`ADBDM user has ${availableSubdealers.length} assigned subdealers`);
+        } else {
+          console.log('ADBDM user has no assigned subdealers');
+        }
+      } else if (hasAllBranchesAccess) {
+        const Subdealer = mongoose.model('Subdealer');
+        const subdealers = await Subdealer.find({ status: 'active' })
+          .select('_id name firmName type status')
+          .sort({ name: 1 })
+          .lean();
+        
+        availableSubdealers = subdealers.map(sub => ({
+          _id: sub._id,
+          name: sub.firmName || sub.name,
+          type: sub.type,
+          status: sub.status
+        }));
+        console.log(`Fetched ${availableSubdealers.length} total subdealers for dropdown`);
+      } else if (user.branch) {
+        const Subdealer = mongoose.model('Subdealer');
+        const subdealers = await Subdealer.find({ 
+          branch: user.branch._id,
+          status: 'active'
+        })
+          .select('_id name firmName type status')
+          .sort({ name: 1 })
+          .lean();
+        
+        availableSubdealers = subdealers.map(sub => ({
+          _id: sub._id,
+          name: sub.firmName || sub.name,
+          type: sub.type,
+          status: sub.status
+        }));
+        console.log(`Fetched ${availableSubdealers.length} subdealers for branch ${user.branch.name}`);
+      }
+      
+      if (availableSubdealers.length > 1) {
+        availableSubdealers.unshift({
+          _id: 'all',
+          name: 'All Subdealers',
+          type: '',
+          status: ''
+        });
+        console.log('Added "All Subdealers" option to subdealer dropdown');
+      }
+  
+      // ========== BUILD FILTER CONDITIONS ==========
+      const bookingFilter = {
+        status: 'ALLOCATED'
+      };
+  
+      // Handle sourceType filter
+      if (sourceType === 'SUBDEALER') {
+        bookingFilter.bookingType = 'SUBDEALER';
+        console.log('Filtering for SUBDEALER bookings only');
+      } else if (sourceType === 'BRANCH') {
+        bookingFilter.bookingType = 'BRANCH';
+        console.log('Filtering for BRANCH bookings only');
+      } else if (sourceType === 'BOTH') {
+        console.log('Including BOTH branch and subdealer bookings');
+      } else {
+        bookingFilter.bookingType = 'BRANCH';
+        console.log('Defaulting to BRANCH bookings only');
+      }
+  
+      // Handle backward compatibility
+      if (bookingSource && !sourceType) {
+        if (bookingSource === 'BOTH') {
+          delete bookingFilter.bookingType;
+        } else if (bookingSource === 'BRANCH') {
+          bookingFilter.bookingType = 'BRANCH';
+        } else if (bookingSource === 'SUBDEALER') {
+          bookingFilter.bookingType = 'SUBDEALER';
+        }
+      }
+  
+      // Handle payment type filter
+      if (bookingType) {
+        bookingFilter['payment.type'] = bookingType;
+        console.log(`Applying payment type filter: ${bookingType}`);
+      }
+  
+      // Apply branch filter (only for BRANCH or BOTH)
+      if (sourceType !== 'SUBDEALER') {
+        if (!hasAllBranchesAccess) {
+          if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+            const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+            
+            if (branchId && branchId !== 'all') {
+              const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+              const hasAccess = accessibleBranchIds.some(bId => 
+                bId.toString() === requestedBranchId.toString()
+              );
+              
+              if (!hasAccess) {
+                return res.status(403).json({
+                  success: false,
+                  message: 'You do not have access to this branch'
+                });
+              }
+              bookingFilter.branch = requestedBranchId;
+            } else if (branchId === 'all' || !branchId) {
+              bookingFilter.branch = { $in: accessibleBranchIds };
+            }
+          } else {
+            if (user.branch && user.branch._id) {
+              bookingFilter.branch = user.branch._id;
+            } else {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to any branch'
+              });
+            }
+          }
+        } else {
+          if (branchId && branchId !== 'all') {
+            bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
+          }
+        }
+      }
+  
+      // Apply subdealer filter (only for SUBDEALER or BOTH)
+      if (sourceType === 'SUBDEALER' || sourceType === 'BOTH') {
+        if (isADBDM) {
+          if (user.assignedSubdealers && user.assignedSubdealers.length > 0) {
+            const assignedSubdealerIds = user.assignedSubdealers.map(sub => sub._id);
+            
+            if (subdealerId && subdealerId !== 'all') {
+              if (!mongoose.Types.ObjectId.isValid(subdealerId)) {
+                return res.status(400).json({
+                  success: false,
+                  message: 'Invalid subdealer ID format'
+                });
+              }
+              
+              const requestedSubdealerId = new mongoose.Types.ObjectId(subdealerId);
+              const hasAccess = assignedSubdealerIds.some(sId => 
+                sId.toString() === requestedSubdealerId.toString()
+              );
+              
+              if (!hasAccess) {
+                return res.status(403).json({
+                  success: false,
+                  message: 'You do not have access to this subdealer'
+                });
+              }
+              bookingFilter.subdealer = requestedSubdealerId;
+            } else if (subdealerId === 'all' || !subdealerId) {
+              bookingFilter.subdealer = { $in: assignedSubdealerIds };
+            }
+          } else {
+            console.log('ADBDM user has no assigned subdealers');
+            const emptyResult = {
+              success: true,
+              count: 0,
+              data: [],
+              availableBranches: availableBranches,
+              availableSubdealers: availableSubdealers,
+              userAccessInfo: {
+                hasAllBranchesAccess: hasAllBranchesAccess,
+                branchAccess: branchAccess,
+                isADBDM: isADBDM,
+                accessibleBranchesCount: user.accessibleBranches?.length || 0,
+                assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+                userBranch: user.branch ? {
+                  _id: user.branch._id,
+                  name: user.branch.name
+                } : null
+              },
+              filters: {
+                startDate: start,
+                endDate: end,
+                branchId: branchId,
+                subdealerId: subdealerId,
+                sourceType: sourceType,
+                status: 'ALLOCATED',
+                bookingType: bookingType,
+                customerType: customerType,
+                modelType: modelType
+              }
+            };
+            
+            if (format === 'excel') {
+              const workbook = new ExcelJS.Workbook();
+              const worksheet = workbook.addWorksheet('Sales Report');
+              const headers = ['No Data Available'];
+              worksheet.columns = [{ header: 'No Data Available', key: 'noData', width: 30 }];
+              
+              res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+              res.setHeader('Content-Disposition', `attachment; filename="empty_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx"`);
+              await workbook.xlsx.write(res);
+              res.end();
+              return;
+            } else {
+              return res.status(200).json(emptyResult);
+            }
+          }
+        } else if (hasAllBranchesAccess) {
+          if (subdealerId && subdealerId !== 'all') {
+            if (!mongoose.Types.ObjectId.isValid(subdealerId)) {
+              return res.status(400).json({
+                success: false,
+                message: 'Invalid subdealer ID format'
+              });
+            }
+            bookingFilter.subdealer = new mongoose.Types.ObjectId(subdealerId);
+          }
+        } else if (user.branch) {
+          if (subdealerId && subdealerId !== 'all') {
+            if (!mongoose.Types.ObjectId.isValid(subdealerId)) {
+              return res.status(400).json({
+                success: false,
+                message: 'Invalid subdealer ID format'
+              });
+            }
+            
+            const Subdealer = mongoose.model('Subdealer');
+            const subdealer = await Subdealer.findById(subdealerId);
+            if (subdealer && subdealer.branch && subdealer.branch.toString() === user.branch._id.toString()) {
+              bookingFilter.subdealer = new mongoose.Types.ObjectId(subdealerId);
+            } else {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this subdealer'
+              });
+            }
+          }
+        }
+      }
+  
+      // Apply customer type filter
+      if (customerType) {
+        bookingFilter.customerType = customerType;
+        console.log(`Applying customerType filter: ${customerType}`);
+      }
+  
+      console.log('Final Booking Filter:', JSON.stringify(bookingFilter, null, 2));
+  
+      // ========== FETCH BOOKINGS ==========
+      let bookingsQuery = Booking.find(bookingFilter)
+        .populate('model', 'model_name type')
+        .populate('color', 'name')
+        .populate('branch', 'name address city')
+        .populate('subdealer', 'name firmName')
+        .populate('salesExecutive', 'name email mobile')
+        .populate('subdealerUser', 'name email mobile')
+        .populate('createdBy', 'name email')
+        .populate('verticleDetails', 'name')
+        .populate({
+          path: 'priceComponents.header',
+          select: 'header_key category_key priority type',
+          model: 'Header'
+        })
+        .populate({
+          path: 'ledgerEntries',
+          select: 'amount paymentMode type date approvalStatus isDebit',
+          match: { approvalStatus: 'Approved' }
+        })
+        .populate('financeDisbursements', 'disbursementReference disbursementAmount receivedAmount status disbursementDate')
+        .populate('exchangeDetails.broker', 'name mobile')
+        .populate('payment.financer', 'name')
+        .populate({
+          path: 'accessories.accessory',
+          select: 'name code category description',
+          model: 'Accessory'
+        })
+        .populate({
+          path: 'vehicle',
+          select: 'chassisNumber engineNumber batteryNumber keyNumber motorNumber chargerNumber allocationHistory',
+          model: 'Vehicle'
+        });
+  
+      // Apply model type filter
+      if (modelType && modelType !== 'all') {
+        const models = await mongoose.model('Model').find({ 
+          type: modelType.toUpperCase() 
+        }).select('_id').lean();
+        
+        const modelIds = models.map(model => model._id);
+        
+        if (modelIds.length > 0) {
+          bookingsQuery = bookingsQuery.where('model').in(modelIds);
+          console.log(`Applying modelType filter: ${modelType} (${modelIds.length} models)`);
+        } else {
+          console.log(`No models found for type: ${modelType}`);
+          const emptyResult = {
+            success: true,
+            count: 0,
+            data: [],
+            availableBranches: availableBranches,
+            availableSubdealers: availableSubdealers,
+            userAccessInfo: {
+              hasAllBranchesAccess: hasAllBranchesAccess,
+              branchAccess: branchAccess,
+              isADBDM: isADBDM,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null
+            },
+            filters: {
+              startDate: start,
+              endDate: end,
+              branchId: branchId,
+              subdealerId: subdealerId,
+              sourceType: sourceType,
+              status: 'ALLOCATED',
+              bookingType: bookingType,
+              customerType: customerType,
+              modelType: modelType
+            }
+          };
+          
+          if (format === 'excel') {
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Sales Report');
+            const headers = ['No Data Available'];
+            worksheet.columns = [{ header: 'No Data Available', key: 'noData', width: 30 }];
+            
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename="empty_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx"`);
+            await workbook.xlsx.write(res);
+            res.end();
+            return;
+          } else {
+            return res.status(200).json(emptyResult);
+          }
+        }
+      }
+  
+      // Execute query
+      let bookings = await bookingsQuery.lean();
+      console.log(`Found ${bookings.length} bookings with ALLOCATED status before date filtering`);
+      console.log(`Booking types in results: ${[...new Set(bookings.map(b => b.bookingType))].join(', ')}`);
+  
+      // Filter by allocation date
+      const filteredBookings = [];
+      
+      for (const booking of bookings) {
+        let allocationDate = null;
+        let allocationStatus = null;
+        
+        if (booking.vehicle && booking.vehicle.allocationHistory && booking.vehicle.allocationHistory.length > 0) {
+          const allocationEntries = booking.vehicle.allocationHistory.filter(
+            history => history.bookingId && 
+                      history.bookingId.toString() === booking._id.toString() &&
+                      history.status === 'ALLOCATED'
+          );
+          
+          if (allocationEntries.length > 0) {
+            allocationEntries.sort((a, b) => new Date(b.allocatedAt) - new Date(a.allocatedAt));
+            const latestAllocation = allocationEntries[0];
+            allocationDate = latestAllocation.allocatedAt;
+            allocationStatus = latestAllocation.status;
+          }
+        }
+        
+        if (allocationDate) {
+          const allocDate = new Date(allocationDate);
+          if (allocDate >= start && allocDate <= end) {
+            booking.allocationDate = allocationDate;
+            booking.allocationStatus = allocationStatus;
+            filteredBookings.push(booking);
+          }
+        } else {
+          console.log(`Booking ${booking.bookingNumber} has ALLOCATED status but no allocation history entry found`);
+          const fallbackDate = booking.approvedAt || booking.updatedAt || booking.createdAt;
+          if (fallbackDate) {
+            const fallbackDateObj = new Date(fallbackDate);
+            if (fallbackDateObj >= start && fallbackDateObj <= end) {
+              booking.allocationDate = fallbackDate;
+              booking.allocationStatus = 'ALLOCATED';
+              filteredBookings.push(booking);
+            }
+          }
+        }
+      }
+  
+      console.log(`After allocation date filtering, ${filteredBookings.length} records with ALLOCATED status in date range`);
+  
+      if (filteredBookings.length === 0) {
+        const emptyResult = {
+          success: true,
+          count: 0,
+          data: [],
+          availableBranches: availableBranches,
+          availableSubdealers: availableSubdealers,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            isADBDM: isADBDM,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0,
+            assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+            userBranch: user.branch ? {
+              _id: user.branch._id,
+              name: user.branch.name
+            } : null
+          },
+          filters: {
+            startDate: start,
+            endDate: end,
+            branchId: branchId,
+            subdealerId: subdealerId,
+            sourceType: sourceType,
+            status: 'ALLOCATED',
+            bookingType: bookingType,
+            customerType: customerType,
+            modelType: modelType
+          }
+        };
+        
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Sales Report');
+          const headers = ['No Data Available'];
+          worksheet.columns = [{ header: 'No Data Available', key: 'noData', width: 30 }];
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="empty_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx"`);
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          return res.status(200).json(emptyResult);
+        }
+      }
+  
+      // ========== GET DYNAMIC PRICE HEADERS ==========
+      let headerTypeFilter = {};
+      if (modelType && modelType !== 'all') {
+        headerTypeFilter.type = modelType.toUpperCase();
+        console.log(`Filtering headers by model type: ${modelType}`);
+      } else {
+        console.log('No modelType filter or "all", fetching all headers (EV + ICE)');
+      }
+  
+      const Header = mongoose.model('Header');
+      const allPossibleHeaders = await Header.find(headerTypeFilter)
+        .select('header_key priority type')
+        .sort({ priority: 1 })
+        .lean();
+  
+      console.log(`Found ${allPossibleHeaders.length} total possible headers in the system`);
+  
+      const headersToExcludeFromReport = [
+        'ON ROAD PRICE',
+        'ADD ON SERVICES TOTAL',
+        'ACCESSORIES TOTAL'
+      ];
+  
+      const headerMap = new Map();
+      allPossibleHeaders.forEach(header => {
+        if (header.header_key) {
+          const shouldExclude = headersToExcludeFromReport.some(excludeHeader => 
+            header.header_key.includes(excludeHeader) || excludeHeader.includes(header.header_key)
+          );
+          
+          if (!shouldExclude) {
+            headerMap.set(header.header_key, {
+              header_key: header.header_key,
+              priority: header.priority || 999,
+              type: header.type,
+              index: headerMap.size
+            });
+          }
+        }
+      });
+  
+      const priceHeaders = Array.from(headerMap.values())
+        .sort((a, b) => a.priority - b.priority);
+  
+      console.log(`Using ${priceHeaders.length} price headers for report`);
+  
+      // Helper functions
+      const isEVBooking = (booking) => {
+        return booking.model && booking.model.type === 'EV';
+      };
+  
+      const isICEBooking = (booking) => {
+        return booking.model && booking.model.type === 'ICE';
+      };
+  
+      const getRTOAmount = (booking) => {
+        if (booking.rtoAmount && booking.rtoAmount > 0) {
+          return booking.rtoAmount;
+        }
+        
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          for (const pc of booking.priceComponents) {
+            if (pc.header && pc.header.header_key) {
+              const headerKey = pc.header.header_key;
+              if (headerKey.includes('RTO')) {
+                return pc.discountedValue !== undefined ? pc.discountedValue : (pc.originalValue || 0);
+              }
+            }
+          }
+        }
+        
+        return 0;
+      };
+  
+      // ========== GENERATE EXCEL REPORT ==========
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        
+        let worksheetName = 'Sales Report';
+        if (branchId && branchId !== 'all' && filteredBookings.length > 0) {
+          const branch = filteredBookings[0]?.branch?.name;
+          if (branch) {
+            worksheetName = `${branch} Sales Report`;
+          }
+        } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+          worksheetName = 'All Branches Sales Report';
+        }
+        
+        if (modelType && modelType !== 'all') {
+          worksheetName = `${modelType} ${worksheetName}`;
+        } else {
+          worksheetName = `EV+ICE ${worksheetName}`;
+        }
+        
+        const worksheet = workbook.addWorksheet(worksheetName.substring(0, 31), {
+          properties: { defaultRowHeight: 20 },
+          pageSetup: { paperSize: 9, orientation: 'landscape' }
+        });
+  
+        const baseHeaders = [
+          'Booking Number', 'Booking Date', 'Allocation Date', 'Branch/Subdealer Name', 
+          'Sales Executive', 'Model', 'Verticle', 'Model Type', 'Color', 
+          'Chassis Number', 'Engine Number', 'Customer Name', 'Mobile1', 'Mobile2',
+          'Address', 'Pincode', 'Aadhar number', 'Pan no', 'Birthday',
+          'Nominee Name', 'Nominee Relation', 'Nominee Age',
+          'Booking Type (CASH/FINANCE)', 'Financier Name', 'Customer Type', 'GST Number',
+          'Exchange', 'Exchange Vehicle Number', 'Exchange Chassis Number', 'Exchange Broker', 'Exchange Price',
+          'Has Claim', 'Claim Price'
+        ];
+  
+        const allHeaders = [...baseHeaders];
+        priceHeaders.forEach(ph => {
+          allHeaders.push(ph.header_key);
+        });
+        allHeaders.push('Total Amount', 'Total Discount Given', 'Final Deal Amount');
+  
+        const columns = allHeaders.map((header, index) => {
+          let width = 15;
+          if (header.includes('Name')) width = 20;
+          else if (header.includes('Address')) width = 30;
+          else if (header.includes('Number')) width = 18;
+          else if (header === 'Has Claim') width = 12;
+          else if (header === 'Claim Price') width = 15;
+          
+          return {
+            header: header,
+            key: `col_${index}`,
+            width: width
+          };
+        });
+  
+        worksheet.columns = columns;
+  
+        const headerRow = worksheet.getRow(1);
+        headerRow.height = 30;
+        headerRow.eachCell((cell) => {
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E75B5' } };
+          cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+          cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+        });
+  
+        filteredBookings.forEach((booking) => {
+          const rowData = {};
+          let colIndex = 0;
+          
+          rowData[`col_${colIndex++}`] = booking.bookingNumber || '';
+          rowData[`col_${colIndex++}`] = booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '';
+          rowData[`col_${colIndex++}`] = booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '';
+          
+          let sourceName = '';
+          if (booking.bookingType === 'BRANCH') {
+            sourceName = booking.branch?.name || '';
+          } else if (booking.bookingType === 'SUBDEALER') {
+            sourceName = booking.subdealer?.firmName || booking.subdealer?.name || '';
+          }
+          rowData[`col_${colIndex++}`] = sourceName;
+          
+          rowData[`col_${colIndex++}`] = booking.salesExecutive?.name || '';
+          rowData[`col_${colIndex++}`] = booking.model?.model_name || '';
+          
+          let verticleNames = '';
+          if (booking.verticleDetails && booking.verticleDetails.length > 0) {
+            verticleNames = booking.verticleDetails.map(v => v.name || '').filter(name => name !== '').join(', ');
+          }
+          rowData[`col_${colIndex++}`] = verticleNames;
+          
+          rowData[`col_${colIndex++}`] = booking.model?.type || '';
+          rowData[`col_${colIndex++}`] = booking.color?.name || '';
+          rowData[`col_${colIndex++}`] = booking.chassisNumber || (booking.vehicle?.chassisNumber || '');
+          rowData[`col_${colIndex++}`] = booking.vehicle?.engineNumber || booking.engineNumber || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.name || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.mobile1 || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.mobile2 || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.address || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.pincode || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.aadharNumber || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.panNo || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeName || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeRelation || '';
+          rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeAge || '';
+          rowData[`col_${colIndex++}`] = booking.payment?.type || '';
+          
+          let financierName = '';
+          if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+            financierName = booking.payment.financer.name || '';
+          }
+          rowData[`col_${colIndex++}`] = financierName;
+          
+          rowData[`col_${colIndex++}`] = booking.customerType || '';
+          rowData[`col_${colIndex++}`] = (booking.customerType === 'B2B') ? (booking.gstin || '') : '';
+          rowData[`col_${colIndex++}`] = booking.exchange ? 'YES' : 'NO';
+          rowData[`col_${colIndex++}`] = booking.exchangeDetails?.vehicleNumber || '';
+          rowData[`col_${colIndex++}`] = booking.exchangeDetails?.chassisNumber || '';
+          rowData[`col_${colIndex++}`] = booking.exchangeDetails?.broker?.name || '';
+          rowData[`col_${colIndex++}`] = booking.exchangeDetails?.price || 0;
+          rowData[`col_${colIndex++}`] = (booking.claimDetails && booking.claimDetails.hasClaim) ? 'YES' : 'NO';
+          rowData[`col_${colIndex++}`] = (booking.claimDetails && booking.claimDetails.priceClaim) || 0;
+  
+          const priceComponentMap = new Map();
+          if (booking.priceComponents && booking.priceComponents.length > 0) {
+            booking.priceComponents.forEach(pc => {
+              if (pc.header && pc.header.header_key) {
+                const headerKey = pc.header.header_key;
+                const value = pc.discountedValue !== undefined ? pc.discountedValue : (pc.originalValue || 0);
+                priceComponentMap.set(headerKey, value);
+              }
+            });
+          }
+  
+          priceHeaders.forEach(ph => {
+            rowData[`col_${colIndex++}`] = priceComponentMap.get(ph.header_key) || 0;
+          });
+  
+          rowData[`col_${colIndex++}`] = booking.totalAmount || 0;
+          const discountAmount = (booking.totalAmount || 0) - (booking.discountedAmount || 0);
+          rowData[`col_${colIndex++}`] = discountAmount;
+          rowData[`col_${colIndex++}`] = booking.discountedAmount || 0;
+  
+          worksheet.addRow(rowData);
+        });
+  
+        for (let i = 1; i <= filteredBookings.length; i++) {
+          const row = worksheet.getRow(i + 1);
+          if (i % 2 === 0) {
+            row.eachCell((cell) => {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            });
+          }
+        }
+  
+        if (worksheet.rowCount > 1) {
+          const lastCol = worksheet.columnCount;
+          let lastColLetter = '';
+          let tempCol = lastCol;
+          while (tempCol > 0) {
+            const remainder = (tempCol - 1) % 26;
+            lastColLetter = String.fromCharCode(65 + remainder) + lastColLetter;
+            tempCol = Math.floor((tempCol - 1) / 26);
+          }
+          worksheet.autoFilter = {
+            from: 'A1',
+            to: `${lastColLetter}${worksheet.rowCount}`
+          };
+        }
+  
+        worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+  
+        const fileName = `sales_report_${modelType && modelType !== 'all' ? modelType + '_' : 'EV_ICE_'}${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        
+        await workbook.xlsx.write(res);
+        res.end();
+  
+      } else {
+        // ========== RETURN JSON FORMAT ==========
+        const formattedBookings = filteredBookings.map(booking => {
+          const totalAmount = booking.totalAmount || 0;
+          const discountedAmount = booking.discountedAmount || 0;
+          const discountAmount = totalAmount - discountedAmount;
+  
+          const priceComponentsObj = {};
+          let subsidyAmount = 0;
+          
+          if (booking.subsidyAmount && booking.subsidyAmount > 0) {
+            subsidyAmount = booking.subsidyAmount;
+          }
+          
+          if (booking.priceComponents && booking.priceComponents.length > 0) {
+            booking.priceComponents.forEach(pc => {
+              if (pc.header && pc.header.header_key) {
+                const headerKey = pc.header.header_key;
+                const value = pc.discountedValue !== undefined ? pc.discountedValue : (pc.originalValue || 0);
+                
+                const shouldExclude = headersToExcludeFromReport.some(excludeHeader => 
+                  headerKey.includes(excludeHeader) || excludeHeader.includes(headerKey)
+                );
+                
+                if (!shouldExclude) {
+                  priceComponentsObj[headerKey] = value;
+                }
+              }
+            });
+          }
+  
+          const rtoAmount = getRTOAmount(booking);
+          const isEV = isEVBooking(booking);
+  
+          let sourceName = '';
+          if (booking.bookingType === 'BRANCH') {
+            sourceName = booking.branch?.name || '';
+          } else if (booking.bookingType === 'SUBDEALER') {
+            sourceName = booking.subdealer?.firmName || booking.subdealer?.name || '';
+          }
+  
+          let financierName = '';
+          if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+            financierName = booking.payment.financer.name || '';
+          }
+  
+          return {
+            bookingNumber: booking.bookingNumber,
+            bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+            allocationDate: booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '',
+            sourceName: sourceName,
+            sourceType: booking.bookingType,
+            branchName: booking.branch?.name,
+            branchId: booking.branch?._id,
+            subdealerName: booking.subdealer?.firmName || booking.subdealer?.name,
+            subdealerId: booking.subdealer?._id,
+            salesExecutive: booking.salesExecutive?.name,
+            model: booking.model?.model_name,
+            modelType: booking.model?.type,
+            color: booking.color?.name,
+            chassisNumber: booking.chassisNumber,
+            engineNumber: booking.vehicle?.engineNumber || booking.engineNumber || '',
+            customerName: booking.customerDetails?.name,
+            mobile1: booking.customerDetails?.mobile1,
+            mobile2: booking.customerDetails?.mobile2,
+            address: booking.customerDetails?.address,
+            pincode: booking.customerDetails?.pincode || '',
+            aadharNumber: booking.customerDetails?.aadharNumber,
+            panNo: booking.customerDetails?.panNo,
+            birthday: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+            nomineeName: booking.customerDetails?.nomineeName,
+            nomineeRelation: booking.customerDetails?.nomineeRelation,
+            nomineeAge: booking.customerDetails?.nomineeAge,
+            bookingType: booking.payment?.type,
+            financierName: financierName,
+            customerType: booking.customerType,
+            gstNumber: (booking.customerType === 'B2B') ? (booking.gstin || '') : '',
+            exchange: booking.exchange ? 'YES' : 'NO',
+            exchangeDetails: booking.exchangeDetails,
+            rtoAmount: rtoAmount,
+            claimDetails: booking.claimDetails,
+            priceComponents: priceComponentsObj,
+            subsidyAmount: isEV ? subsidyAmount : 0,
+            totalAmount: totalAmount,
+            totalDiscount: discountAmount,
+            finalAmount: discountedAmount,
+            isEV: isEV
+          };
+        });
+  
+        const overallTotals = formattedBookings.reduce((acc, booking) => {
+          acc.totalAmount += booking.totalAmount || 0;
+          acc.totalDiscount += booking.totalDiscount || 0;
+          acc.finalAmount += booking.finalAmount || 0;
+          acc.totalClaimAmount += (booking.claimDetails?.priceClaim || 0);
+          acc.totalRTOCharges += (booking.rtoAmount || 0);
+          acc.totalSubsidy += (booking.subsidyAmount || 0);
+          return acc;
+        }, { totalAmount: 0, totalDiscount: 0, finalAmount: 0, totalClaimAmount: 0, totalRTOCharges: 0, totalSubsidy: 0 });
+  
+        const bookingsWithClaim = filteredBookings.filter(b => b.claimDetails?.hasClaim).length;
+        const evBookings = filteredBookings.filter(b => isEVBooking(b)).length;
+        const iceBookings = filteredBookings.filter(b => isICEBooking(b)).length;
+  
+        res.status(200).json({
+          success: true,
+          count: formattedBookings.length,
+          totals: overallTotals,
+          data: formattedBookings,
+          priceHeaders: priceHeaders.map(ph => ph.header_key),
+          headerTypes: [...new Set(priceHeaders.map(h => h.type))],
+          availableBranches: availableBranches,
+          availableSubdealers: availableSubdealers,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            isADBDM: isADBDM,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0,
+            assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+            userBranch: user.branch ? {
+              _id: user.branch._id,
+              name: user.branch.name
+            } : null
+          },
+          filters: {
+            startDate: start,
+            endDate: end,
+            branchId: branchId,
+            subdealerId: subdealerId,
+            sourceType: sourceType,
+            status: 'ALLOCATED',
+            bookingType: bookingType,
+            customerType: customerType,
+            modelType: modelType
+          },
+          summary: {
+            totalBookings: filteredBookings.length,
+            evBookings: evBookings,
+            iceBookings: iceBookings,
+            branchBookings: filteredBookings.filter(b => b.bookingType === 'BRANCH').length,
+            subdealerBookings: filteredBookings.filter(b => b.bookingType === 'SUBDEALER').length,
+            totalClaimAmount: overallTotals.totalClaimAmount,
+            totalRTOCharges: overallTotals.totalRTOCharges,
+            totalSubsidy: overallTotals.totalSubsidy,
+            bookingsWithClaim: bookingsWithClaim,
+            modelTypesInReport: [...new Set(filteredBookings.map(b => b.model?.type).filter(Boolean))]
+          }
+        });
+      }
+  
+    } catch (error) {
+      console.error('Error generating sales report:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Error generating sales report',
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  };
+// ============================================================
+// FIXED: generateBranchSalesReport
+// KEY CHANGES FOR EV SUBSIDY:
+//   1. priceComponentMap for Ex-Showroom: add subsidyAmount to its value
+//      so the column shows the GROSS price (before subsidy deduction)
+//   2. LESS:- CENTER SUBSIDY(FAME-II) column: shows the raw subsidy amount
+//   3. Total Discount Given: does NOT include subsidy
+//      (subsidy is a govt benefit, not a dealer discount)
+//   4. netAmountAfterSubsidy = discountedAmount (already correct — the
+//      final amount the customer pays after subsidy has been applied)
+// ============================================================
 
-//exports.createVehicle = async (req, res, next) => {
+
+// ========== HELPER: Send empty report ==========
+async function _sendEmptyReport(res, format, availableBranches, hasAllBranchesAccess, branchAccess, user, start, end, branchId, bookingFilter, customerType, modelType, bookingSource) {
+  if (format === 'excel') {
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Sales Report');
+    const headers = [
+      'Booking Number', 'Booking Date', 'Allocation Date', 'Branch/Subdealer Name',
+      'Sales Executive', 'Model', 'Verticle', 'Model Type', 'Color',
+      'Chassis Number', 'Engine Number', 'Customer Name', 'Mobile1', 'Mobile2',
+      'Address', 'Pincode', 'Aadhar number', 'Pan no', 'Birthday',
+      'Nominee Name', 'Nominee Relation', 'Nominee Age',
+      'Booking Type (CASH/FINANCE)', 'Financier Name', 'Customer Type', 'GST Number',
+      'Exchange', 'Exchange Vehicle Number', 'Exchange Chassis Number', 'Exchange Broker', 'Exchange Price',
+      'Has Claim', 'Claim Price', 'RTO CHARGES', 'Total Amount', 'Total Discount Given',
+      'Final Deal Amount', 'Net Amount After Subsidy', 'Accessories'
+    ];
+    worksheet.columns = headers.map((header, index) => ({
+      header,
+      key: `col_${index}`,
+      width: header.includes('Name') ? 20 : header.includes('Address') ? 30 : header.includes('Number') ? 18 : 15
+    }));
+    const fileName = `sales_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } else {
+    return res.status(200).json({
+      success: true,
+      count: 0,
+      data: [],
+      availableBranches,
+      userAccessInfo: {
+        hasAllBranchesAccess,
+        branchAccess,
+        accessibleBranchesCount: user.accessibleBranches?.length || 0,
+        userBranch: user.branch ? { _id: user.branch._id, name: user.branch.name } : null
+      },
+      filters: {
+        startDate: start,
+        endDate: end,
+        branchId,
+        status: 'ALLOCATED',
+        bookingType: bookingFilter.bookingType,
+        customerType,
+        modelType,
+        bookingSource
+      }
+    });
+  }
+}
+exports.generateSubdealerSalesReport = async (req, res) => {
+  try {
+    const { 
+      subdealerId, 
+      startDate, 
+      endDate, 
+      status, 
+      bookingType,
+      customerType,
+      modelType,
+      format = 'excel' 
+    } = req.query;
+
+    // Validate required dates
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date and end date are required'
+      });
+    }
+
+    // Parse dates
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    
+    // Set end date to end of day
+    end.setHours(23, 59, 59, 999);
+
+    // Validate date range
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date cannot be greater than end date'
+      });
+    }
+
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    
+    // Check user roles
+    const userRoles = user.roles || [];
+    
+    // Check if user is SUPERADMIN
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    // Check if user has superadmin flag
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    // Determine subdealer access level
+    let hasAllSubdealersAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllSubdealersAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all subdealers');
+    } else if (isSuperAdminFlag) {
+      hasAllSubdealersAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all subdealers');
+    } else {
+      console.log('ℹ️ User has restricted subdealer access based on branch');
+    }
+
+    // ========== GET AVAILABLE SUBDEALERS FOR DROPDOWN ==========
+    let availableSubdealers = [];
+    
+    if (hasAllSubdealersAccess) {
+      // User can see all active subdealers
+      availableSubdealers = await Subdealer.find({ status: 'active' })
+        .select('_id name type branch latLong.address rateOfInterest creditPeriodDays discount')
+        .populate('branch', 'name')
+        .sort({ name: 1 })
+        .lean();
+      
+      // Format the response
+      availableSubdealers = availableSubdealers.map(sub => ({
+        _id: sub._id,
+        name: sub.name,
+        type: sub.type,
+        branchName: sub.branch?.name || '',
+        address: sub.latLong?.address || '',
+        rateOfInterest: sub.rateOfInterest,
+        creditPeriodDays: sub.creditPeriodDays,
+        discount: sub.discount
+      }));
+      
+      console.log(`✅ Fetched ${availableSubdealers.length} total subdealers for dropdown`);
+    } else {
+      // Get subdealers based on user's branch access
+      let branchIds = [];
+      
+      // Add user's own branch
+      if (user.branch && user.branch._id) {
+        branchIds.push(user.branch._id);
+      }
+      
+      // Add accessible branches
+      if (user.accessibleBranches && user.accessibleBranches.length > 0) {
+        branchIds = [...branchIds, ...user.accessibleBranches.map(b => b._id)];
+      }
+      
+      // Remove duplicates
+      branchIds = [...new Set(branchIds.map(id => id.toString()))].map(id => 
+        typeof id === 'string' ? new mongoose.Types.ObjectId(id) : id
+      );
+      
+      if (branchIds.length > 0) {
+        // Get subdealers under these branches
+        availableSubdealers = await Subdealer.find({ 
+          branch: { $in: branchIds },
+          status: 'active'
+        })
+        .select('_id name type branch latLong.address rateOfInterest creditPeriodDays discount')
+        .populate('branch', 'name')
+        .sort({ name: 1 })
+        .lean();
+        
+        // Format the response
+        availableSubdealers = availableSubdealers.map(sub => ({
+          _id: sub._id,
+          name: sub.name,
+          type: sub.type,
+          branchName: sub.branch?.name || '',
+          address: sub.latLong?.address || '',
+          rateOfInterest: sub.rateOfInterest,
+          creditPeriodDays: sub.creditPeriodDays,
+          discount: sub.discount
+        }));
+        
+        console.log(`✅ Found ${availableSubdealers.length} subdealers under accessible branches`);
+      }
+    }
+    
+    // If no subdealers found, return empty result
+    if (availableSubdealers.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have access to any subdealers'
+      });
+    }
+    
+    // Add "All" option for users with multiple subdealer access
+    if (availableSubdealers.length > 1) {
+      availableSubdealers.unshift({
+        _id: 'all',
+        name: 'All Subdealers',
+        type: '',
+        branchName: '',
+        address: '',
+        rateOfInterest: null,
+        creditPeriodDays: null,
+        discount: null
+      });
+      console.log('✅ Added "All Subdealers" option to dropdown');
+    }
+
+    // ========== BUILD FILTER CONDITIONS ==========
+    
+    // Build booking filter for ALLOCATED status
+    const bookingFilter = {
+      status: 'ALLOCATED',
+      bookingType: 'SUBDEALER' // Explicitly filter for subdealer bookings
+    };
+
+    // Apply subdealer filter - REMOVED THE ACCESS CHECK
+    if (subdealerId && subdealerId !== 'all') {
+      // Simply set the filter without checking access
+      bookingFilter.subdealer = new mongoose.Types.ObjectId(subdealerId);
+      console.log(`📋 Filtering by subdealer ID: ${subdealerId}`);
+    } else if (subdealerId === 'all' || !subdealerId) {
+      // If 'all' selected or no filter, show all subdealers
+      // No need to restrict to accessible ones
+      console.log('📋 Showing all subdealers (no restriction)');
+    }
+
+    // Apply additional filters
+    if (bookingType) bookingFilter.bookingType = bookingType;
+    if (customerType) bookingFilter.customerType = customerType;
+
+    console.log('Subdealer Booking Filter:', JSON.stringify(bookingFilter, null, 2));
+
+    // ========== FETCH BOOKINGS WITH ALLOCATED STATUS ==========
+    // Get all bookings with ALLOCATED status and populate all required fields
+    let bookingsQuery = Booking.find(bookingFilter)
+      .populate('model', 'model_name type')
+      .populate('color', 'name')
+      .populate({
+        path: 'subdealer',
+        select: 'name type branch rateOfInterest creditPeriodDays discount',
+        populate: {
+          path: 'branch',
+          select: 'name'
+        }
+      })
+      .populate('subdealerUser', 'name email mobile')
+      .populate('createdBy', 'name email')
+      .populate('verticleDetails', 'name')
+      .populate({
+        path: 'priceComponents.header',
+        select: 'header_key category_key priority'
+      })
+      .populate({
+        path: 'ledgerEntries',
+        select: 'amount paymentMode type date approvalStatus isDebit',
+        match: { approvalStatus: 'Approved' }
+      })
+      .populate('financeDisbursements', 'disbursementReference disbursementAmount receivedAmount status disbursementDate')
+      .populate('payment.financer', 'name')
+      .populate({
+        path: 'vehicle',
+        select: 'chassisNumber engineNumber batteryNumber keyNumber motorNumber chargerNumber allocationHistory',
+        model: 'Vehicle'
+      });
+
+    // Apply model type filter if provided (EV/ICE)
+    if (modelType) {
+      const models = await mongoose.model('Model').find({ 
+        type: modelType.toUpperCase() 
+      }).select('_id').lean();
+      
+      const modelIds = models.map(model => model._id);
+      
+      if (modelIds.length > 0) {
+        bookingsQuery = bookingsQuery.where('model').in(modelIds);
+        console.log(`📋 Applying modelType filter: ${modelType} (${modelIds.length} models)`);
+      } else {
+        // No models of this type found, return empty result
+        console.log(`⚠️ No models found for type: ${modelType}`);
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Subdealer Sales Report');
+          const headers = getSubdealerSalesHeaders([]);
+          worksheet.columns = headers.map((header, index) => ({
+            header: header,
+            key: `col_${index}`,
+            width: getSubdealerColumnWidth(header)
+          }));
+          
+          const fileName = `subdealer_sales_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            data: [],
+            availableSubdealers: availableSubdealers,
+            userAccessInfo: {
+              hasAllSubdealersAccess: hasAllSubdealersAccess,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0
+            },
+            filters: {
+              startDate: start,
+              endDate: end,
+              subdealerId: subdealerId,
+              status: 'ALLOCATED',
+              bookingType: bookingType,
+              customerType: customerType,
+              modelType: modelType
+            }
+          });
+        }
+      }
+    }
+
+    // Execute the query to get all ALLOCATED bookings
+    let bookings = await bookingsQuery.lean();
+
+    console.log(`📊 Found ${bookings.length} subdealer bookings with ALLOCATED status before date filtering`);
+
+    // ========== FILTER BY ALLOCATION DATE USING VEHICLE ALLOCATION HISTORY ==========
+    const filteredBookings = [];
+    
+    for (const booking of bookings) {
+      let allocationDate = null;
+      let allocationStatus = null;
+      
+      // Check vehicle allocation history
+      if (booking.vehicle && booking.vehicle.allocationHistory && booking.vehicle.allocationHistory.length > 0) {
+        // Find allocation entries for this booking with ALLOCATED status
+        const allocationEntries = booking.vehicle.allocationHistory.filter(
+          history => history.bookingId && 
+                    history.bookingId.toString() === booking._id.toString() &&
+                    history.status === 'ALLOCATED'
+        );
+        
+        if (allocationEntries.length > 0) {
+          // Sort by date (most recent first)
+          allocationEntries.sort((a, b) => new Date(b.allocatedAt) - new Date(a.allocatedAt));
+          const latestAllocation = allocationEntries[0];
+          
+          allocationDate = latestAllocation.allocatedAt;
+          allocationStatus = latestAllocation.status;
+        }
+      }
+      
+      // If allocation date found, check if it's within the requested date range
+      if (allocationDate) {
+        const allocDate = new Date(allocationDate);
+        
+        // Check if within range
+        const isAfterStart = allocDate >= start;
+        const isBeforeEnd = allocDate <= end;
+        
+        if (isAfterStart && isBeforeEnd) {
+          // Add allocation info to booking
+          booking.allocationDate = allocationDate;
+          booking.allocationStatus = allocationStatus;
+          filteredBookings.push(booking);
+        }
+      } else {
+        // Fallback for bookings with no allocation history
+        console.log(`⚠️ Booking ${booking.bookingNumber} has ALLOCATED status but no allocation history entry found`);
+        
+        // Use approvedAt or updatedAt as fallback
+        const fallbackDate = booking.approvedAt || booking.updatedAt || booking.createdAt;
+        if (fallbackDate) {
+          const fallbackDateObj = new Date(fallbackDate);
+          const isAfterStart = fallbackDateObj >= start;
+          const isBeforeEnd = fallbackDateObj <= end;
+          
+          if (isAfterStart && isBeforeEnd) {
+            booking.allocationDate = fallbackDate;
+            booking.allocationStatus = 'ALLOCATED';
+            filteredBookings.push(booking);
+          }
+        }
+      }
+    }
+
+    console.log(`📊 After allocation date filtering, ${filteredBookings.length} subdealer records with ALLOCATED status in date range`);
+
+    if (filteredBookings.length === 0) {
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Subdealer Sales Report');
+        const headers = getSubdealerSalesHeaders([]);
+        worksheet.columns = headers.map((header, index) => ({
+          header: header,
+          key: `col_${index}`,
+          width: getSubdealerColumnWidth(header)
+        }));
+        
+        const fileName = `subdealer_sales_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        
+        await workbook.xlsx.write(res);
+        res.end();
+        return;
+      } else {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          availableSubdealers: availableSubdealers,
+          userAccessInfo: {
+            hasAllSubdealersAccess: hasAllSubdealersAccess,
+            userBranch: user.branch ? {
+              _id: user.branch._id,
+              name: user.branch.name
+            } : null,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0
+          },
+          filters: {
+            startDate: start,
+            endDate: end,
+            subdealerId: subdealerId,
+            status: 'ALLOCATED',
+            bookingType: bookingType,
+            customerType: customerType,
+            modelType: modelType
+          }
+        });
+      }
+    }
+
+    // ========== GET DYNAMIC PRICE HEADERS ==========
+    // Extract all unique price headers from the filtered bookings
+    const headerMap = new Map();
+    
+    filteredBookings.forEach(booking => {
+      if (booking.priceComponents && booking.priceComponents.length > 0) {
+        const sortedComponents = [...booking.priceComponents].sort((a, b) => {
+          const priorityA = a.header?.priority || 999;
+          const priorityB = b.header?.priority || 999;
+          return priorityA - priorityB;
+        });
+
+        sortedComponents.forEach(pc => {
+          if (pc.header && pc.header.header_key && !headerMap.has(pc.header.header_key)) {
+            headerMap.set(pc.header.header_key, {
+              header_key: pc.header.header_key,
+              priority: pc.header.priority || 999,
+              index: headerMap.size
+            });
+          }
+        });
+      }
+    });
+
+    const priceHeaders = Array.from(headerMap.values())
+      .sort((a, b) => a.priority - b.priority);
+
+    console.log(`Found ${priceHeaders.length} dynamic price headers for subdealer bookings`);
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      // Create worksheet name based on subdealer selection
+      let worksheetName = 'Subdealer Sales Report';
+      if (subdealerId && subdealerId !== 'all' && filteredBookings.length > 0) {
+        const subdealer = filteredBookings[0]?.subdealer?.name;
+        if (subdealer) {
+          worksheetName = `${subdealer} Sales Report`;
+        }
+      } else if (hasAllSubdealersAccess && (!subdealerId || subdealerId === 'all')) {
+        worksheetName = 'All Subdealers Sales Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName.substring(0, 31), { // Excel sheet name max 31 chars
+        properties: { defaultRowHeight: 20 },
+        pageSetup: { paperSize: 9, orientation: 'landscape' }
+      });
+
+      // Get complete headers list
+      const headers = getSubdealerSalesHeaders(priceHeaders);
+
+      // Set worksheet columns with proper widths
+      const columns = headers.map((header, index) => ({
+        header: header,
+        key: `col_${index}`,
+        width: getSubdealerColumnWidth(header),
+        style: {
+          alignment: { vertical: 'middle', horizontal: getSubdealerAlignment(header) },
+          font: { size: 10 }
+        }
+      }));
+
+      worksheet.columns = columns;
+
+      // Style header row
+      const headerRow = worksheet.getRow(1);
+      headerRow.height = 30;
+      headerRow.eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11,
+          name: 'Arial'
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Add data rows for each booking
+      filteredBookings.forEach((booking) => {
+        const rowData = {};
+        let colIndex = 0;
+        
+        // Booking Number
+        rowData[`col_${colIndex++}`] = booking.bookingNumber || '';
+        
+        // Booking Date
+        rowData[`col_${colIndex++}`] = booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '';
+        
+        // Allocation Date
+        rowData[`col_${colIndex++}`] = booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '';
+        
+        // Subdealer Name
+        rowData[`col_${colIndex++}`] = booking.subdealer?.name || '';
+        
+        // Subdealer Type (B2B/B2C)
+        rowData[`col_${colIndex++}`] = booking.subdealer?.type || '';
+        
+        // Subdealer User
+        rowData[`col_${colIndex++}`] = booking.subdealerUser?.name || '';
+        
+        // Parent Branch
+        rowData[`col_${colIndex++}`] = booking.subdealer?.branch?.name || '';
+        
+        // Model
+        rowData[`col_${colIndex++}`] = booking.model?.model_name || '';
+        
+        // Verticle
+        let verticleNames = '';
+        if (booking.verticleDetails && booking.verticleDetails.length > 0) {
+          verticleNames = booking.verticleDetails
+            .map(v => v.name || '')
+            .filter(name => name !== '')
+            .join(', ');
+        }
+        rowData[`col_${colIndex++}`] = verticleNames;
+        
+        // Model Type (EV/ICE)
+        rowData[`col_${colIndex++}`] = booking.model?.type || '';
+        
+        // Color
+        rowData[`col_${colIndex++}`] = booking.color?.name || '';
+        
+        // Chassis Number
+        rowData[`col_${colIndex++}`] = booking.chassisNumber || (booking.vehicle?.chassisNumber || '');
+        
+        // Engine Number
+        rowData[`col_${colIndex++}`] = booking.vehicle?.engineNumber || booking.engineNumber || '';
+        
+        // Customer Name
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.name || '';
+        
+        // Mobile1
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.mobile1 || '';
+        
+        // Mobile2
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.mobile2 || '';
+        
+        // Address
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.address || '';
+        
+        // Pincode
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.pincode || '';
+        
+        // Aadhar number
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.aadharNumber || '';
+        
+        // Pan no
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.panNo || '';
+        
+        // Birthday
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '';
+        
+        // Nominee Name
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeName || '';
+        
+        // Nominee Relation
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeRelation || '';
+        
+        // Nominee Age
+        rowData[`col_${colIndex++}`] = booking.customerDetails?.nomineeAge || '';
+        
+        // Booking Type (CASH/FINANCE)
+        rowData[`col_${colIndex++}`] = booking.payment?.type || '';
+        
+        // Financier Name
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = booking.payment.financer.name || '';
+        }
+        rowData[`col_${colIndex++}`] = financierName;
+        
+        // Customer Type
+        rowData[`col_${colIndex++}`] = booking.customerType || '';
+        
+        // GST NUMBER COLUMN REMOVED - no longer included
+
+        // Create price component map for dynamic headers
+        const priceComponentMap = new Map();
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          booking.priceComponents.forEach(pc => {
+            if (pc.header && pc.header.header_key) {
+              priceComponentMap.set(pc.header.header_key, pc.discountedValue || 0);
+            }
+          });
+        }
+
+        // Add dynamic price headers
+        priceHeaders.forEach(ph => {
+          rowData[`col_${colIndex++}`] = priceComponentMap.get(ph.header_key) || 0;
+        });
+
+        // Subdealer Specific Fields
+        rowData[`col_${colIndex++}`] = booking.subdealer?.rateOfInterest || '';
+        rowData[`col_${colIndex++}`] = booking.subdealer?.creditPeriodDays || '';
+        rowData[`col_${colIndex++}`] = booking.subdealer?.discount || '';
+        
+        // Calculate totals
+        const totalAmount = booking.totalAmount || 0;
+        const discountedAmount = booking.discountedAmount || 0;
+        const totalDiscountGiven = totalAmount - discountedAmount;
+        
+        // ACCESSORIES REMOVED - no longer collecting or displaying accessories
+        
+        // Total Amount
+        rowData[`col_${colIndex++}`] = totalAmount;
+        
+        // Total Discount Given
+        rowData[`col_${colIndex++}`] = totalDiscountGiven;
+        
+        // Final Deal Amount
+        rowData[`col_${colIndex++}`] = discountedAmount;
+        
+        // ACCESSORIES COLUMN REMOVED - no longer added to rowData
+
+        worksheet.addRow(rowData);
+      });
+
+      // Style data rows
+      for (let i = 2; i <= worksheet.rowCount; i++) {
+        const row = worksheet.getRow(i);
+        row.height = 20;
+        
+        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+          const header = headers[colNumber - 1];
+          
+          // Set alignment based on content type
+          if (header.includes('Amount') || header.includes('Price') || 
+              header.includes('Discount') || header.includes('Charges') ||
+              header.includes('Rate') || header.includes('Period') ||
+              header === 'Total Amount' || header === 'Final Deal Amount') {
+            cell.alignment = { horizontal: 'right', vertical: 'middle' };
+            if (typeof cell.value === 'number' && cell.value !== 0) {
+              cell.numFmt = '#,##0.00';
+            }
+          } else if (header === 'Booking Number' || header === 'Chassis Number' || 
+                    header === 'Engine Number' || header === 'Aadhar number' || 
+                    header === 'Pan no' || header === 'Mobile1' || header === 'Mobile2' ||
+                    header === 'Pincode' || header === 'Nominee Age') {
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          } else {
+            cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+          }
+          
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+      }
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      // Set response headers for file download
+      const fileName = `subdealer_sales_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      
+      // Write workbook to response
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedBookings = filteredBookings.map(booking => {
+        const totalAmount = booking.totalAmount || 0;
+        const discountedAmount = booking.discountedAmount || 0;
+        const totalDiscountGiven = totalAmount - discountedAmount;
+
+        // Price components
+        const priceComponentsObj = {};
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          booking.priceComponents.forEach(pc => {
+            if (pc.header && pc.header.header_key) {
+              priceComponentsObj[pc.header.header_key] = pc.discountedValue || 0;
+            }
+          });
+        }
+
+        // ACCESSORIES REMOVED - no longer collecting accessories
+
+        // Financier
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = booking.payment.financer.name || '';
+        }
+
+        // Verticle
+        let verticleNames = [];
+        if (booking.verticleDetails && booking.verticleDetails.length > 0) {
+          verticleNames = booking.verticleDetails.map(v => v.name || '');
+        }
+
+        return {
+          bookingNumber: booking.bookingNumber,
+          bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+          allocationDate: booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '',
+          subdealerName: booking.subdealer?.name,
+          subdealerId: booking.subdealer?._id,
+          subdealerType: booking.subdealer?.type,
+          subdealerUser: booking.subdealerUser?.name,
+          parentBranch: booking.subdealer?.branch?.name,
+          model: booking.model?.model_name,
+          verticle: verticleNames.join(', '),
+          modelType: booking.model?.type,
+          color: booking.color?.name,
+          chassisNumber: booking.chassisNumber,
+          engineNumber: booking.vehicle?.engineNumber || booking.engineNumber || '',
+          customerName: booking.customerDetails?.name,
+          mobile1: booking.customerDetails?.mobile1,
+          mobile2: booking.customerDetails?.mobile2,
+          address: booking.customerDetails?.address,
+          pincode: booking.customerDetails?.pincode || '',
+          aadharNumber: booking.customerDetails?.aadharNumber,
+          panNo: booking.customerDetails?.panNo,
+          birthday: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+          nomineeName: booking.customerDetails?.nomineeName,
+          nomineeRelation: booking.customerDetails?.nomineeRelation,
+          nomineeAge: booking.customerDetails?.nomineeAge,
+          bookingType: booking.payment?.type,
+          financierName: financierName,
+          customerType: booking.customerType,
+          // GST NUMBER REMOVED from JSON response
+          priceComponents: priceComponentsObj,
+          subdealerDetails: {
+            rateOfInterest: booking.subdealer?.rateOfInterest,
+            creditPeriodDays: booking.subdealer?.creditPeriodDays,
+            discount: booking.subdealer?.discount
+          },
+          totalAmount: totalAmount,
+          totalDiscountGiven: totalDiscountGiven,
+          finalAmount: discountedAmount
+          // ACCESSORIES REMOVED from JSON response
+        };
+      });
+
+      // Calculate overall totals
+      const overallTotals = formattedBookings.reduce((acc, booking) => {
+        acc.totalAmount += booking.totalAmount || 0;
+        acc.totalDiscount += booking.totalDiscountGiven || 0;
+        acc.finalAmount += booking.finalAmount || 0;
+        return acc;
+      }, { totalAmount: 0, totalDiscount: 0, finalAmount: 0 });
+
+      res.status(200).json({
+        success: true,
+        count: formattedBookings.length,
+        totals: overallTotals,
+        data: formattedBookings,
+        priceHeaders: priceHeaders.map(ph => ph.header_key),
+        availableSubdealers: availableSubdealers,
+        userAccessInfo: {
+          hasAllSubdealersAccess: hasAllSubdealersAccess,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        },
+        filters: {
+          startDate: start,
+          endDate: end,
+          subdealerId: subdealerId,
+          status: 'ALLOCATED',
+          bookingType: bookingType,
+          customerType: customerType,
+          modelType: modelType
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating subdealer sales report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating subdealer sales report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+// ========== HELPER FUNCTIONS FOR SUBDEALER REPORT ==========
+
+/**
+ * Get headers for subdealer sales report (EXCLUDING exchange, GST, and accessories columns)
+ */
+function getSubdealerSalesHeaders(priceHeaders = []) {
+  const baseHeaders = [
+    'Booking Number',
+    'Booking Date',
+    'Allocation Date',
+    'Subdealer Name',
+    'Subdealer Type',
+    'Subdealer User',
+    'Parent Branch',
+    'Model',
+    'Verticle',
+    'Model Type',
+    'Color',
+    'Chassis Number',
+    'Engine Number',
+    'Customer Name',
+    'Mobile1',
+    'Mobile2',
+    'Address',
+    'Pincode',
+    'Aadhar number',
+    'Pan no',
+    'Birthday',
+    'Nominee Name',
+    'Nominee Relation',
+    'Nominee Age',
+    'Booking Type',
+    'Financier Name',
+    'Customer Type'
+    // GST NUMBER REMOVED - 'GST Number' is gone
+    // EXCHANGE COLUMNS REMOVED - 'Exchange Vehicle', 'Exchange Vehicle Number', 
+    // 'Exchange Chassis Number', 'Exchange Broker', 'Exchange Price' are gone
+  ];
+
+  // Add dynamic price headers
+  const dynamicHeaders = priceHeaders.map(ph => ph.header_key);
+
+  // Add subdealer specific headers and totals (Accessories removed)
+  const subdealerSpecificHeaders = [
+    'Rate of Interest (%)',
+    'Credit Period (Days)',
+    'Subdealer Discount (%)',
+    'Total Amount',
+    'Total Discount Given',
+    'Final Deal Amount'
+    // ACCESSORIES REMOVED - 'Accessories' column is gone
+  ];
+
+  return [...baseHeaders, ...dynamicHeaders, ...subdealerSpecificHeaders];
+}
+
+/**
+ * Get column width based on header content for subdealer report
+ */
+function getSubdealerColumnWidth(header) {
+  const widthMap = {
+    'Booking Number': 18,
+    'Booking Date': 15,
+    'Allocation Date': 15,
+    'Subdealer Name': 25,
+    'Subdealer Type': 15,
+    'Subdealer User': 20,
+    'Parent Branch': 20,
+    'Model': 20,
+    'Verticle': 20,
+    'Model Type': 12,
+    'Color': 15,
+    'Chassis Number': 20,
+    'Engine Number': 20,
+    'Customer Name': 25,
+    'Mobile1': 15,
+    'Mobile2': 15,
+    'Address': 30,
+    'Pincode': 10,
+    'Aadhar number': 16,
+    'Pan no': 12,
+    'Birthday': 12,
+    'Nominee Name': 20,
+    'Nominee Relation': 15,
+    'Nominee Age': 12,
+    'Booking Type': 12,
+    'Financier Name': 20,
+    'Customer Type': 12,
+    // GST NUMBER REMOVED from widthMap
+    'Rate of Interest (%)': 15,
+    'Credit Period (Days)': 15,
+    'Subdealer Discount (%)': 18,
+    'Total Amount': 15,
+    'Total Discount Given': 18,
+    'Final Deal Amount': 15
+    // ACCESSORIES REMOVED from widthMap
+  };
+
+  // Default width for dynamic headers
+  if (widthMap[header]) {
+    return widthMap[header];
+  } else if (header.includes('CHARGES') || header.includes('PRICE') || header.includes('AMOUNT')) {
+    return 15; // Financial headers
+  } else {
+    return 20; // Default for dynamic headers
+  }
+}
+
+/**
+ * Get alignment based on header content for subdealer report
+ */
+function getSubdealerAlignment(header) {
+  const rightAlignedHeaders = [
+    'Amount', 'Price', 'Discount', 'Charges', 'Rate', 'Period',
+    'Total Amount', 'Final Deal Amount'
+  ];
+  
+  const centerAlignedHeaders = [
+    'Booking Number', 'Chassis Number', 'Engine Number', 'Aadhar number',
+    'Pan no', 'Mobile1', 'Mobile2', 'Pincode', 'Nominee Age'
+  ];
+
+  if (rightAlignedHeaders.some(h => header.includes(h))) {
+    return 'right';
+  } else if (centerAlignedHeaders.includes(header)) {
+    return 'center';
+  } else {
+    return 'left';
+  }
+}
+/**
+ * Get sales headers with dynamic price headers
+ */
+function getSalesHeaders(priceHeaders) {
+  const baseHeaders = [
+    'Booking Number',
+    'Booking Date',
+    'Allocation Date',
+    'Branch Name',
+    'Sales Executive',
+    'Model',
+    'Verticle',
+    'Model Type',
+    'Color',
+    'Chassis Number',
+    'Engine Number',
+    'Customer Name',
+    'Mobile1',
+    'Mobile2',
+    'Address',
+    'Pincode',
+    'Aadhar number',
+    'Pan no',
+    'Birthday',
+    'Nominee Name',
+    'Nominee Relation',
+    'Nominee Age',
+    'Booking Type',
+    'Financier Name',
+    'Customer Type',
+    'GST Number',
+    'Exchange Vehicle',
+    'Exchange Vehicle Number',
+    'Exchange Chassis Number',
+    'Exchange Broker',
+    'Exchange Price'
+  ];
+
+  // Add dynamic price headers
+  const priceHeaderKeys = priceHeaders.map(ph => ph.header_key);
+  
+  // Add totals
+  const totalHeaders = [
+    'Total Amount',
+    'Total Discount Given',
+    'Final Deal Amount',
+    'Accessories'
+  ];
+
+  return [...baseHeaders, ...priceHeaderKeys, ...totalHeaders];
+}
+
+/**
+ * Get column width based on header
+ */
+function getColumnWidth(header) {
+  const widths = {
+    'Booking Number': 18,
+    'Booking Date': 12,
+    'Allocation Date': 12,
+    'Branch Name': 25,
+    'Sales Executive': 25,
+    'Model': 20,
+    'Verticle': 20,
+    'Model Type': 12,
+    'Color': 15,
+    'Chassis Number': 20,
+    'Engine Number': 20,
+    'Customer Name': 25,
+    'Mobile1': 15,
+    'Mobile2': 15,
+    'Address': 40,
+    'Pincode': 12,
+    'Aadhar number': 20,
+    'Pan no': 20,
+    'Birthday': 12,
+    'Nominee Name': 25,
+    'Nominee Relation': 20,
+    'Nominee Age': 15,
+    'Booking Type': 15,
+    'Financier Name': 25,
+    'Customer Type': 15,
+    'GST Number': 25,
+    'Exchange Vehicle': 15,
+    'Exchange Vehicle Number': 20,
+    'Exchange Chassis Number': 20,
+    'Exchange Broker': 25,
+    'Exchange Price': 15,
+    'Total Amount': 15,
+    'Total Discount Given': 18,
+    'Final Deal Amount': 18,
+    'Accessories': 40
+  };
+  
+  // For dynamic price headers, return standard width
+  return widths[header] || 18;
+}
+
+/**
+ * Get alignment based on header
+ */
+function getAlignment(header) {
+  if (header.includes('Amount') || header.includes('Price') || 
+      header.includes('Discount') || header.includes('Charges') ||
+      header === 'Total Amount' || header === 'Final Deal Amount' ||
+      header === 'Exchange Price') {
+    return 'right';
+  }
+  if (header === 'Booking Number' || header === 'Chassis Number' || 
+      header === 'Engine Number' || header === 'Aadhar number' || 
+      header === 'Pan no' || header === 'Mobile1' || header === 'Mobile2' ||
+      header === 'Pincode' || header === 'Nominee Age') {
+    return 'center';
+  }
+  return 'left';
+}
+
+/**
+ * Get sales headers with dynamic price headers
+ */
+
+
+/**
+ * Generate booking report with filtering options - MATCHING SALES REPORT COLUMNS
+ * @route GET /api/v1/reports/bookings
+ * @access Private
+ */
+exports.generateBookingReport = async (req, res) => {
+  try {
+    const { 
+      branchId, 
+      startDate, 
+      endDate, 
+      status, 
+      bookingType,
+      customerType,
+      modelType, // ADDED: Model type filter (EV/ICE)
+      format = 'excel' 
+    } = req.query;
+
+    // Build filter conditions
+    const filter = {};
+
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data (same as getMe)
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+    // Check user roles and permissions from user object
+    const userRoles = user.roles || [];
+    
+    // Check if user is SUPERADMIN
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    // Check if user has superadmin flag
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    // Get branch access from user
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    // Check if user has all branches access
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      // User can see all active branches
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      // User can see only assigned branches
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      // User can see only their own branch
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // ========== APPLY BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        // User has access to specific assigned branches
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        console.log(`User has access to ${accessibleBranchIds.length} assigned branches`);
+        
+        // If branchId is provided in query, check if it's in accessible branches
+        if (branchId) {
+          if (branchId === 'all') {
+            // User selected "All" - show all accessible branches
+            filter.branch = { $in: accessibleBranchIds };
+            console.log('✅ Showing all accessible branches');
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this branch'
+              });
+            }
+            filter.branch = requestedBranchId;
+            console.log(`✅ Filtering by branch: ${branchId}`);
+          }
+        } else {
+          // If no branchId specified, show all accessible branches
+          filter.branch = { $in: accessibleBranchIds };
+          console.log('✅ Showing all accessible branches (no branch filter)');
+        }
+      } else {
+        // User has only OWN branch access
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          filter.branch = user.branch._id;
+          console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
+        }
+      }
+    } else {
+      // User has all branches permission
+      if (branchId) {
+        if (branchId === 'all') {
+          // Show all branches (no filter)
+          console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+        } else {
+          filter.branch = new mongoose.Types.ObjectId(branchId);
+          console.log(`✅ Filtering by branch: ${branchId}`);
+        }
+      } else {
+        // If no branchId specified, show all branches
+        console.log('✅ Showing ALL branches (no branch filter)');
+      }
+    }
+
+    // ========== OTHER FILTERS ==========
+    // Date range filter
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.createdAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    // Additional filters
+    if (status) filter.status = status;
+    if (bookingType) filter.bookingType = bookingType;
+    if (customerType) filter.customerType = customerType;
+
+    // ========== IMPORTANT: EXCLUDE ALLOCATED BOOKINGS ==========
+    // Filter out bookings with chassisAllocationStatus = 'ALLOCATED'
+    filter.chassisAllocationStatus = { $ne: 'ALLOCATED' };
+    console.log('✅ Excluding allocated bookings (chassisAllocationStatus != ALLOCATED)');
+
+    console.log('Generated filter:', JSON.stringify(filter, null, 2));
+    
+    // ========== FETCH BOOKINGS ==========
+    // First, get the booking query
+    const bookingsQuery = Booking.find(filter)
+      .populate('model', 'model_name type') // Added 'type' field
+      .populate('color', 'name')
+      .populate('branch', 'name address city')
+      .populate('salesExecutive', 'name email mobile')
+      .populate('createdBy', 'name email')
+      .populate('verticleDetails', 'name')
+      .populate({
+        path: 'priceComponents.header',
+        select: 'header_key category_key priority'
+      })
+      .populate({
+        path: 'ledgerEntries',
+        select: 'amount paymentMode type date approvalStatus isDebit',
+        match: { approvalStatus: 'Approved' }
+      })
+      .populate('financeDisbursements', 'disbursementReference disbursementAmount receivedAmount status disbursementDate')
+      .populate('exchangeDetails.broker', 'name mobile')
+      .populate('payment.financer', 'name')
+      .populate({
+        path: 'accessories.accessory',
+        select: 'name code category description',
+        model: 'Accessory'
+      })
+      .populate({
+        path: 'vehicle',
+        select: 'chassisNumber engineNumber batteryNumber keyNumber motorNumber chargerNumber',
+        model: 'Vehicle'
+      })
+      .sort({ createdAt: -1 });
+
+    // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+    if (modelType) {
+      console.log(`Applying model type filter: ${modelType}`);
+      
+      // Get all model IDs of the specified type
+      const models = await mongoose.model('Model').find({ 
+        type: modelType.toUpperCase() // Assuming 'EV' or 'ICE'
+      }).select('_id').lean();
+      
+      const modelIds = models.map(model => model._id);
+      
+      if (modelIds.length > 0) {
+        // Add model filter to the query
+        bookingsQuery.where('model').in(modelIds);
+        console.log(`Filtering by ${modelIds.length} ${modelType} models`);
+      } else {
+        // No models of this type found, return empty result
+        console.log(`No ${modelType} models found`);
+        if (format === 'excel') {
+          // For Excel format, return empty workbook
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Booking Report');
+          
+          // Set response headers
+          const fileName = `booking_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+          res.setHeader(
+            'Content-Type',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          );
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${fileName}"`
+          );
+          
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          // For JSON format
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            totals: { 
+              totalAmount: 0, 
+              totalDiscount: 0, 
+              finalAmount: 0
+            },
+            data: [],
+            availableBranches: availableBranches,
+            userAccessInfo: {
+              hasAllBranchesAccess: hasAllBranchesAccess,
+              branchAccess: branchAccess,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null
+            },
+            filters: {
+              chassisAllocated: false,
+              dateRange: filter.createdAt ? {
+                start: filter.createdAt.$gte ? filter.createdAt.$gte.toISOString() : undefined,
+                end: filter.createdAt.$lte ? filter.createdAt.$lte.toISOString() : undefined
+              } : undefined,
+              branchId: branchId,
+              status: status,
+              bookingType: bookingType,
+              customerType: customerType,
+              modelType: modelType // ADDED: Include modelType in response
+            }
+          });
+        }
+      }
+    }
+    
+    // Execute the query
+    const bookings = await bookingsQuery.lean();
+
+    console.log(`Found ${bookings.length} bookings (excluding allocated)`);
+
+    if (bookings.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No bookings found for the specified criteria',
+        // Still return available branches for dropdown
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        }
+      });
+    }
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      // Create worksheet name
+      let worksheetName = 'Booking Report';
+      if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+        const branch = bookings[0]?.branch;
+        if (branch?.name) {
+          worksheetName = `${branch.name} Booking Report`;
+        }
+      } else if (hasAllBranchesAccess && !branchId) {
+        worksheetName = 'All Branches Booking Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      // Define headers - UPDATED:
+      // 1. REMOVED: 'Chassis Number', 'Engine Number', 'Exchange Broker Mobile'
+      // 2. ADDED: 'Pincode' after Address
+      const headers = [
+        'Booking Number',
+        'Booking Date', // Will show only date (no time)
+        'Branch Name',
+        'Sales Executive',
+        'Model',
+        'Model Type', // Model type column
+        'Color',
+        // REMOVED: 'Chassis Number', 'Engine Number'
+        'Customer Name',
+        'Mobile1',
+        'Mobile2',
+        'Address',
+        'Pincode', // ADDED: Customer Pincode
+        'Aadhar number',
+        'Pan no',
+        'Birthday',
+        'Nominee Name',
+        'Nominee Relation',
+        'Nominee Age',
+        'Booking Type',
+        'Financier Name',
+        'Customer Type',
+        'GST Number',
+        // Exchange Details Headers - REMOVED 'Exchange Broker Mobile'
+        'Exchange Vehicle',
+        'Exchange Vehicle Number',
+        'Exchange Chassis Number',
+        'Exchange Broker',
+        'Exchange Price' // REMOVED: 'Exchange Broker Mobile'
+      ];
+
+      // Get price component headers
+      const headerMap = new Map();
+      
+      bookings.forEach(booking => {
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          const sortedComponents = [...booking.priceComponents].sort((a, b) => {
+            const priorityA = a.header?.priority || 999;
+            const priorityB = b.header?.priority || 999;
+            return priorityA - priorityB;
+          });
+
+          sortedComponents.forEach(pc => {
+            if (pc.header && pc.header.header_key && !headerMap.has(pc.header.header_key)) {
+              headerMap.set(pc.header.header_key, {
+                header_key: pc.header.header_key,
+                priority: pc.header.priority || 999,
+                index: headerMap.size
+              });
+            }
+          });
+        }
+      });
+
+      const priceHeaders = Array.from(headerMap.values())
+        .sort((a, b) => a.priority - b.priority);
+
+      priceHeaders.forEach(header => {
+        headers.push(header.header_key);
+      });
+
+      // Add the discount and amount headers
+      headers.push('Total Amount');
+      headers.push('Total Discount Given');
+      headers.push('Final Deal Amount');
+      headers.push('Accessories'); // SHOWING NAMES, NOT AMOUNT
+
+      // Set worksheet columns - UPDATED for removed/added columns
+      const columns = headers.map((header, index) => {
+        let width = 20;
+        
+        if (header === 'Booking Number') width = 18;
+        else if (header === 'Booking Date') width = 12; // Reduced width for date only
+        else if (header === 'Branch Name') width = 25;
+        else if (header === 'Sales Executive') width = 25;
+        else if (header === 'Customer Name') width = 25;
+        else if (header === 'Address') width = 40;
+        else if (header === 'Pincode') width = 12; // ADDED: Pincode column width
+        else if (header === 'Aadhar number') width = 20;
+        else if (header === 'Pan no') width = 20;
+        else if (header === 'Model') width = 20;
+        else if (header === 'Model Type') width = 12;
+        else if (header === 'Color') width = 15;
+        else if (header === 'Mobile1' || header === 'Mobile2') width = 15;
+        else if (header === 'Birthday') width = 12;
+        else if (header === 'Customer Type') width = 15;
+        else if (header === 'Booking Type') width = 15;
+        else if (header === 'Financier Name') width = 25;
+        else if (header === 'GST Number') width = 25;
+        else if (header === 'Nominee Name') width = 25;
+        else if (header === 'Nominee Relation') width = 20;
+        else if (header === 'Nominee Age') width = 15;
+        // Exchange details columns
+        else if (header === 'Exchange Vehicle') width = 20;
+        else if (header === 'Exchange Vehicle Number') width = 25;
+        else if (header === 'Exchange Chassis Number') width = 25;
+        else if (header === 'Exchange Broker') width = 25;
+        else if (header === 'Exchange Price') width = 15;
+        // Amount columns
+        else if (header.includes('Amount') || header.includes('Discount') || header.includes('Price')) {
+          width = 18;
+        } else if (priceHeaders.some(ph => ph.header_key === header)) {
+          width = 15;
+        } else if (header === 'Accessories') {
+          width = 40; // Wider column for accessory names
+        }
+
+        return {
+          header: header,
+          key: `col_${index}`,
+          width: width,
+          style: header.includes('Amount') || header.includes('Discount') || header.includes('Price') ? 
+                 { numFmt: '#,##0.00' } : {}
+        };
+      });
+
+      worksheet.columns = columns;
+
+      // Add data rows - UPDATED column indices
+      bookings.forEach((booking) => {
+        const rowData = {};
+        
+        // Basic booking information
+        rowData['col_0'] = booking.bookingNumber || '';
+        
+        // Booking Date - SHOW ONLY DATE (no time)
+        rowData['col_1'] = booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '';
+        
+        rowData['col_2'] = booking.branch?.name || '';
+        rowData['col_3'] = booking.salesExecutive?.name || '';
+        rowData['col_4'] = booking.model?.model_name || '';
+        rowData['col_5'] = booking.model?.type || ''; // Model type
+        rowData['col_6'] = booking.color?.name || '';
+        
+        // REMOVED: Chassis Number and Engine Number columns
+        
+        // Customer details - UPDATED indices
+        rowData['col_7'] = booking.customerDetails?.name || '';
+        rowData['col_8'] = booking.customerDetails?.mobile1 || '';
+        rowData['col_9'] = booking.customerDetails?.mobile2 || '';
+        rowData['col_10'] = booking.customerDetails?.address || '';
+        
+        // NEW: Pincode
+        rowData['col_11'] = booking.customerDetails?.pincode || '';
+        
+        rowData['col_12'] = booking.customerDetails?.aadharNumber || '';
+        rowData['col_13'] = booking.customerDetails?.panNo || '';
+        
+        // Birthday - SHOW ONLY DATE (no time)
+        rowData['col_14'] = booking.customerDetails?.dob ? 
+          moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '';
+        
+        // Nominee details
+        rowData['col_15'] = booking.customerDetails?.nomineeName || '';
+        rowData['col_16'] = booking.customerDetails?.nomineeRelation || '';
+        rowData['col_17'] = booking.customerDetails?.nomineeAge || '';
+        
+        // Booking Type and Financier
+        rowData['col_18'] = booking.payment?.type || '';
+        
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = booking.payment.financer.name || '';
+        }
+        rowData['col_19'] = financierName;
+        
+        rowData['col_20'] = booking.customerType || '';
+        
+        // GST Number (only for B2B customers)
+        rowData['col_21'] = (booking.customerType === 'B2B') ? (booking.gstin || '') : '';
+
+        // Exchange Details - REMOVED 'Exchange Broker Mobile'
+        rowData['col_22'] = booking.exchange ? 'YES' : 'NO'; // Exchange Vehicle
+        rowData['col_23'] = booking.exchangeDetails?.vehicleNumber || '';
+        rowData['col_24'] = booking.exchangeDetails?.chassisNumber || '';
+        rowData['col_25'] = booking.exchangeDetails?.broker?.name || '';
+        // Note: 'Exchange Broker Mobile' column has been removed
+        rowData['col_26'] = booking.exchangeDetails?.price || 0;
+
+        // Create price component map
+        const priceComponentMap = new Map();
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          const sortedComponents = [...booking.priceComponents].sort((a, b) => {
+            const priorityA = a.header?.priority || 999;
+            const priorityB = b.header?.priority || 999;
+            return priorityA - priorityB;
+          });
+
+          sortedComponents.forEach(pc => {
+            if (pc.header && pc.header.header_key) {
+              priceComponentMap.set(pc.header.header_key, pc.discountedValue || 0);
+            }
+          });
+        }
+
+        // Add price component values (UPDATED column index due to removed/added columns)
+        priceHeaders.forEach((header, priceIndex) => {
+          const columnIndex = 27 + priceIndex; // Updated from 29 to 27 (removed 2 columns, added 1 column)
+          rowData[`col_${columnIndex}`] = priceComponentMap.get(header.header_key) || 0;
+        });
+
+        // Calculate discount amounts
+        const totalAmount = booking.totalAmount || 0;
+        const discountedAmount = booking.discountedAmount || 0;
+        const totalDiscountGiven = totalAmount - discountedAmount;
+        
+        // Get accessories names (comma-separated) instead of amount
+        let accessoriesNames = '';
+        if (Array.isArray(booking.accessories) && booking.accessories.length > 0) {
+          const accessoryNamesArray = booking.accessories
+            .map(acc => {
+              if (acc.accessory && acc.accessory.name) {
+                return acc.accessory.name;
+              }
+              return '';
+            })
+            .filter(name => name !== '');
+          
+          accessoriesNames = accessoryNamesArray.join(', ');
+        }
+        
+        // Add discount and amount columns (UPDATED index due to removed/added columns)
+        const discountStartIndex = 27 + priceHeaders.length; // Updated from 29 to 27
+        rowData[`col_${discountStartIndex}`] = totalAmount;
+        rowData[`col_${discountStartIndex + 1}`] = totalDiscountGiven;
+        rowData[`col_${discountStartIndex + 2}`] = discountedAmount;
+        rowData[`col_${discountStartIndex + 3}`] = accessoriesNames; // Showing names instead of amount
+
+        worksheet.addRow(rowData);
+      });
+
+      // Style the header row
+      worksheet.getRow(1).eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FF000000' } },
+          left: { style: 'thin', color: { argb: 'FF000000' } },
+          bottom: { style: 'thin', color: { argb: 'FF000000' } },
+          right: { style: 'thin', color: { argb: 'FF000000' } }
+        };
+      });
+
+      // Format all rows
+      for (let i = 1; i <= bookings.length; i++) {
+        const row = worksheet.getRow(i + 1);
+        
+        headers.forEach((header, colIndex) => {
+          if (header.includes('Amount') || header.includes('Discount') || 
+              header.includes('Exchange Price') ||
+              priceHeaders.some(ph => ph.header_key === header)) {
+            const cell = row.getCell(colIndex + 1);
+            if (typeof cell.value === 'number') {
+              cell.numFmt = '#,##0.00';
+              cell.alignment = { horizontal: 'right' };
+            }
+          }
+        });
+      }
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [
+        { state: 'frozen', ySplit: 1 }
+      ];
+
+      // Set response headers for file download
+      const fileName = `booking_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      // Write to response
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT WITH DROPDOWN DATA ==========
+      const formattedBookings = bookings.map(booking => {
+        const totalAmount = booking.totalAmount || 0;
+        const discountedAmount = booking.discountedAmount || 0;
+        const totalDiscountGiven = totalAmount - discountedAmount;
+
+        // Organize price components
+        const priceComponentsObj = {};
+        if (booking.priceComponents && booking.priceComponents.length > 0) {
+          const sortedComponents = [...booking.priceComponents].sort((a, b) => {
+            const priorityA = a.header?.priority || 999;
+            const priorityB = b.header?.priority || 999;
+            return priorityA - priorityB;
+          });
+
+          sortedComponents.forEach(pc => {
+            if (pc.header && pc.header.header_key) {
+              priceComponentsObj[pc.header.header_key] = pc.discountedValue || 0;
+            }
+          });
+        }
+
+        // Get accessories names for JSON
+        let accessoriesNames = [];
+        if (Array.isArray(booking.accessories) && booking.accessories.length > 0) {
+          accessoriesNames = booking.accessories
+            .map(acc => acc.accessory?.name || '')
+            .filter(name => name !== '');
+        }
+
+        // Get financier name
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = booking.payment.financer.name || '';
+        }
+
+        // Exchange details - REMOVED 'brokerMobile'
+        const exchangeDetails = booking.exchange ? {
+          hasExchange: true,
+          vehicleNumber: booking.exchangeDetails?.vehicleNumber || '',
+          chassisNumber: booking.exchangeDetails?.chassisNumber || '',
+          brokerName: booking.exchangeDetails?.broker?.name || '',
+          price: booking.exchangeDetails?.price || 0
+        } : {
+          hasExchange: false,
+          vehicleNumber: '',
+          chassisNumber: '',
+          brokerName: '',
+          price: 0
+        };
+
+        return {
+          bookingNumber: booking.bookingNumber,
+          bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '', // DATE ONLY (no time)
+          branchName: booking.branch?.name,
+          branchId: booking.branch?._id,
+          salesExecutive: booking.salesExecutive?.name,
+          model: booking.model?.model_name,
+          modelType: booking.model?.type,
+          color: booking.color?.name,
+          // REMOVED: chassisNumber, engineNumber
+          customerName: booking.customerDetails?.name,
+          mobile1: booking.customerDetails?.mobile1,
+          mobile2: booking.customerDetails?.mobile2,
+          address: booking.customerDetails?.address,
+          pincode: booking.customerDetails?.pincode || '', // ADDED: Customer pincode
+          adharNumber: booking.customerDetails?.aadharNumber,
+          panNo: booking.customerDetails?.panNo,
+          birthday: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '', // DATE ONLY
+          nomineeName: booking.customerDetails?.nomineeName,
+          nomineeRelation: booking.customerDetails?.nomineeRelation,
+          nomineeAge: booking.customerDetails?.nomineeAge,
+          bookingType: booking.payment?.type,
+          financierName: financierName,
+          customerType: booking.customerType,
+          gstNumber: (booking.customerType === 'B2B') ? (booking.gstin || '') : '',
+          exchangeDetails: exchangeDetails, // Without brokerMobile
+          priceComponents: priceComponentsObj,
+          totalAmount: totalAmount,
+          totalDiscountGiven: totalDiscountGiven,
+          finalAmount: discountedAmount,
+          accessories: accessoriesNames
+        };
+      });
+
+      // Calculate overall totals
+      const overallTotals = formattedBookings.reduce((acc, booking) => {
+        acc.totalAmount += booking.totalAmount || 0;
+        acc.totalDiscount += booking.totalDiscountGiven || 0;
+        acc.finalAmount += booking.finalAmount || 0;
+        return acc;
+      }, { 
+        totalAmount: 0, 
+        totalDiscount: 0, 
+        finalAmount: 0
+      });
+
+      res.status(200).json({
+        success: true,
+        count: bookings.length,
+        totals: overallTotals,
+        data: formattedBookings,
+        // ========== DROPDOWN DATA FOR FRONTEND ==========
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          chassisAllocated: false, // This report excludes allocated bookings
+          dateRange: filter.createdAt ? {
+            start: filter.createdAt.$gte ? filter.createdAt.$gte.toISOString() : undefined,
+            end: filter.createdAt.$lte ? filter.createdAt.$lte.toISOString() : undefined
+          } : undefined,
+          branchId: branchId,
+          status: status,
+          bookingType: bookingType,
+          customerType: customerType,
+          modelType: modelType // ADDED: Include modelType in filters response
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating booking report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating booking report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+/**
+ * Generate quotation report with filtering - SINGLE ROW WITH ALL MODEL PRICES
+ * @route GET /api/v1/reports/quotations
+ * @access Private
+ */
+exports.generateQuotationReport = async (req, res) => {
+    try {
+      const { 
+        branchId, 
+        startDate, 
+        endDate, 
+        status, 
+        createdBy,
+        customerId,
+        format = 'excel' 
+      } = req.query;
+  
+      // Build filter conditions
+      const filter = {};
+  
+      // Branch filter through userDetails.branch
+      if (branchId) {
+        filter['userDetails.branch._id'] = new mongoose.Types.ObjectId(branchId);
+      }
+  
+      // Customer filter
+      if (customerId) {
+        filter.customer_id = new mongoose.Types.ObjectId(customerId);
+      }
+  
+      // Date range filter
+      if (startDate || endDate) {
+        filter.createdAt = {};
+        if (startDate) {
+          const start = new Date(startDate);
+          start.setHours(0, 0, 0, 0);
+          filter.createdAt.$gte = start;
+        }
+        if (endDate) {
+          const end = new Date(endDate);
+          end.setHours(23, 59, 59, 999);
+          filter.createdAt.$lte = end;
+        }
+      }
+  
+      // Additional filters
+      if (status) filter.status = status;
+      if (createdBy) filter.createdBy = new mongoose.Types.ObjectId(createdBy);
+  
+      console.log('Quotation filter:', JSON.stringify(filter, null, 2));
+  
+      // Fetch quotations
+      const quotations = await Quotation.find(filter)
+        .populate('customer_id', 'name mobile1 mobile2 address taluka district panNo aadharNumber occupation')
+        .populate('createdBy', 'name full_name username email mobile branch')
+        .populate('base_model_id', 'model_name series type')
+        .populate({
+          path: 'models.model_id',
+          select: 'model_name series type fuel_type engine_cc color_options'
+        })
+        .sort({ createdAt: -1 })
+        .lean();
+  
+      console.log(`Found ${quotations.length} quotations`);
+  
+      if (quotations.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'No quotations found for the specified criteria',
+          filter: filter
+        });
+      }
+  
+      // Generate Excel report
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Quotation Report');
+  
+        // Helper function to get sales person name
+        const getSalesPersonName = (quotation) => {
+          if (quotation.userDetails?.full_name) {
+            return quotation.userDetails.full_name;
+          }
+          if (quotation.createdBy?.name) {
+            return quotation.createdBy.name;
+          }
+          if (quotation.userDetails?.username) {
+            return quotation.userDetails.username;
+          }
+          if (quotation.createdBy?.full_name) {
+            return quotation.createdBy.full_name;
+          }
+          return '';
+        };
+  
+        // Define columns EXACTLY as requested
+        const columns = [
+          { header: 'S.No', key: 'sno', width: 8 },
+          { header: 'Quotation No', key: 'quotationNumber', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Branch', key: 'branch', width: 25 },
+          { header: 'Sales Person', key: 'salesPerson', width: 25 },
+          { header: 'Customer Name', key: 'customerName', width: 25 },
+          { header: 'Mobile 1', key: 'mobile1', width: 15 },
+          { header: 'Mobile 2', key: 'mobile2', width: 15 },
+          { header: 'Address', key: 'address', width: 40 },
+          { header: 'Taluka', key: 'taluka', width: 15 },
+          { header: 'District', key: 'district', width: 15 },
+          { header: 'Finance Needed', key: 'financeNeeded', width: 15 },
+          { header: 'Status sent on WhatsApp', key: 'status', width: 15 },
+          { header: 'Expected Delivery Date', key: 'expectedDelivery', width: 20 },
+          { header: 'Selected Model 1 Name', key: 'selectedModel1Name', width: 30 },
+          { header: 'Selected Model 2 Name', key: 'selectedModel2Name', width: 30 },
+          { header: 'Base Model Name', key: 'baseModelName', width: 30 }
+        ];
+  
+        worksheet.columns = columns;
+  
+        // Add data rows - ONE ROW PER QUOTATION
+        quotations.forEach((quotation, index) => {
+          // Get base model name
+          let baseModelName = '';
+          
+          // First try: check base_model_name field
+          if (quotation.base_model_name) {
+            baseModelName = quotation.base_model_name;
+          }
+          // Second try: check populated base_model_id
+          else if (quotation.base_model_id?.model_name) {
+            baseModelName = quotation.base_model_id.model_name;
+          }
+          // Third try: find base model from models array
+          else {
+            const baseModel = quotation.models?.find(model => model.is_base_model);
+            baseModelName = baseModel?.model_name || '';
+          }
+  
+          // Get selected model names
+          let selectedModel1Name = '';
+          let selectedModel2Name = '';
+          
+          if (quotation.models && quotation.models.length > 0) {
+            // Get first model
+            if (quotation.models[0]) {
+              selectedModel1Name = quotation.models[0].model_name || '';
+            }
+            // Get second model if exists
+            if (quotation.models[1]) {
+              selectedModel2Name = quotation.models[1].model_name || '';
+            }
+          }
+  
+          // Get sales person name using helper function
+          const salesPersonName = getSalesPersonName(quotation);
+          
+          // Format the row data EXACTLY as requested
+          const rowData = {
+            sno: index + 1,
+            quotationNumber: quotation.quotation_number || '',
+            date: quotation.date ? moment(quotation.date).format('DD/MM/YYYY') : '',
+            branch: quotation.userDetails?.branch?.name || '',
+            salesPerson: salesPersonName,
+            customerName: quotation.customerDetails?.name || '',
+            mobile1: quotation.customerDetails?.mobile1 || '',
+            mobile2: quotation.customerDetails?.mobile2 || '',
+            address: quotation.customerDetails?.address || '',
+            taluka: quotation.customerDetails?.taluka || '',
+            district: quotation.customerDetails?.district || '',
+            financeNeeded: quotation.finance_needed ? 'Yes' : 'No',
+            status: quotation.status ? quotation.status.toUpperCase() : '',
+            expectedDelivery: quotation.expected_delivery_date ? 
+              moment(quotation.expected_delivery_date).format('DD/MM/YYYY') : '',
+            selectedModel1Name: selectedModel1Name,
+            selectedModel2Name: selectedModel2Name,
+            baseModelName: baseModelName
+          };
+  
+          worksheet.addRow(rowData);
+        });
+  
+        // Style header row
+        worksheet.getRow(1).eachCell((cell) => {
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Style data rows
+        for (let i = 2; i <= worksheet.rowCount; i++) {
+          const row = worksheet.getRow(i);
+          row.eachCell((cell) => {
+            cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+            cell.border = {
+              top: { style: 'thin' },
+              left: { style: 'thin' },
+              bottom: { style: 'thin' },
+              right: { style: 'thin' }
+            };
+          });
+        }
+  
+        // Auto-fit columns
+        worksheet.columns.forEach(column => {
+          const maxWidth = 40;
+          column.width = column.width ? Math.min(column.width, maxWidth) : 15;
+        });
+  
+        // Add auto-filter
+        if (worksheet.rowCount > 1) {
+          worksheet.autoFilter = {
+            from: 'A1',
+            to: `Q${worksheet.rowCount}`
+          };
+        }
+  
+        // Freeze header row
+        worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+  
+        // Set response headers
+        const fileName = `quotation_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${fileName}"`
+        );
+  
+        await workbook.xlsx.write(res);
+        res.end();
+  
+      } else {
+        // Return JSON format
+        const formattedQuotations = quotations.map(quotation => {
+          // Helper function for JSON too
+          const getSalesPersonName = (q) => {
+            if (q.userDetails?.full_name) return q.userDetails.full_name;
+            if (q.createdBy?.name) return q.createdBy.name;
+            if (q.userDetails?.username) return q.userDetails.username;
+            if (q.createdBy?.full_name) return q.createdBy.full_name;
+            return '';
+          };
+  
+          // Get base model name
+          let baseModelName = '';
+          if (quotation.base_model_name) {
+            baseModelName = quotation.base_model_name;
+          } else if (quotation.base_model_id?.model_name) {
+            baseModelName = quotation.base_model_id.model_name;
+          } else {
+            const baseModel = quotation.models?.find(model => model.is_base_model);
+            baseModelName = baseModel?.model_name || '';
+          }
+  
+          // Get selected model names
+          let selectedModel1Name = '';
+          let selectedModel2Name = '';
+          
+          if (quotation.models && quotation.models.length > 0) {
+            if (quotation.models[0]) {
+              selectedModel1Name = quotation.models[0].model_name || '';
+            }
+            if (quotation.models[1]) {
+              selectedModel2Name = quotation.models[1].model_name || '';
+            }
+          }
+  
+          return {
+            sno: index + 1,
+            quotation_number: quotation.quotation_number,
+            date: quotation.date,
+            expected_delivery_date: quotation.expected_delivery_date,
+            branch: quotation.userDetails?.branch?.name,
+            sales_person: getSalesPersonName(quotation),
+            customer_details: {
+              name: quotation.customerDetails?.name,
+              mobile1: quotation.customerDetails?.mobile1,
+              mobile2: quotation.customerDetails?.mobile2,
+              address: quotation.customerDetails?.address,
+              taluka: quotation.customerDetails?.taluka,
+              district: quotation.customerDetails?.district
+            },
+            finance_needed: quotation.finance_needed,
+            status: quotation.status,
+            selected_model_1_name: selectedModel1Name,
+            selected_model_2_name: selectedModel2Name,
+            base_model_name: baseModelName
+          };
+        });
+  
+        res.status(200).json({
+          success: true,
+          count: quotations.length,
+          data: formattedQuotations,
+          metadata: {
+            total_quotations: quotations.length,
+            date_range: filter.createdAt ? {
+              start: filter.createdAt.$gte ? filter.createdAt.$gte.toISOString() : undefined,
+              end: filter.createdAt.$lte ? filter.createdAt.$lte.toISOString() : undefined
+            } : undefined
+          }
+        });
+      }
+  
+    } catch (error) {
+      console.error('Error generating quotation report:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Error generating quotation report',
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  };
+/**
+ * Generate insurance pending report with dynamic headers
+ * @route GET /api/v1/reports/insurance/pending
+ * @access Private
+ */
+/**
+ * Generate Insurance Pending Report - Shows bookings with AWAITING, PENDING, NOT_STARTED, and LATER insurance status
+ * Clean professional format without colors or price columns
+ * @route GET /api/v1/reports/insurance/pending
+ * @access Private
+ */
+/**
+ * Generate Insurance Pending Report - Shows bookings with AWAITING, PENDING, NOT_STARTED, and LATER insurance status
+ * Clean professional format without colors or price columns
+ * @route GET /api/v1/reports/insurance/pending
+ * @access Private
+ */
+exports.generateInsurancePendingReport = async (req, res) => {
+  try {
+    const { 
+      branchId, 
+      startDate, 
+      endDate, 
+      bookingType,
+      customerType,
+      modelId,
+      format = 'excel' 
+    } = req.query;
+
+    // ========== BRANCH ACCESS LOGIC ==========
+    const userId = req.user.id;
+    
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name')
+        .sort({ name: 1 })
+        .lean();
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+      availableBranches = user.accessibleBranches.map(b => ({
+        _id: b._id,
+        name: b.name
+      })).sort((a, b) => a.name.localeCompare(b.name));
+    } else if (user.branch) {
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name
+      }];
+    }
+
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches'
+      });
+    }
+
+    // ========== BUILD BOOKING FILTER ==========
+    // Show ALL pending insurance statuses including LATER
+    const bookingFilter = {
+      insuranceStatus: { $in: ['AWAITING', 'PENDING', 'NOT_STARTED', 'LATER'] }
+    };
+
+    // Branch filter with access control
+    if (!hasAllBranchesAccess) {
+      let allowedBranchIds = [];
+
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+        allowedBranchIds = user.accessibleBranches.map(b => b._id);
+
+        if (branchId && branchId !== 'all') {
+          const requestedId = new mongoose.Types.ObjectId(branchId);
+          const hasAccess = allowedBranchIds.some(id => id.toString() === requestedId.toString());
+          if (!hasAccess) {
+            return res.status(403).json({
+              success: false,
+              message: 'You do not have access to this branch'
+            });
+          }
+          allowedBranchIds = [requestedId];
+        }
+      } else if (user.branch?._id) {
+        allowedBranchIds = [user.branch._id];
+        
+        if (branchId && branchId !== 'all' && branchId !== user.branch._id.toString()) {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to this branch'
+          });
+        }
+      }
+
+      if (allowedBranchIds.length > 0) {
+        bookingFilter.branch = { $in: allowedBranchIds };
+      }
+    } else if (branchId && branchId !== 'all') {
+      bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
+    }
+
+    // Date range filter
+    if (startDate || endDate) {
+      bookingFilter.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        bookingFilter.createdAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        bookingFilter.createdAt.$lte = end;
+      }
+    }
+
+    // Additional filters
+    if (bookingType) bookingFilter.bookingType = bookingType;
+    if (customerType) bookingFilter.customerType = customerType;
+    if (modelId) bookingFilter.model = new mongoose.Types.ObjectId(modelId);
+
+    console.log('Insurance Pending Filter:', JSON.stringify(bookingFilter, null, 2));
+
+    // ========== FETCH BOOKINGS WITH PENDING INSURANCE ==========
+    const bookings = await Booking.find(bookingFilter)
+      .populate({
+        path: 'model',
+        select: 'model_name type'
+      })
+      .populate({
+        path: 'color',
+        select: 'name'
+      })
+      .populate({
+        path: 'branch',
+        select: 'name'
+      })
+      .populate({
+        path: 'salesExecutive',
+        select: 'name'
+      })
+      .populate({
+        path: 'createdBy',
+        select: 'name'
+      })
+      .populate({
+        path: 'vehicle',
+        select: 'chassisNumber engineNumber'
+      })
+      .populate({
+        path: 'payment.financer',
+        select: 'name'
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    console.log(`Found ${bookings.length} bookings with pending insurance`);
+
+    if (bookings.length === 0) {
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Insurance Pending Report');
+        
+        const headers = getInsuranceHeaders();
+        worksheet.columns = headers.map((header, index) => ({
+          header: header,
+          key: `col_${index}`,
+          width: getInsuranceColumnWidth(header)
+        }));
+        
+        const fileName = `insurance_pending_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        
+        await workbook.xlsx.write(res);
+        res.end();
+        return;
+      } else {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          availableBranches: availableBranches,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0
+          },
+          filters: {
+            branchId: branchId,
+            insuranceStatus: ['AWAITING', 'PENDING', 'NOT_STARTED', 'LATER'],
+            bookingType: bookingType,
+            customerType: customerType,
+            modelId: modelId,
+            startDate: startDate,
+            endDate: endDate
+          }
+        });
+      }
+    }
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      let worksheetName = 'Insurance Pending Report';
+      if (branchId && branchId !== 'all' && bookings.length > 0) {
+        worksheetName = `${bookings[0]?.branch?.name || ''} Insurance Pending`.trim();
+      } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+        worksheetName = 'All Branches Insurance Pending';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName.substring(0, 31), {
+        properties: { defaultRowHeight: 20 },
+        pageSetup: { paperSize: 9, orientation: 'landscape' }
+      });
+
+      // Get headers - NO PRICE COMPONENTS
+      const headers = getInsuranceHeaders();
+
+      // Set worksheet columns with proper widths
+      worksheet.columns = headers.map((header, index) => ({
+        header: header,
+        key: `col_${index}`,
+        width: getInsuranceColumnWidth(header)
+      }));
+
+      // Style header row
+      const headerRow = worksheet.getRow(1);
+      headerRow.height = 30;
+      headerRow.eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11,
+          name: 'Arial'
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Add data rows
+      bookings.forEach((booking, index) => {
+        // Format address
+        const fullAddress = [
+          booking.customerDetails?.address || '',
+          booking.customerDetails?.taluka || '',
+          booking.customerDetails?.district || '',
+          booking.customerDetails?.pincode || ''
+        ].filter(Boolean).join(', ');
+
+        // Get financier name
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = typeof booking.payment.financer === 'object' 
+            ? booking.payment.financer.name || '' 
+            : booking.payment.financer.toString();
+        }
+
+        // Prepare row data - WITH NOMINEE AGE FROM DATABASE
+        const rowData = {
+          col_0: index + 1,
+          col_1: booking.bookingNumber || '',
+          col_2: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+          col_3: booking.branch?.name || '',
+          col_4: `${booking.customerDetails?.salutation || ''} ${booking.customerDetails?.name || ''}`.trim(),
+          col_5: booking.customerDetails?.custId || '',
+          col_6: fullAddress,
+          col_7: booking.customerDetails?.mobile1 || '',
+          col_8: booking.customerDetails?.mobile2 || '',
+          col_9: booking.customerDetails?.panNo || '',
+          col_10: booking.customerDetails?.aadharNumber || '',
+          col_11: booking.customerDetails?.occupation || '',
+          col_12: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+          col_13: booking.customerDetails?.nomineeAge || '', // ✅ NOMINEE AGE FROM DATABASE
+          col_14: booking.customerDetails?.nomineeName || '',
+          col_15: booking.customerDetails?.nomineeRelation || '',
+          col_16: booking.model?.model_name || '',
+          col_17: booking.model?.type || '',
+          col_18: booking.color?.name || '',
+          col_19: booking.chassisNumber || booking.vehicle?.chassisNumber || '',
+          col_20: booking.vehicle?.engineNumber || booking.engineNumber || '',
+          col_21: booking.insuranceStatus || '',
+          col_22: booking.payment?.type || '',
+          col_23: financierName,
+          col_24: booking.hpa ? 'Yes' : 'No',
+          col_25: booking.rtoStatus || '',
+          col_26: booking.rtoAmount || 0,
+          col_27: booking.kycStatus || '',
+          col_28: booking.financeLetterStatus || '',
+          col_29: booking.dealFormStatus || '',
+          col_30: booking.deliveryChallanStatus || '',
+          col_31: booking.salesExecutive?.name || '',
+          col_32: booking.createdBy?.name || '',
+          col_33: booking.totalAmount || 0,
+          col_34: booking.receivedAmount || 0,
+          col_35: booking.balanceAmount || 0,
+          col_36: booking.status || ''
+        };
+
+        const row = worksheet.addRow(rowData);
+        row.height = 20;
+
+        // Style the row - NO COLORS
+        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+          const header = headers[colNumber - 1];
+          
+          // Set alignment based on content type
+          if (header.includes('Amount') || header.includes('Total') || header.includes('Balance')) {
+            cell.alignment = { horizontal: 'right', vertical: 'middle' };
+            if (typeof cell.value === 'number' && cell.value !== 0) {
+              cell.numFmt = '#,##0.00';
+            }
+          } else if (header === 'Sr. No' || header === 'Age' || header === 'Pincode' || 
+                    header.includes('Mobile') || header.includes('RTO Status')) {
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          } else {
+            cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+          }
+          
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+      });
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      // --- SUMMARY SECTION ---
+      const summaryStartRow = worksheet.rowCount + 3;
+      
+      // SUMMARY title
+      worksheet.mergeCells(`A${summaryStartRow}:E${summaryStartRow}`);
+      const summaryTitleCell = worksheet.getCell(`A${summaryStartRow}`);
+      summaryTitleCell.value = 'INSURANCE PENDING SUMMARY';
+      summaryTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+      summaryTitleCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E75B5' }
+      };
+      summaryTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+      summaryTitleCell.border = {
+        top: { style: 'medium' },
+        left: { style: 'medium' },
+        bottom: { style: 'medium' },
+        right: { style: 'medium' }
+      };
+
+      // Calculate summary statistics
+      const awaitingCount = bookings.filter(b => b.insuranceStatus === 'AWAITING').length;
+      const pendingCount = bookings.filter(b => b.insuranceStatus === 'PENDING').length;
+      const notStartedCount = bookings.filter(b => b.insuranceStatus === 'NOT_STARTED').length;
+      const laterCount = bookings.filter(b => b.insuranceStatus === 'LATER').length;
+      
+      const totalBalance = bookings.reduce((sum, b) => sum + (b.balanceAmount || 0), 0);
+      const totalReceived = bookings.reduce((sum, b) => sum + (b.receivedAmount || 0), 0);
+
+      // Summary data
+      const summaryData = [
+        ['Total Bookings:', bookings.length],
+        ['AWAITING:', awaitingCount],
+        ['PENDING:', pendingCount],
+        ['NOT_STARTED:', notStartedCount],
+        ['LATER:', laterCount],
+        ['Total Balance Amount:', `₹${totalBalance.toFixed(2)}`],
+        ['Total Received Amount:', `₹${totalReceived.toFixed(2)}`]
+      ];
+
+      // Add summary data rows
+      summaryData.forEach(([label, value], index) => {
+        const rowNum = summaryStartRow + 2 + index;
+        
+        worksheet.getCell(`A${rowNum}`).value = label;
+        worksheet.getCell(`A${rowNum}`).font = { bold: true };
+        worksheet.getCell(`A${rowNum}`).alignment = { horizontal: 'right', vertical: 'middle' };
+        worksheet.getCell(`A${rowNum}`).border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        
+        worksheet.getCell(`B${rowNum}`).value = value;
+        worksheet.getCell(`B${rowNum}`).font = { bold: true };
+        worksheet.getCell(`B${rowNum}`).alignment = { horizontal: 'left', vertical: 'middle' };
+        worksheet.getCell(`B${rowNum}`).border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Add footer
+      const footerRow = summaryStartRow + summaryData.length + 4;
+      worksheet.mergeCells(`A${footerRow}:E${footerRow}`);
+      const footerCell = worksheet.getCell(`A${footerRow}`);
+      footerCell.value = `Report generated on ${moment().format('DD MMM YYYY HH:mm:ss')} | Showing AWAITING, PENDING, NOT_STARTED, and LATER insurance status`;
+      footerCell.font = { italic: true, size: 10, color: { argb: 'FF666666' } };
+      footerCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      // Set response headers
+      const fileName = `insurance_pending_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedBookings = bookings.map((booking, index) => {
+        // Get financier name
+        let financierName = '';
+        if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+          financierName = typeof booking.payment.financer === 'object' 
+            ? booking.payment.financer.name || '' 
+            : booking.payment.financer.toString();
+        }
+
+        return {
+          srNo: index + 1,
+          bookingNumber: booking.bookingNumber,
+          bookingDate: booking.createdAt,
+          formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+          branchName: booking.branch?.name || '',
+          customerInfo: {
+            fullName: `${booking.customerDetails?.salutation || ''} ${booking.customerDetails?.name || ''}`.trim(),
+            customerId: booking.customerDetails?.custId || '',
+            address: booking.customerDetails?.address || '',
+            taluka: booking.customerDetails?.taluka || '',
+            district: booking.customerDetails?.district || '',
+            pincode: booking.customerDetails?.pincode || '',
+            mobile1: booking.customerDetails?.mobile1 || '',
+            mobile2: booking.customerDetails?.mobile2 || '',
+            panNo: booking.customerDetails?.panNo || '',
+            aadharNumber: booking.customerDetails?.aadharNumber || '',
+            occupation: booking.customerDetails?.occupation || '',
+            dob: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+            nomineeAge: booking.customerDetails?.nomineeAge || '', // ✅ NOMINEE AGE FROM DATABASE
+            nomineeName: booking.customerDetails?.nomineeName || '',
+            nomineeRelation: booking.customerDetails?.nomineeRelation || ''
+          },
+          vehicleInfo: {
+            model: booking.model?.model_name || '',
+            modelType: booking.model?.type || '',
+            color: booking.color?.name || '',
+            chassisNumber: booking.chassisNumber || booking.vehicle?.chassisNumber || '',
+            engineNumber: booking.vehicle?.engineNumber || booking.engineNumber || ''
+          },
+          insuranceStatus: booking.insuranceStatus,
+          paymentInfo: {
+            type: booking.payment?.type || '',
+            financier: financierName,
+            hpa: booking.hpa || false
+          },
+          statusInfo: {
+            rtoStatus: booking.rtoStatus || '',
+            rtoAmount: booking.rtoAmount || 0,
+            kycStatus: booking.kycStatus || '',
+            financeLetterStatus: booking.financeLetterStatus || '',
+            dealFormStatus: booking.dealFormStatus || '',
+            deliveryChallanStatus: booking.deliveryChallanStatus || '',
+            bookingStatus: booking.status || ''
+          },
+          financialInfo: {
+            totalAmount: booking.totalAmount || 0,
+            receivedAmount: booking.receivedAmount || 0,
+            balanceAmount: booking.balanceAmount || 0
+          },
+          salesInfo: {
+            salesExecutive: booking.salesExecutive?.name || '',
+            bookingType: booking.bookingType || '',
+            customerType: booking.customerType || '',
+            createdBy: booking.createdBy?.name || ''
+          }
+        };
+      });
+
+      // Calculate summary statistics
+      const summary = {
+        totalBookings: bookings.length,
+        awaitingCount: bookings.filter(b => b.insuranceStatus === 'AWAITING').length,
+        pendingCount: bookings.filter(b => b.insuranceStatus === 'PENDING').length,
+        notStartedCount: bookings.filter(b => b.insuranceStatus === 'NOT_STARTED').length,
+        laterCount: bookings.filter(b => b.insuranceStatus === 'LATER').length,
+        totalBalanceAmount: bookings.reduce((sum, b) => sum + (b.balanceAmount || 0), 0),
+        totalReceivedAmount: bookings.reduce((sum, b) => sum + (b.receivedAmount || 0), 0),
+        branchWiseBreakdown: bookings.reduce((acc, booking) => {
+          const branch = booking.branch?.name || 'Unknown';
+          if (!acc[branch]) {
+            acc[branch] = { 
+              total: 0, 
+              awaiting: 0, 
+              pending: 0, 
+              notStarted: 0, 
+              later: 0 
+            };
+          }
+          acc[branch].total++;
+          if (booking.insuranceStatus === 'AWAITING') acc[branch].awaiting++;
+          else if (booking.insuranceStatus === 'PENDING') acc[branch].pending++;
+          else if (booking.insuranceStatus === 'NOT_STARTED') acc[branch].notStarted++;
+          else if (booking.insuranceStatus === 'LATER') acc[branch].later++;
+          return acc;
+        }, {})
+      };
+
+      res.status(200).json({
+        success: true,
+        count: bookings.length,
+        summary: summary,
+        data: formattedBookings,
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          branchId: branchId,
+          insuranceStatus: ['AWAITING', 'PENDING', 'NOT_STARTED', 'LATER'],
+          bookingType: bookingType,
+          customerType: customerType,
+          modelId: modelId,
+          startDate: startDate,
+          endDate: endDate
+        },
+        generatedAt: new Date()
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating insurance pending report:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error generating insurance pending report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+/**
+ * Helper function to get insurance report headers
+ */
+function getInsuranceHeaders() {
+  return [
+    'Sr. No',
+    'Booking Number',
+    'Booking Date',
+    'Branch Name',
+    'Customer Name',
+    'Customer ID',
+    'Address',
+    'Mobile 1',
+    'Mobile 2',
+    'PAN',
+    'Aadhar',
+    'Occupation',
+    'Date of Birth',
+    'Nominee Age', // ✅ Changed from 'Age' to 'Nominee Age'
+    'Nominee Name',
+    'Nominee Relation',
+    'Model',
+    'Model Type',
+    'Color',
+    'Chassis Number',
+    'Engine Number',
+    'Insurance Status',
+    'Payment Type',
+    'Financier Name',
+    'HPA',
+    'RTO Status',
+    'RTO Amount',
+    'KYC Status',
+    'Finance Letter Status',
+    'Deal Form Status',
+    'Delivery Challan Status',
+    'Sales Executive',
+    'Created By',
+    'Total Amount',
+    'Received Amount',
+    'Balance Amount',
+    'Booking Status'
+  ];
+}
+
+/**
+ * Helper function to get column width based on header
+ */
+function getInsuranceColumnWidth(header) {
+  const widthMap = {
+    'Sr. No': 8,
+    'Booking Number': 18,
+    'Booking Date': 12,
+    'Branch Name': 20,
+    'Customer Name': 25,
+    'Customer ID': 15,
+    'Address': 40,
+    'Mobile 1': 15,
+    'Mobile 2': 15,
+    'PAN': 15,
+    'Aadhar': 18,
+    'Occupation': 15,
+    'Date of Birth': 12,
+    'Nominee Age': 12, // ✅ Updated width
+    'Nominee Name': 20,
+    'Nominee Relation': 15,
+    'Model': 20,
+    'Model Type': 12,
+    'Color': 15,
+    'Chassis Number': 20,
+    'Engine Number': 18,
+    'Insurance Status': 18,
+    'Payment Type': 15,
+    'Financier Name': 20,
+    'HPA': 8,
+    'RTO Status': 15,
+    'RTO Amount': 15,
+    'KYC Status': 15,
+    'Finance Letter Status': 20,
+    'Deal Form Status': 18,
+    'Delivery Challan Status': 20,
+    'Sales Executive': 20,
+    'Created By': 20,
+    'Total Amount': 15,
+    'Received Amount': 15,
+    'Balance Amount': 15,
+    'Booking Status': 18
+  };
+  
+  return widthMap[header] || 18;
+}
+
+
+/**
+ * Helper function to add summary section to Excel
+ */
+const addSummarySection = (worksheet, receipts, totalColumns) => {
+  const summaryStartRow = worksheet.rowCount + 3;
+  
+  // Summary Title
+  const summaryTitleRow = summaryStartRow;
+  const titleEndCol = Math.min(6, totalColumns);
+  const titleEndColLetter = String.fromCharCode(64 + titleEndCol);
+  worksheet.mergeCells(`A${summaryTitleRow}:${titleEndColLetter}${summaryTitleRow}`);
+  const titleCell = worksheet.getCell(`A${summaryTitleRow}`);
+  titleCell.value = 'RECEIPT SUMMARY';
+  titleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+  titleCell.fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF4F81BD' }
+  };
+  titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  titleCell.border = {
+    top: { style: 'medium' },
+    left: { style: 'medium' },
+    bottom: { style: 'medium' },
+    right: { style: 'medium' }
+  };
+
+  // Calculate totals
+  const totalAmount = receipts.reduce((sum, r) => sum + (r.amount || 0), 0);
+  const totalNetAmount = receipts.reduce((sum, r) => sum + (r.netAmount || 0), 0);
+  const totalGcAmount = receipts.reduce((sum, r) => sum + (r.gcAmount || 0), 0);
+  
+  const summaryData = [
+    ['Total Receipts:', receipts.length],
+    ['Total Amount:', `₹${totalAmount.toFixed(2)}`],
+    ['Total Net Amount:', `₹${totalNetAmount.toFixed(2)}`],
+    ['Total GC Amount:', `₹${totalGcAmount.toFixed(2)}`],
+    ['Average Receipt Amount:', `₹${(totalAmount / Math.max(receipts.length, 1)).toFixed(2)}`]
+  ];
+
+  summaryData.forEach(([label, value], index) => {
+    const rowNum = summaryStartRow + 1 + index;
+    
+    // Label
+    const labelCell = worksheet.getCell(`A${rowNum}`);
+    labelCell.value = label;
+    labelCell.font = { bold: true };
+    labelCell.alignment = { horizontal: 'right', vertical: 'middle' };
+    labelCell.border = {
+      top: { style: 'thin' },
+      left: { style: 'thin' },
+      bottom: { style: 'thin' },
+      right: { style: 'thin' }
+    };
+    
+    // Value
+    if (value) {
+      worksheet.mergeCells(`B${rowNum}:${titleEndColLetter}${rowNum}`);
+      const valueCell = worksheet.getCell(`B${rowNum}`);
+      valueCell.value = value;
+      valueCell.alignment = { horizontal: 'left', vertical: 'middle' };
+      valueCell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      
+      // Style amount cells
+      if (typeof value === 'string' && value.startsWith('₹')) {
+        valueCell.font = { bold: true, color: { argb: 'FF107C10' } };
+      }
+    }
+  });
+
+  return summaryStartRow + summaryData.length + 2;
+};
+
+/**
+ * Helper function to add payment mode breakdown
+ */
+const addPaymentModeBreakdown = (worksheet, receipts, startRow, totalColumns) => {
+  // Breakdown Title
+  const titleEndCol = Math.min(3, totalColumns);
+  const titleEndColLetter = String.fromCharCode(64 + titleEndCol);
+  worksheet.mergeCells(`A${startRow}:${titleEndColLetter}${startRow}`);
+  const breakdownTitleCell = worksheet.getCell(`A${startRow}`);
+  breakdownTitleCell.value = 'PAYMENT MODE BREAKDOWN';
+  breakdownTitleCell.font = { bold: true, size: 12, color: { argb: 'FFFFFFFF' } };
+  breakdownTitleCell.fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF2E75B5' }
+  };
+  breakdownTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  breakdownTitleCell.border = {
+    top: { style: 'medium' },
+    left: { style: 'medium' },
+    bottom: { style: 'medium' },
+    right: { style: 'medium' }
+  };
+
+  // Breakdown Headers
+  const breakdownHeadersRow = startRow + 1;
+  const breakdownHeaders = ['Payment Mode', 'Count', 'Total Amount'];
+  breakdownHeaders.forEach((header, colIndex) => {
+    const colLetter = String.fromCharCode(65 + colIndex);
+    const cell = worksheet.getCell(`${colLetter}${breakdownHeadersRow}`);
+    cell.value = header;
+    cell.font = { bold: true };
+    cell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF2F2F2' }
+    };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    cell.border = {
+      top: { style: 'thin' },
+      left: { style: 'thin' },
+      bottom: { style: 'thin' },
+      right: { style: 'thin' }
+    };
+  });
+
+  // Calculate payment mode breakdown
+  const paymentModeBreakdown = receipts.reduce((acc, receipt) => {
+    const mode = receipt.paymentMode || 'Unknown';
+    if (!acc[mode]) {
+      acc[mode] = { count: 0, amount: 0 };
+    }
+    acc[mode].count++;
+    acc[mode].amount += receipt.amount || 0;
+    return acc;
+  }, {});
+
+  // Add breakdown data
+  Object.entries(paymentModeBreakdown).forEach(([mode, data], index) => {
+    const rowNum = breakdownHeadersRow + 1 + index;
+    
+    // Mode
+    const modeCell = worksheet.getCell(`A${rowNum}`);
+    modeCell.value = mode;
+    modeCell.alignment = { horizontal: 'left', vertical: 'middle' };
+    
+    // Count
+    const countCell = worksheet.getCell(`B${rowNum}`);
+    countCell.value = data.count;
+    countCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    
+    // Amount
+    const amountCell = worksheet.getCell(`C${rowNum}`);
+    amountCell.value = `₹${data.amount.toFixed(2)}`;
+    amountCell.alignment = { horizontal: 'right', vertical: 'middle' };
+    amountCell.font = { bold: true, color: { argb: 'FF107C10' } };
+    
+    // Row styling
+    [modeCell, countCell, amountCell].forEach(cell => {
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      
+      if (index % 2 === 0) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFF8F8F8' }
+        };
+      }
+    });
+  });
+
+  return breakdownHeadersRow + Object.keys(paymentModeBreakdown).length + 2;
+};
+ 
+/**
+ * Generate receipt report with filtering options - FIXED VERSION
+ * Now filtering by receiptDate instead of approvedAt
+ * Shows approval details correctly (without time)
+ * ADDED: Refund column (Yes/No)
+ * @route GET /api/v1/reports/receipts
+ * @access Private
+ */
+exports.generateReceiptReport = async (req, res) => {
+  try {
+    // Extract query parameters
+    const { 
+      branchId, 
+      startDate, 
+      endDate, 
+      paymentMode,
+      cashOtherFilter, // NEW: 'cash' or 'other' filter
+      status,
+      createdBy,
+      receivedBy,
+      bookingNumber,
+      customerId,
+      bookingType,
+      customerType,
+      modelId,
+      colorId,
+      salesExecutiveId,
+      format = 'excel',
+      includeCancelled = 'false'
+    } = req.query;
+
+    // ========== BRANCH ACCESS LOGIC ==========
+    const userId = req.user.id;
+    
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // ========== BUILD BOOKING FILTERS WITH BRANCH ACCESS ==========
+    let hasBookingFilter = false;
+    const bookingFilterConditions = [];
+
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        console.log(`User has access to ${accessibleBranchIds.length} assigned branches`);
+        
+        if (branchId) {
+          if (branchId === 'all') {
+            bookingFilterConditions.push({ branch: { $in: accessibleBranchIds } });
+            console.log('✅ Showing receipts from all accessible branches');
+            hasBookingFilter = true;
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this branch'
+              });
+            }
+            bookingFilterConditions.push({ branch: requestedBranchId });
+            console.log(`✅ Filtering by branch: ${branchId}`);
+            hasBookingFilter = true;
+          }
+        } else {
+          bookingFilterConditions.push({ branch: { $in: accessibleBranchIds } });
+          console.log('✅ Showing receipts from all accessible branches (no branch filter)');
+          hasBookingFilter = true;
+        }
+      } else {
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          bookingFilterConditions.push({ branch: user.branch._id });
+          console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+          hasBookingFilter = true;
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
+        }
+      }
+    } else {
+      if (branchId) {
+        if (branchId === 'all') {
+          console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+        } else {
+          bookingFilterConditions.push({ branch: new mongoose.Types.ObjectId(branchId) });
+          console.log(`✅ Filtering by branch: ${branchId}`);
+          hasBookingFilter = true;
+        }
+      } else {
+        console.log('✅ Showing ALL branches (no branch filter)');
+      }
+    }
+
+    if (bookingType) {
+      bookingFilterConditions.push({ bookingType: bookingType });
+      hasBookingFilter = true;
+    }
+    if (customerType) {
+      bookingFilterConditions.push({ customerType: customerType });
+      hasBookingFilter = true;
+    }
+    if (modelId) {
+      bookingFilterConditions.push({ model: new mongoose.Types.ObjectId(modelId) });
+      hasBookingFilter = true;
+    }
+    if (colorId) {
+      bookingFilterConditions.push({ color: new mongoose.Types.ObjectId(colorId) });
+      hasBookingFilter = true;
+    }
+    if (salesExecutiveId) {
+      bookingFilterConditions.push({ salesExecutive: new mongoose.Types.ObjectId(salesExecutiveId) });
+      hasBookingFilter = true;
+    }
+
+    console.log('Booking Filter Conditions:', bookingFilterConditions);
+
+    // ========== BUILD RECEIPT MATCH CRITERIA ==========
+    let receiptMatch = {};
+    
+    if (startDate || endDate) {
+      receiptMatch.receiptDate = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        receiptMatch.receiptDate.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        receiptMatch.receiptDate.$lte = end;
+      }
+    }
+
+    // MODIFIED: Handle payment mode filter with cash/other logic
+    if (paymentMode && paymentMode !== 'all') {
+      receiptMatch.paymentMode = paymentMode;
+    } else if (cashOtherFilter) {
+      // If cashOtherFilter is provided, don't set paymentMode in receiptMatch
+      // We'll handle it after fetching receipts
+      console.log(`Cash/Other filter applied: ${cashOtherFilter}`);
+    }
+
+    receiptMatch.status = includeCancelled === 'true' ? { $in: ['active', 'cancelled'] } : 'active';
+
+    console.log('Receipt Match Criteria:', JSON.stringify(receiptMatch, null, 2));
+
+    // ========== GET RECEIPTS FIRST (by receiptDate) ==========
+    const receipts = await Receipt.find(receiptMatch)
+      .populate({
+        path: 'createdBy',
+        select: 'name email'
+      })
+      .populate({
+        path: 'receivedBy',
+        select: 'name email'
+      })
+      .sort({ receiptDate: -1, createdAt: -1 })
+      .lean();
+
+    console.log(`Found ${receipts.length} receipts in date range`);
+
+    if (receipts.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No receipts found for the specified date range',
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        },
+        filters: {
+          receipt: receiptMatch
+        }
+      });
+    }
+
+    // ========== GET LEDGER IDs FROM RECEIPTS ==========
+    const ledgerIds = receipts
+      .map(r => r.ledger)
+      .filter(Boolean);
+
+    // ========== GET LEDGERS ==========
+    let ledgerMap = {};
+    if (ledgerIds.length > 0) {
+      const ledgers = await Ledger.find({
+        _id: { $in: ledgerIds }
+      })
+      .populate({
+        path: 'subPaymentModeDetails',
+        select: 'payment_mode name'
+      })
+      .populate({
+        path: 'approvedBy',
+        select: 'name email'
+      })
+      .populate({
+        path: 'receivedByDetails',
+        select: 'name email'
+      })
+      .lean();
+
+      ledgers.forEach(ledger => {
+        ledgerMap[ledger._id.toString()] = ledger;
+      });
+      
+      console.log(`Fetched ${ledgers.length} ledger details`);
+    }
+
+    // ========== GET BOOKING IDs ==========
+    const bookingIds = receipts
+      .map(r => r.booking)
+      .filter(Boolean)
+      .map(id => new mongoose.Types.ObjectId(id));
+
+    // ========== GET BOOKING DETAILS ==========
+    let bookingMap = {};
+    if (bookingIds.length > 0) {
+      const bookings = await Booking.find({
+        _id: { $in: bookingIds }
+      })
+      .populate({
+        path: 'vehicle',
+        select: 'chassisNumber engineNumber'
+      })
+      .populate({
+        path: 'model',
+        select: 'model_name type'  // Added 'type' field from Model schema
+      })
+      .populate({
+        path: 'color',
+        select: 'name'
+      })
+      .populate({
+        path: 'branch',
+        select: 'name address city'
+      })
+      .lean();
+
+      bookings.forEach(booking => {
+        bookingMap[booking._id.toString()] = booking;
+      });
+      
+      console.log(`Fetched ${bookings.length} booking details`);
+    }
+
+    // ========== FILTER RECEIPTS BY BOOKING FILTERS ==========
+    let enrichedReceipts = receipts;
+    
+    if (hasBookingFilter && bookingFilterConditions.length > 0 && bookingIds.length > 0) {
+      const bookingQuery = { 
+        $and: [
+          ...bookingFilterConditions,
+          { _id: { $in: bookingIds } }
+        ]
+      };
+      
+      const matchingBookings = await Booking.find(bookingQuery)
+        .select('_id')
+        .lean();
+      
+      const matchingBookingIds = matchingBookings.map(b => b._id.toString());
+      
+      enrichedReceipts = receipts.filter(receipt => {
+        if (!receipt.booking) return false;
+        return matchingBookingIds.includes(receipt.booking.toString());
+      });
+      
+      console.log(`Filtered to ${enrichedReceipts.length} receipts with matching bookings`);
+    }
+
+    if (receivedBy) {
+      enrichedReceipts = enrichedReceipts.filter(r => 
+        r.receivedBy?._id?.toString() === receivedBy || 
+        r.receivedBy?.toString() === receivedBy
+      );
+    }
+
+    if (createdBy) {
+      enrichedReceipts = enrichedReceipts.filter(r => 
+        r.createdBy?._id?.toString() === createdBy || 
+        r.createdBy?.toString() === createdBy
+      );
+    }
+
+    if (bookingNumber) {
+      enrichedReceipts = enrichedReceipts.filter(r => 
+        r.bookingNumber?.toLowerCase().includes(bookingNumber.toLowerCase())
+      );
+    }
+
+    if (customerId) {
+      enrichedReceipts = enrichedReceipts.filter(r => 
+        r.customer?.custId?.toLowerCase().includes(customerId.toLowerCase())
+      );
+    }
+
+    // NEW: Apply cash/other filter
+    if (cashOtherFilter) {
+      if (cashOtherFilter.toLowerCase() === 'cash') {
+        enrichedReceipts = enrichedReceipts.filter(r => 
+          r.paymentMode?.toLowerCase() === 'cash'
+        );
+        console.log(`Filtered to ${enrichedReceipts.length} CASH receipts`);
+      } else if (cashOtherFilter.toLowerCase() === 'other') {
+        enrichedReceipts = enrichedReceipts.filter(r => 
+          r.paymentMode?.toLowerCase() !== 'cash'
+        );
+        console.log(`Filtered to ${enrichedReceipts.length} OTHER (non-cash) receipts`);
+      }
+    }
+
+    if (enrichedReceipts.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No receipts found after applying filters',
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        },
+        filters: {
+          receipt: receiptMatch,
+          booking: bookingFilterConditions,
+          cashOtherFilter: cashOtherFilter || null
+        }
+      });
+    }
+
+    // ========== APPLY LEDGER STATUS FILTER ==========
+    if (status && status !== 'all') {
+      enrichedReceipts = enrichedReceipts.filter(receipt => {
+        const ledger = receipt.ledger ? ledgerMap[receipt.ledger.toString()] : null;
+        return ledger?.approvalStatus === status;
+      });
+      
+      console.log(`Filtered to ${enrichedReceipts.length} receipts with ledger status: ${status}`);
+    }
+
+    // ========== MERGE RECEIPT, LEDGER AND BOOKING DATA ==========
+    const finalReceipts = enrichedReceipts.map(receipt => {
+      const ledger = receipt.ledger ? ledgerMap[receipt.ledger.toString()] : null;
+      const booking = receipt.booking ? bookingMap[receipt.booking.toString()] : null;
+      
+      let chassisNumber = '';
+      let engineNumber = '';
+      let modelName = '';
+      let modelType = '';  // NEW: For model type (EV, ICE, CSD)
+      
+      if (booking) {
+        chassisNumber = booking.chassisNumber || '';
+        engineNumber = booking.engineNumber || '';
+        
+        if ((!chassisNumber || !engineNumber) && booking.vehicle) {
+          chassisNumber = chassisNumber || booking.vehicle.chassisNumber || '';
+          engineNumber = engineNumber || booking.vehicle.engineNumber || '';
+        }
+        
+        // Extract model name and type from booking
+        if (booking.model) {
+          if (typeof booking.model === 'object') {
+            modelName = booking.model.model_name || '';
+            modelType = booking.model.type || '';  // Get model type (EV, ICE, CSD)
+          } else {
+            modelName = booking.model.toString();
+          }
+        }
+      }
+
+      let customerName = receipt.customer?.name || '';
+      if (!customerName && booking?.customerDetails) {
+        customerName = booking.customerDetails.name || '';
+      }
+      
+      let subPaymentMode = '';
+      if (ledger?.subPaymentModeDetails) {
+        if (Array.isArray(ledger.subPaymentModeDetails) && ledger.subPaymentModeDetails.length > 0) {
+          subPaymentMode = ledger.subPaymentModeDetails[0].payment_mode || ledger.subPaymentModeDetails[0].name || '';
+        } else if (ledger.subPaymentModeDetails && typeof ledger.subPaymentModeDetails === 'object') {
+          subPaymentMode = ledger.subPaymentModeDetails.payment_mode || ledger.subPaymentModeDetails.name || '';
+        }
+      }
+      
+      if (!subPaymentMode && receipt.paymentDetails?.subPaymentMode) {
+        subPaymentMode = receipt.paymentDetails.subPaymentMode.name || receipt.paymentDetails.subPaymentMode.code || '';
+      }
+
+      let approvedByName = '';
+      let approvedAtFormatted = null;
+      
+      if (ledger?.approvedBy) {
+        if (typeof ledger.approvedBy === 'object' && ledger.approvedBy.name) {
+          approvedByName = ledger.approvedBy.name;
+        } else if (typeof ledger.approvedBy === 'object' && ledger.approvedBy.email) {
+          approvedByName = ledger.approvedBy.email;
+        } else {
+          approvedByName = ledger.approvedBy.toString();
+        }
+      }
+      
+      if (ledger?.approvedAt) {
+        approvedAtFormatted = ledger.approvedAt;
+      }
+      
+      // ========== DETERMINE IF THIS IS A REFUND ==========
+      // Check multiple sources to identify refund:
+      // 1. From receipt receiptType field
+      // 2. From receipt paymentMode field
+      // 3. From ledger type field
+      // 4. From receipt paymentDetails refundDetails field
+      const isRefund = (
+        (receipt.receiptType === 'REFUND') ||
+        (receipt.paymentMode === 'Refund') ||
+        (ledger?.type === 'REFUND') ||
+        (receipt.paymentDetails?.refundDetails?.reason)
+      );
+      
+      return {
+        ...receipt,
+        ledger: ledger,
+        bookingDetails: booking,
+        receiptDate: receipt.receiptDate,
+        chassisNumber: chassisNumber,
+        engineNumber: engineNumber,
+        branchName: booking?.branch?.name || '',
+        branchId: booking?.branch?._id?.toString() || '',
+        customerName: customerName,
+        subPaymentMode: subPaymentMode,
+        approvalStatus: ledger?.approvalStatus || 'N/A',
+        approvedBy: approvedByName,
+        approvedById: ledger?.approvedBy?._id || ledger?.approvedBy,
+        approvedAt: approvedAtFormatted,
+        receivedByName: receipt.receivedBy?.name || receipt.receivedBy?.toString() || '',
+        receivedById: receipt.receivedBy?._id || receipt.receivedBy,
+        createdByName: receipt.createdBy?.name || receipt.createdBy?.toString() || '',
+        createdById: receipt.createdBy?._id || receipt.createdBy,
+        receiptType: receipt.receiptType || 'PAYMENT',
+        // Add model name and model type
+        modelName: modelName,
+        modelType: modelType,  // Model type (EV, ICE, CSD)
+        // NEW: Add refund indicator
+        isRefund: isRefund ? 'Yes' : 'No'  // Convert boolean to Yes/No for Excel
+      };
+    });
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      let worksheetName = 'Receipt Report';
+      if (branchId && branchId !== 'all') {
+        const branch = await Branch.findById(branchId).select('name').lean();
+        if (branch?.name) {
+          worksheetName = `${branch.name} Receipt Report`;
+        }
+      } else if (hasAllBranchesAccess && !branchId) {
+        worksheetName = 'All Branches Receipt Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      const columns = [
+        { header: 'S.No', key: 'sno', width: 8 },
+        { header: 'Receipt Number', key: 'receiptNumber', width: 25 },
+        { header: 'Receipt Date', key: 'receiptDate', width: 15 },
+        { header: 'Ledger Status', key: 'ledgerStatus', width: 15 },
+        { header: 'Approved By', key: 'approvedBy', width: 25 },
+        { header: 'Approved Date', key: 'approvedDate', width: 15 },
+        { header: 'Booking Number', key: 'bookingNumber', width: 20 },
+        { header: 'Model Name', key: 'modelName', width: 25 },
+        { header: 'Model Type', key: 'modelType', width: 15 },  // NEW COLUMN for model type
+        { header: 'Branch Name', key: 'branchName', width: 25 },
+        { header: 'Chassis Number', key: 'chassisNumber', width: 25 },
+        { header: 'Engine Number', key: 'engineNumber', width: 25 },
+        { header: 'Payment Mode', key: 'paymentMode', width: 15 },
+        { header: 'Sub Payment Mode', key: 'subPaymentMode', width: 20 },
+        { header: 'Net Amount (₹)', key: 'netAmount', width: 15, style: { numFmt: '#,##0.00' } },
+        { header: 'Customer Name', key: 'customerName', width: 25 },
+        { header: 'Transaction Reference', key: 'transactionReference', width: 25 },
+        { header: 'Received By', key: 'receivedBy', width: 25 },
+        { header: 'Created By', key: 'createdBy', width: 25 },
+        { header: 'Notes', key: 'notes', width: 30 },
+        { header: 'Refund', key: 'isRefund', width: 10 }  // NEW COLUMN for refund indicator
+      ];
+
+      worksheet.columns = columns;
+
+      finalReceipts.forEach((receipt, index) => {
+        const ledger = receipt.ledger || {};
+        
+        const rowData = {
+          sno: index + 1,
+          receiptNumber: receipt.receiptNumber || '',
+          receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('DD/MM/YYYY') : '',
+          ledgerStatus: receipt.approvalStatus,
+          approvedBy: receipt.approvedBy || '',
+          approvedDate: receipt.approvedAt ? moment(receipt.approvedAt).format('DD/MM/YYYY') : '',
+          bookingNumber: receipt.bookingNumber || receipt.bookingDetails?.bookingNumber || '',
+          modelName: receipt.modelName || '',
+          modelType: receipt.modelType || '',  // NEW FIELD
+          branchName: receipt.branchName || '',
+          chassisNumber: receipt.chassisNumber || '',
+          engineNumber: receipt.engineNumber || '',
+          paymentMode: receipt.paymentMode || ledger.paymentMode || '',
+          subPaymentMode: receipt.subPaymentMode || '',
+          netAmount: receipt.netAmount || receipt.amount || ledger.amount || 0,
+          customerName: receipt.customerName || '',
+          transactionReference: receipt.transactionReference || ledger.transactionReference || '',
+          receivedBy: receipt.receivedByName || '',
+          createdBy: receipt.createdByName || '',
+          notes: receipt.notes || ledger.remark || '',
+          isRefund: receipt.isRefund || 'No'  // NEW FIELD: Yes/No
+        };
+
+        worksheet.addRow(rowData);
+      });
+
+      const headerRow = worksheet.getRow(1);
+      headerRow.eachCell((cell) => {
+        cell.font = { bold: true, size: 11 };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFE0E0E0' }
+        };
+      });
+
+      for (let i = 1; i <= finalReceipts.length; i++) {
+        const row = worksheet.getRow(i + 1);
+        if (i % 2 === 0) {
+          row.eachCell((cell) => {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          });
+        }
+      }
+
+      if (worksheet.rowCount > 1) {
+        const lastCol = worksheet.columnCount;
+        let lastColLetter = '';
+        let tempCol = lastCol;
+        while (tempCol > 0) {
+          const remainder = (tempCol - 1) % 26;
+          lastColLetter = String.fromCharCode(65 + remainder) + lastColLetter;
+          tempCol = Math.floor((tempCol - 1) / 26);
+        }
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      const summaryStartRow = worksheet.rowCount + 3;
+      
+      worksheet.mergeCells(`A${summaryStartRow}:D${summaryStartRow}`);
+      const titleCell = worksheet.getCell(`A${summaryStartRow}`);
+      titleCell.value = 'RECEIPT REPORT SUMMARY';
+      titleCell.font = { bold: true, size: 14 };
+      titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+      titleCell.border = {
+        top: { style: 'medium' },
+        left: { style: 'medium' },
+        bottom: { style: 'medium' },
+        right: { style: 'medium' }
+      };
+
+      const totalNetAmount = finalReceipts.reduce((sum, r) => sum + (r.netAmount || r.amount || r.ledger?.amount || 0), 0);
+      const uniqueBookings = [...new Set(finalReceipts.map(r => r.booking?.toString() || r.bookingDetails?._id?.toString()).filter(Boolean))];
+      const uniqueBranches = [...new Set(finalReceipts.map(r => r.branchId).filter(Boolean))];
+      
+      const bankPayments = finalReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Bank').length;
+      const cashPayments = finalReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Cash').length;
+      
+      // NEW: Calculate Other payments count (all non-cash, non-bank)
+      const otherPayments = finalReceipts.filter(r => {
+        const mode = r.paymentMode || r.ledger?.paymentMode;
+        return mode && mode !== 'Cash' && mode !== 'Bank';
+      }).length;
+      
+      const approvedCount = finalReceipts.filter(r => r.approvalStatus === 'Approved').length;
+      const pendingCount = finalReceipts.filter(r => r.approvalStatus === 'Pending').length;
+      const rejectedCount = finalReceipts.filter(r => r.approvalStatus === 'Rejected').length;
+      
+      const vehiclesWithChassis = finalReceipts.filter(r => r.chassisNumber).length;
+      const vehiclesWithEngine = finalReceipts.filter(r => r.engineNumber).length;
+      
+      // Count by model type
+      const evCount = finalReceipts.filter(r => r.modelType === 'EV').length;
+      const iceCount = finalReceipts.filter(r => r.modelType === 'ICE').length;
+      const csdCount = finalReceipts.filter(r => r.modelType === 'CSD').length;
+      
+      // NEW: Count refunds
+      const refundCount = finalReceipts.filter(r => r.isRefund === 'Yes').length;
+      
+      const summaryData = [
+        ['Total Receipts:', finalReceipts.length],
+        ['Unique Bookings:', uniqueBookings.length],
+        ['Unique Branches:', uniqueBranches.length],
+        ['Vehicles with Chassis Number:', vehiclesWithChassis],
+        ['Vehicles with Engine Number:', vehiclesWithEngine],
+        ['EV Models:', evCount],
+        ['ICE Models:', iceCount],
+        ['CSD Models:', csdCount],
+        ['Cash Payments:', cashPayments],
+        ['Bank Payments:', bankPayments],
+        ['Other Payments:', otherPayments],
+        ['Refund Receipts:', refundCount],  // NEW: Refund count only
+        ['Approved Receipts:', approvedCount],
+        ['Pending Receipts:', pendingCount],
+        ['Rejected Receipts:', rejectedCount],
+        ['Total Net Amount:', `₹${totalNetAmount.toFixed(2)}`],
+        ['Average Net Amount per Receipt:', `₹${(totalNetAmount / Math.max(finalReceipts.length, 1)).toFixed(2)}`]
+      ];
+
+      summaryData.forEach(([label, value], index) => {
+        const rowNum = summaryStartRow + 1 + index;
+        
+        const labelCell = worksheet.getCell(`A${rowNum}`);
+        labelCell.value = label;
+        labelCell.font = { bold: true };
+        labelCell.alignment = { horizontal: 'right', vertical: 'middle' };
+        labelCell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        
+        if (value) {
+          worksheet.mergeCells(`B${rowNum}:D${rowNum}`);
+          const valueCell = worksheet.getCell(`B${rowNum}`);
+          valueCell.value = value;
+          valueCell.alignment = { horizontal: 'left', vertical: 'middle' };
+          valueCell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        }
+      });
+
+      const footerRow = summaryStartRow + summaryData.length + 2;
+      worksheet.mergeCells(`A${footerRow}:D${footerRow}`);
+      const footerCell = worksheet.getCell(`A${footerRow}`);
+      footerCell.value = `Report generated on ${moment().format('DD MMM YYYY')} by ${user.name}`;
+      footerCell.font = { italic: true, size: 10 };
+      footerCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      const fileName = `receipt_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      await workbook.xlsx.write(res);
+      return res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedReceipts = finalReceipts.map(receipt => {
+        const ledger = receipt.ledger || {};
+        const booking = receipt.bookingDetails || {};
+        
+        return {
+          receiptNumber: receipt.receiptNumber,
+          receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('YYYY-MM-DD') : null,
+          receiptStatus: receipt.status,
+          ledgerStatus: receipt.approvalStatus,
+          approvedBy: receipt.approvedBy || null,
+          approvedById: receipt.approvedById || null,
+          approvedAt: receipt.approvedAt ? moment(receipt.approvedAt).format('YYYY-MM-DD') : null,
+          receivedBy: receipt.receivedByName,
+          receivedById: receipt.receivedById,
+          createdBy: receipt.createdByName,
+          createdById: receipt.createdById,
+          bookingNumber: receipt.bookingNumber || booking.bookingNumber,
+          modelName: receipt.modelName || '',
+          modelType: receipt.modelType || '',  // NEW FIELD
+          branchName: receipt.branchName,
+          branchId: receipt.branchId,
+          vehicle: {
+            chassisNumber: receipt.chassisNumber,
+            engineNumber: receipt.engineNumber
+          },
+          payment: {
+            mode: receipt.paymentMode || ledger.paymentMode,
+            subPaymentMode: receipt.subPaymentMode,
+            netAmount: receipt.netAmount || receipt.amount || ledger.amount,
+            transactionReference: receipt.transactionReference || ledger.transactionReference
+          },
+          customer: {
+            name: receipt.customerName,
+            custId: receipt.customer?.custId
+          },
+          bookingId: receipt.booking?.toString() || booking._id?.toString(),
+          ledger: ledger._id ? {
+            id: ledger._id,
+            type: ledger.type,
+            approvalStatus: ledger.approvalStatus,
+            amount: ledger.amount
+          } : null,
+          notes: receipt.notes || ledger.remark,
+          // NEW: Add refund indicator
+          isRefund: receipt.isRefund === 'Yes'  // Convert back to boolean for JSON
+        };
+      });
+
+      const uniqueBookings = [...new Set(finalReceipts.map(r => r.booking?.toString() || r.bookingDetails?._id?.toString()).filter(Boolean))];
+      const uniqueBranches = [...new Set(finalReceipts.map(r => r.branchId).filter(Boolean))];
+      const refundCount = finalReceipts.filter(r => r.isRefund === 'Yes').length;
+      
+      const summary = {
+        totalReceipts: finalReceipts.length,
+        uniqueBookings: uniqueBookings.length,
+        uniqueBranches: uniqueBranches.length,
+        vehiclesWithChassis: finalReceipts.filter(r => r.chassisNumber).length,
+        vehiclesWithEngine: finalReceipts.filter(r => r.engineNumber).length,
+        modelTypeBreakdown: {  // NEW: Model type breakdown
+          ev: finalReceipts.filter(r => r.modelType === 'EV').length,
+          ice: finalReceipts.filter(r => r.modelType === 'ICE').length,
+          csd: finalReceipts.filter(r => r.modelType === 'CSD').length
+        },
+        // NEW: Add refund breakdown
+        refundBreakdown: {
+          refunds: refundCount
+          // Non-refunds line removed as requested
+        },
+        totalNetAmount: finalReceipts.reduce((sum, r) => sum + (r.netAmount || r.amount || r.ledger?.amount || 0), 0),
+        paymentModeBreakdown: {
+          cash: finalReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Cash').length,
+          bank: finalReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Bank').length,
+          other: finalReceipts.filter(r => {
+            const mode = r.paymentMode || r.ledger?.paymentMode;
+            return mode && !['Cash', 'Bank'].includes(mode);
+          }).length
+        },
+        approvalStatusBreakdown: {
+          approved: finalReceipts.filter(r => r.approvalStatus === 'Approved').length,
+          pending: finalReceipts.filter(r => r.approvalStatus === 'Pending').length,
+          rejected: finalReceipts.filter(r => r.approvalStatus === 'Rejected').length
+        }
+      };
+
+      res.status(200).json({
+        success: true,
+        count: formattedReceipts.length,
+        summary: summary,
+        data: formattedReceipts,
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null,
+          userName: user.name,
+          userEmail: user.email
+        },
+        filters: {
+          dateRange: { 
+            startDate: startDate || null, 
+            endDate: endDate || null 
+          },
+          booking: bookingFilterConditions,
+          selectedBranch: branchId || null,
+          paymentMode: paymentMode || 'All',
+          cashOtherFilter: cashOtherFilter || null,  // NEW: Show applied cash/other filter
+          ledgerStatus: status || 'All'
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating receipt report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating receipt report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+/**
+ * Generate Stock Report - Current Stock at Branches/Subdealers
+ * @route GET /api/v1/reports/stock/current
+ * @access Private
+ */
+exports.generateCurrentStockReport = async (req, res) => {
+    try {
+      const {
+        branchId,
+        subdealerId,
+        locationType,
+        modelId,
+        colorId,
+        vehicleType,
+        modelType,
+        status,
+        format = 'excel',
+        includeZeroStock = 'false',
+        showAgeAnalysis = 'true'
+      } = req.query;
+  
+      // Build filter conditions
+      const filter = {};
+  
+      // ========== BRANCH ACCESS CONTROL ==========
+      // Get user info from auth middleware
+      const userId = req.user.id;
+      
+      // Fetch user with all necessary data
+      const user = await User.findById(userId)
+        .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+        .populate({
+          path: 'roles',
+          select: 'name isSuperAdmin permissionsCount'
+        })
+        .populate('branch')
+        .populate({
+          path: 'accessibleBranches',
+          model: 'Branch',
+          select: '_id name address city state pincode phone email is_active logo1'
+        })
+        .populate({
+          path: 'assignedSubdealers', // Populate assigned subdealers
+          model: 'Subdealer',
+          select: '_id name firmName type status branch'
+        })
+        .lean();
+  
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: 'User not found'
+        });
+      }
+  
+      console.log(`👤 User: ${user.name} (${user.email})`);
+      console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+      console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+      console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+      
+      // Check user roles
+      const userRoles = user.roles || [];
+      
+      // Extract role names
+      const roleNames = userRoles.map(role => role.name);
+      console.log('User roles:', roleNames);
+      
+      // Check if user is SUPERADMIN
+      const isActualSuperAdmin = roleNames.includes("SUPERADMIN");
+      
+      // Check if user has superadmin flag
+      const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true);
+      
+      // Check if user is ADBDM
+      const isADBDM = roleNames.includes("ADBDM");
+      console.log('Is ADBDM user:', isADBDM);
+      
+      // Get branch access from user
+      const branchAccess = user.branchAccess || 'OWN';
+      
+      // Check if user has all branches access
+      let hasAllBranchesAccess = false;
+      
+      if (isActualSuperAdmin) {
+        hasAllBranchesAccess = true;
+        console.log('✅ User is SUPERADMIN - has access to all branches');
+      } else if (branchAccess === 'ALL') {
+        hasAllBranchesAccess = true;
+        console.log('✅ User has ALL branch access permission');
+      } else if (isSuperAdminFlag) {
+        hasAllBranchesAccess = true;
+        console.log('✅ User is ADMIN/GM - has access to all branches');
+      } else {
+        console.log('ℹ️ User has restricted branch access');
+      }
+  
+      // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+      let availableBranches = [];
+      
+      if (hasAllBranchesAccess) {
+        // User can see all active branches
+        availableBranches = await Branch.find({ is_active: true })
+          .select('_id name address city')
+          .sort({ name: 1 })
+          .lean();
+        console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+      } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+        // User can see only assigned branches
+        availableBranches = user.accessibleBranches.map(branch => ({
+          _id: branch._id,
+          name: branch.name,
+          address: branch.address,
+          city: branch.city
+        })).sort((a, b) => a.name.localeCompare(b.name));
+        console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+      } else if (user.branch) {
+        // User can see only their own branch
+        availableBranches = [{
+          _id: user.branch._id,
+          name: user.branch.name,
+          address: user.branch.address,
+          city: user.branch.city
+        }];
+        console.log('✅ Using only own branch for dropdown');
+      }
+      
+      // Add "All" option for users with multiple branch access
+      if (availableBranches.length > 1) {
+        availableBranches.unshift({
+          _id: 'all',
+          name: 'All Branches',
+          address: '',
+          city: ''
+        });
+        console.log('✅ Added "All Branches" option to dropdown');
+      }
+  
+      // ========== GET AVAILABLE SUBDEALERS FOR DROPDOWN ==========
+      let availableSubdealers = [];
+      
+      if (isADBDM) {
+        // ADBDM users can only see their assigned subdealers
+        if (user.assignedSubdealers && user.assignedSubdealers.length > 0) {
+          availableSubdealers = user.assignedSubdealers.map(subdealer => ({
+            _id: subdealer._id,
+            name: subdealer.firmName || subdealer.name,
+            type: subdealer.type,
+            status: subdealer.status,
+            branch: subdealer.branch
+          })).sort((a, b) => a.name.localeCompare(b.name));
+          console.log(`ADBDM user has ${availableSubdealers.length} assigned subdealers`);
+        } else {
+          console.log('ADBDM user has no assigned subdealers');
+        }
+      } else if (hasAllBranchesAccess) {
+        // Superadmin/GM can see all active subdealers
+        const subdealers = await Subdealer.find({ status: 'active' })
+          .select('_id name firmName type status branch')
+          .sort({ name: 1 })
+          .lean();
+        
+        availableSubdealers = subdealers.map(sub => ({
+          _id: sub._id,
+          name: sub.firmName || sub.name,
+          type: sub.type,
+          status: sub.status,
+          branch: sub.branch
+        }));
+        console.log(`Fetched ${availableSubdealers.length} total subdealers for dropdown`);
+      } else if (user.branch) {
+        // Regular users can see subdealers assigned to their branch
+        const subdealers = await Subdealer.find({ 
+          branch: user.branch._id,
+          status: 'active'
+        })
+          .select('_id name firmName type status branch')
+          .sort({ name: 1 })
+          .lean();
+        
+        availableSubdealers = subdealers.map(sub => ({
+          _id: sub._id,
+          name: sub.firmName || sub.name,
+          type: sub.type,
+          status: sub.status,
+          branch: sub.branch
+        }));
+        console.log(`Fetched ${availableSubdealers.length} subdealers for branch ${user.branch.name}`);
+      }
+      
+      // Add "All" option for subdealers if multiple
+      if (availableSubdealers.length > 1) {
+        availableSubdealers.unshift({
+          _id: 'all',
+          name: 'All Subdealers',
+          type: '',
+          status: '',
+          branch: null
+        });
+        console.log('Added "All Subdealers" option to subdealer dropdown');
+      }
+  
+      // ========== APPLY BRANCH FILTER ==========
+      // First apply branch filter for locationType = 'branch'
+      if (locationType === 'branch' || !locationType) {
+        if (!hasAllBranchesAccess) {
+          if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+            // User has access to specific assigned branches
+            const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+            console.log(`User has access to ${accessibleBranchIds.length} assigned branches`);
+            
+            // If branchId is provided in query, check if it's in accessible branches
+            if (branchId) {
+              if (branchId === 'all') {
+                // User selected "All" - show all accessible branches
+                filter.unloadLocation = { $in: accessibleBranchIds };
+                console.log('✅ Showing vehicles from all accessible branches');
+              } else {
+                const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+                const hasAccess = accessibleBranchIds.some(branchId => 
+                  branchId.toString() === requestedBranchId.toString()
+                );
+                
+                if (!hasAccess) {
+                  return res.status(403).json({
+                    success: false,
+                    message: 'You do not have access to this branch'
+                  });
+                }
+                filter.unloadLocation = requestedBranchId;
+                console.log(`✅ Filtering vehicles by branch: ${branchId}`);
+              }
+            } else {
+              // If no branchId specified, show vehicles from all accessible branches
+              filter.unloadLocation = { $in: accessibleBranchIds };
+              console.log('✅ Showing vehicles from all accessible branches (no branch filter)');
+            }
+          } else {
+            // User has only OWN branch access
+            console.log('User has only OWN branch access');
+            if (user.branch && user.branch._id) {
+              filter.unloadLocation = user.branch._id;
+              console.log(`✅ Filtering vehicles by own branch: ${user.branch._id}`);
+            } else {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to any branch'
+              });
+            }
+          }
+        } else {
+          // User has all branches permission
+          if (branchId) {
+            if (branchId === 'all') {
+              // Show vehicles from all branches (no filter)
+              console.log('✅ Showing vehicles from ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+            } else {
+              filter.unloadLocation = new mongoose.Types.ObjectId(branchId);
+              console.log(`✅ Filtering vehicles by branch: ${branchId}`);
+            }
+          } else {
+            // If no branchId specified, show vehicles from all branches
+            console.log('✅ Showing vehicles from ALL branches (no branch filter)');
+          }
+        }
+      }
+  
+      // ========== APPLY SUBDEALER FILTER ==========
+      // Handle subdealer filtering
+      if (locationType === 'subdealer') {
+        console.log('Processing subdealer location filter...');
+        
+        if (isADBDM) {
+          // ADBDM users can only see their assigned subdealers
+          if (user.assignedSubdealers && user.assignedSubdealers.length > 0) {
+            const assignedSubdealerIds = user.assignedSubdealers.map(sub => sub._id);
+            
+            if (subdealerId) {
+              if (subdealerId === 'all') {
+                // Show vehicles from all assigned subdealers
+                filter.subdealerLocation = { $in: assignedSubdealerIds };
+                filter.locationType = 'subdealer';
+                console.log(`✅ ADBDM: Showing vehicles from all ${assignedSubdealerIds.length} assigned subdealers`);
+              } else {
+                const requestedSubdealerId = new mongoose.Types.ObjectId(subdealerId);
+                const hasAccess = assignedSubdealerIds.some(sId => 
+                  sId.toString() === requestedSubdealerId.toString()
+                );
+                
+                if (!hasAccess) {
+                  return res.status(403).json({
+                    success: false,
+                    message: 'You do not have access to this subdealer'
+                  });
+                }
+                filter.subdealerLocation = requestedSubdealerId;
+                filter.locationType = 'subdealer';
+                console.log(`✅ ADBDM: Filtering vehicles by subdealer: ${subdealerId}`);
+              }
+            } else {
+              // If no subdealerId specified, show vehicles from all assigned subdealers
+              filter.subdealerLocation = { $in: assignedSubdealerIds };
+              filter.locationType = 'subdealer';
+              console.log(`✅ ADBDM: Showing vehicles from all assigned subdealers (no filter)`);
+            }
+          } else {
+            // ADBDM with no assigned subdealers - return empty result
+            console.log('⚠️ ADBDM user has no assigned subdealers');
+            if (format === 'excel') {
+              const workbook = new ExcelJS.Workbook();
+              const worksheet = workbook.addWorksheet('Stock Report');
+              
+              const fileName = `stock_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+              
+              res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+              res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+              
+              await workbook.xlsx.write(res);
+              res.end();
+              return;
+            } else {
+              return res.status(200).json({
+                success: true,
+                count: 0,
+                data: [],
+                availableBranches: availableBranches,
+                availableSubdealers: availableSubdealers,
+                userAccessInfo: {
+                  hasAllBranchesAccess: hasAllBranchesAccess,
+                  branchAccess: branchAccess,
+                  isADBDM: isADBDM,
+                  accessibleBranchesCount: user.accessibleBranches?.length || 0,
+                  assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+                  userBranch: user.branch ? {
+                    _id: user.branch._id,
+                    name: user.branch.name
+                  } : null
+                },
+                filters: {
+                  branchId: branchId,
+                  subdealerId: subdealerId,
+                  locationType: locationType,
+                  modelId: modelId,
+                  colorId: colorId,
+                  vehicleType: vehicleType,
+                  modelType: modelType,
+                  status: status
+                }
+              });
+            }
+          }
+        } else if (hasAllBranchesAccess) {
+          // Superadmin/GM can see all subdealers
+          if (subdealerId) {
+            if (subdealerId === 'all') {
+              // Show vehicles from all subdealers
+              console.log('✅ Superadmin: Showing vehicles from ALL subdealers');
+            } else {
+              filter.subdealerLocation = new mongoose.Types.ObjectId(subdealerId);
+              console.log(`✅ Filtering vehicles by subdealer: ${subdealerId}`);
+            }
+            filter.locationType = 'subdealer';
+          }
+        } else if (user.branch) {
+          // Regular users can only see subdealers from their branch
+          if (subdealerId && subdealerId !== 'all') {
+            // Verify the subdealer belongs to user's branch
+            const subdealer = await Subdealer.findById(subdealerId);
+            if (subdealer && subdealer.branch.toString() === user.branch._id.toString()) {
+              filter.subdealerLocation = new mongoose.Types.ObjectId(subdealerId);
+              filter.locationType = 'subdealer';
+              console.log(`✅ Filtering vehicles by subdealer from own branch: ${subdealerId}`);
+            } else {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this subdealer'
+              });
+            }
+          } else if (subdealerId === 'all') {
+            // Show vehicles from all subdealers of the user's branch
+            const branchSubdealers = await Subdealer.find({ 
+              branch: user.branch._id,
+              status: 'active'
+            }).select('_id');
+            
+            const branchSubdealerIds = branchSubdealers.map(sub => sub._id);
+            if (branchSubdealerIds.length > 0) {
+              filter.subdealerLocation = { $in: branchSubdealerIds };
+              filter.locationType = 'subdealer';
+              console.log(`✅ Showing vehicles from all ${branchSubdealerIds.length} subdealers of branch`);
+            } else {
+              console.log('No subdealers found for this branch');
+              if (format === 'excel') {
+                const workbook = new ExcelJS.Workbook();
+                const worksheet = workbook.addWorksheet('Stock Report');
+                
+                const fileName = `stock_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+                
+                res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+                
+                await workbook.xlsx.write(res);
+                res.end();
+                return;
+              } else {
+                return res.status(200).json({
+                  success: true,
+                  count: 0,
+                  data: [],
+                  availableBranches: availableBranches,
+                  availableSubdealers: availableSubdealers,
+                  userAccessInfo: {
+                    hasAllBranchesAccess: hasAllBranchesAccess,
+                    branchAccess: branchAccess,
+                    isADBDM: isADBDM,
+                    accessibleBranchesCount: user.accessibleBranches?.length || 0,
+                    assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+                    userBranch: user.branch ? {
+                      _id: user.branch._id,
+                      name: user.branch.name
+                    } : null
+                  },
+                  filters: {
+                    branchId: branchId,
+                    subdealerId: subdealerId,
+                    locationType: locationType,
+                    modelId: modelId,
+                    colorId: colorId,
+                    vehicleType: vehicleType,
+                    modelType: modelType,
+                    status: status
+                  }
+                });
+              }
+            }
+          }
+        }
+      }
+  
+      // ========== OTHER FILTERS ==========
+      // Status filter - default to in_stock vehicles
+      if (status) {
+        filter.status = status;
+      } else {
+        filter.status = 'in_stock';
+      }
+  
+      // Additional filters
+      if (modelId) {
+        filter.model = new mongoose.Types.ObjectId(modelId);
+      }
+      if (colorId) {
+        filter['color.id'] = new mongoose.Types.ObjectId(colorId);
+      }
+      if (vehicleType) {
+        filter.type = vehicleType.toUpperCase();
+      }
+  
+      console.log('Stock Report Filter:', JSON.stringify(filter, null, 2));
+  
+      // ========== FETCH VEHICLES ==========
+      // First, create the vehicle query
+      let vehiclesQuery = Vehicle.find(filter)
+        .populate('model', 'model_name manufacturer variant fuel_type type model_type')
+        .populate('colors', 'name hex_code')
+        .populate('color.id', 'name hex_code')
+        .populate('unloadLocation', 'name address city state')
+        .populate('subdealerLocation', 'name location rateOfInterest type branch')
+        .populate('addedBy', 'name email')
+        .populate('lastUpdatedBy', 'name email')
+        .sort({ inwardDate: 1, chassisNumber: 1 });
+  
+      // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+      let modelTypeFilterApplied = false;
+      if (modelType) {
+        console.log(`Applying model type filter: ${modelType}`);
+        
+        // Get all model IDs of the specified type
+        const models = await mongoose.model('Model').find({ 
+          $or: [
+            { model_type: modelType.toUpperCase() },
+            { type: modelType.toUpperCase() }
+          ]
+        }).select('_id').lean();
+        
+        const modelIds = models.map(model => model._id);
+        console.log(`Found ${modelIds.length} models of type ${modelType}:`, modelIds);
+        
+        if (modelIds.length > 0) {
+          // Add model filter to the query - IMPORTANT: Assign back to vehiclesQuery
+          vehiclesQuery = vehiclesQuery.where('model').in(modelIds);
+          modelTypeFilterApplied = true;
+          console.log(`✅ Filtering by ${modelIds.length} ${modelType} models`);
+        } else {
+          // No models of this type found, return empty result
+          console.log(`❌ No ${modelType} models found in Model collection`);
+          if (format === 'excel') {
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Stock Report');
+            
+            const fileName = `stock_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+            
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+            
+            await workbook.xlsx.write(res);
+            res.end();
+            return;
+          } else {
+            return res.status(200).json({
+              success: true,
+              count: 0,
+              summary: {
+                totalVehicles: 0,
+                branchDistribution: {},
+                locationTypeDistribution: {},
+                modelDistribution: {},
+                modelTypeDistribution: {},
+                ageDistribution: {},
+                averageAge: 0,
+                gmApprovalRequired: 0,
+                under10DaysCluster: 0
+              },
+              data: [],
+              availableBranches: availableBranches,
+              availableSubdealers: availableSubdealers,
+              userAccessInfo: {
+                hasAllBranchesAccess: hasAllBranchesAccess,
+                branchAccess: branchAccess,
+                isADBDM: isADBDM,
+                accessibleBranchesCount: user.accessibleBranches?.length || 0,
+                assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+                userBranch: user.branch ? {
+                  _id: user.branch._id,
+                  name: user.branch.name
+                } : null
+              },
+              filters: {
+                branchId: branchId,
+                subdealerId: subdealerId,
+                locationType: locationType,
+                modelId: modelId,
+                colorId: colorId,
+                vehicleType: vehicleType,
+                modelType: modelType,
+                status: status,
+                chassisAllocated: false
+              }
+            });
+          }
+        }
+      }
+      
+      // Execute the query
+      console.log('Executing vehicle query...');
+      const vehicles = await vehiclesQuery.lean();
+      console.log(`Found ${vehicles.length} vehicles in stock`);
+  
+      // Apply post-query filtering for model type if needed (alternative approach)
+      let finalVehicles = vehicles;
+      if (modelType && !modelTypeFilterApplied) {
+        console.log('Applying post-query model type filter...');
+        finalVehicles = vehicles.filter(vehicle => {
+          const vehicleModelType = vehicle.model?.model_type || vehicle.model?.type || '';
+          return vehicleModelType.toUpperCase() === modelType.toUpperCase();
+        });
+        console.log(`After model type filter: ${finalVehicles.length} vehicles`);
+      } else {
+        finalVehicles = vehicles;
+      }
+  
+      if (finalVehicles.length === 0 && includeZeroStock === 'false') {
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Stock Report');
+          
+          const fileName = `stock_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            summary: {
+              totalVehicles: 0,
+              branchDistribution: {},
+              locationTypeDistribution: {},
+              modelDistribution: {},
+              modelTypeDistribution: {},
+              ageDistribution: {},
+              averageAge: 0,
+              gmApprovalRequired: 0,
+              under10DaysCluster: 0
+            },
+            data: [],
+            availableBranches: availableBranches,
+            availableSubdealers: availableSubdealers,
+            userAccessInfo: {
+              hasAllBranchesAccess: hasAllBranchesAccess,
+              branchAccess: branchAccess,
+              isADBDM: isADBDM,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null
+            },
+            filters: {
+              branchId: branchId,
+              subdealerId: subdealerId,
+              locationType: locationType,
+              modelId: modelId,
+              colorId: colorId,
+              vehicleType: vehicleType,
+              modelType: modelType,
+              status: status,
+              chassisAllocated: false
+            }
+          });
+        }
+      }
+  
+      // Generate Excel report
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        
+        // Create worksheet name
+        let worksheetName = 'Current Stock Report';
+        if (locationType === 'subdealer' && subdealerId && subdealerId !== 'all') {
+          const subdealer = await Subdealer.findById(subdealerId);
+          if (subdealer) {
+            worksheetName = `${subdealer.firmName || subdealer.name} Stock Report`;
+          }
+        } else if (filter.unloadLocation && typeof filter.unloadLocation === 'object' && !filter.unloadLocation.$in) {
+          const firstVehicle = finalVehicles.find(v => v.unloadLocation);
+          if (firstVehicle?.unloadLocation?.name) {
+            worksheetName = `${firstVehicle.unloadLocation.name} Stock Report`;
+          }
+        } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+          worksheetName = 'All Branches Stock Report';
+        }
+        
+        const worksheet = workbook.addWorksheet(worksheetName.substring(0, 31));
+  
+        // Define column headers
+        const columns = [
+          { header: 'S.No', key: 'sno', width: 8 },
+          { header: 'Model Type', key: 'modelType', width: 12 },
+          { header: 'Location', key: 'locationName', width: 25 },
+          { header: 'Location Type', key: 'locationType', width: 15 },
+          { header: 'Chassis Number', key: 'chassisNumber', width: 20 },
+          { header: 'Engine Number', key: 'engineNumber', width: 18 },
+          { header: 'Model', key: 'model', width: 25 },
+          { header: 'Color', key: 'primaryColor', width: 15 },
+          { header: 'Inward Date', key: 'inwardDate', width: 15 },
+          { header: 'Age (Days)', key: 'ageInDays', width: 12 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+  
+        worksheet.columns = columns;
+  
+        // Add data rows
+        finalVehicles.forEach((vehicle, index) => {
+          // Get location details
+          let locationName = '';
+          let locationTypeValue = '';
+          
+          if (vehicle.locationType === 'branch' && vehicle.unloadLocation) {
+            locationName = vehicle.unloadLocation.name || '';
+            locationTypeValue = 'Branch';
+          } else if (vehicle.locationType === 'subdealer' && vehicle.subdealerLocation) {
+            locationName = vehicle.subdealerLocation.name || '';
+            locationTypeValue = 'Subdealer';
+          } else if (vehicle.locationType === 'yard') {
+            locationName = 'Yard';
+            locationTypeValue = 'Yard';
+          }
+  
+          // Get color information
+          const primaryColor = vehicle.color?.id?.name || vehicle.color?.name || '';
+  
+          // Get model type (EV/ICE)
+          const modelTypeValue = vehicle.model?.model_type || vehicle.model?.type || '';
+  
+          // Prepare row data
+          const rowData = {
+            sno: index + 1,
+            modelType: modelTypeValue,
+            locationName: locationName,
+            locationType: locationTypeValue,
+            chassisNumber: vehicle.chassisNumber || '',
+            engineNumber: vehicle.engineNumber || '',
+            model: vehicle.model?.model_name || vehicle.modelName || '',
+            primaryColor: primaryColor,
+            inwardDate: vehicle.inwardDate ? moment(vehicle.inwardDate).format('DD/MM/YYYY') : '',
+            ageInDays: vehicle.ageInDays || 0,
+            status: vehicle.status || ''
+          };
+  
+          worksheet.addRow(rowData);
+        });
+  
+        // Style the header row
+        const headerRow = worksheet.getRow(1);
+        headerRow.eachCell((cell) => {
+          cell.font = {
+            bold: true,
+            color: { argb: 'FFFFFFFF' },
+            size: 11
+          };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = {
+            vertical: 'middle',
+            horizontal: 'center',
+            wrapText: true
+          };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Format all rows
+        for (let i = 1; i <= finalVehicles.length; i++) {
+          const row = worksheet.getRow(i + 1);
+          
+          if (i % 2 === 0) {
+            row.eachCell((cell) => {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            });
+          }
+        }
+  
+        // Auto-filter
+        if (worksheet.rowCount > 1) {
+          const lastCol = worksheet.columnCount;
+          let lastColLetter = '';
+          let tempCol = lastCol;
+          while (tempCol > 0) {
+            const remainder = (tempCol - 1) % 26;
+            lastColLetter = String.fromCharCode(65 + remainder) + lastColLetter;
+            tempCol = Math.floor((tempCol - 1) / 26);
+          }
+          worksheet.autoFilter = {
+            from: 'A1',
+            to: `${lastColLetter}${worksheet.rowCount}`
+          };
+        }
+  
+        // Freeze header row
+        worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+  
+        // ========== SUMMARY SHEET ==========
+        const summarySheet = workbook.addWorksheet('Summary');
+  
+        // Summary Title
+        summarySheet.mergeCells('A1:D1');
+        const titleCell = summarySheet.getCell('A1');
+        titleCell.value = 'STOCK SUMMARY REPORT';
+        titleCell.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+        titleCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' }
+        };
+        titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+        // Report Info
+        const infoRows = [
+          ['Report Generated:', moment().format('DD MMM YYYY HH:mm:ss')],
+          ['Total Vehicles:', finalVehicles.length],
+          ['Branch Filter:', branchId || (hasAllBranchesAccess ? 'All Branches' : 'User Accessible Branches')],
+          ['Subdealer Filter:', subdealerId || (locationType === 'subdealer' ? 'All Subdealers' : 'Not Applied')],
+          ['Location Type Filter:', locationType || 'All'],
+          ['Model Type Filter:', modelType || 'All'],
+          ['Status Filter:', status || 'in_stock'],
+          ['Include Zero Stock:', includeZeroStock === 'true' ? 'Yes' : 'No']
+        ];
+  
+        infoRows.forEach(([label, value], index) => {
+          const rowNum = index + 3;
+          summarySheet.getCell(`A${rowNum}`).value = label;
+          summarySheet.getCell(`B${rowNum}`).value = value;
+          summarySheet.getCell(`B${rowNum}`).font = { bold: true };
+        });
+  
+        // ========== BRANCH-WISE SUMMARY ==========
+        const branchStartRow = infoRows.length + 5;
+  
+        // Branch Summary Title
+        summarySheet.mergeCells(`A${branchStartRow}:C${branchStartRow}`);
+        const branchTitleCell = summarySheet.getCell(`A${branchStartRow}`);
+        branchTitleCell.value = 'BRANCH-WISE STOCK SUMMARY';
+        branchTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+        branchTitleCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        branchTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+        // Branch Summary Headers
+        const branchHeaders = ['Branch/Subdealer Name', 'Location Type', 'Vehicle Count'];
+        const branchHeaderRow = branchStartRow + 1;
+        branchHeaders.forEach((header, colIndex) => {
+          const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${branchHeaderRow}`);
+          cell.value = header;
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Group vehicles by location
+        const locationSummary = finalVehicles.reduce((acc, vehicle) => {
+          let locationKey = '';
+          let locationName = '';
+          let locationTypeValue = '';
+          
+          if (vehicle.locationType === 'branch' && vehicle.unloadLocation) {
+            locationKey = `BRANCH_${vehicle.unloadLocation._id}`;
+            locationName = vehicle.unloadLocation.name || 'Unknown Branch';
+            locationTypeValue = 'Branch';
+          } else if (vehicle.locationType === 'subdealer' && vehicle.subdealerLocation) {
+            locationKey = `SUBDEALER_${vehicle.subdealerLocation._id}`;
+            locationName = vehicle.subdealerLocation.name || 'Unknown Subdealer';
+            locationTypeValue = 'Subdealer';
+          } else {
+            locationKey = 'UNKNOWN';
+            locationName = 'Unknown Location';
+            locationTypeValue = 'Unknown';
+          }
+  
+          if (!acc[locationKey]) {
+            acc[locationKey] = {
+              locationName: locationName,
+              locationType: locationTypeValue,
+              count: 0
+            };
+          }
+          
+          acc[locationKey].count++;
+          return acc;
+        }, {});
+  
+        // Add location summary data
+        Object.values(locationSummary).forEach((location, index) => {
+          const rowNum = branchHeaderRow + 1 + index;
+          const rowData = [
+            location.locationName,
+            location.locationType,
+            location.count
+          ];
+          
+          rowData.forEach((value, colIndex) => {
+            const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${rowNum}`);
+            cell.value = value;
+            cell.alignment = { 
+              horizontal: colIndex === 2 ? 'right' : 'left',
+              vertical: 'middle'
+            };
+            cell.border = {
+              top: { style: 'thin' },
+              left: { style: 'thin' },
+              bottom: { style: 'thin' },
+              right: { style: 'thin' }
+            };
+            
+            if (index % 2 === 0) {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            }
+          });
+        });
+  
+        // ========== MODEL TYPE SUMMARY ==========
+        const modelTypeStartRow = branchHeaderRow + Object.keys(locationSummary).length + 3;
+  
+        // Model Type Summary Title
+        summarySheet.mergeCells(`A${modelTypeStartRow}:C${modelTypeStartRow}`);
+        const modelTypeTitleCell = summarySheet.getCell(`A${modelTypeStartRow}`);
+        modelTypeTitleCell.value = 'MODEL TYPE SUMMARY';
+        modelTypeTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+        modelTypeTitleCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        modelTypeTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+        // Model Type Summary Headers
+        const modelTypeHeaders = ['Model Type', 'Vehicle Type', 'Count'];
+        const modelTypeHeaderRow = modelTypeStartRow + 1;
+        modelTypeHeaders.forEach((header, colIndex) => {
+          const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${modelTypeHeaderRow}`);
+          cell.value = header;
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Group vehicles by model type
+        const modelTypeSummary = finalVehicles.reduce((acc, vehicle) => {
+          const modelTypeValue = vehicle.model?.model_type || vehicle.model?.type || 'UNKNOWN';
+          const vehicleTypeValue = vehicle.type || '';
+          
+          if (!acc[modelTypeValue]) {
+            acc[modelTypeValue] = {
+              modelType: modelTypeValue,
+              vehicleType: vehicleTypeValue,
+              count: 0
+            };
+          }
+          
+          acc[modelTypeValue].count++;
+          return acc;
+        }, {});
+  
+        // Add model type summary data
+        Object.values(modelTypeSummary).forEach((modelTypeData, index) => {
+          const rowNum = modelTypeHeaderRow + 1 + index;
+          
+          const rowData = [
+            modelTypeData.modelType,
+            modelTypeData.vehicleType,
+            modelTypeData.count
+          ];
+          
+          rowData.forEach((value, colIndex) => {
+            const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${rowNum}`);
+            cell.value = value;
+            cell.alignment = { 
+              horizontal: colIndex === 2 ? 'right' : 'left',
+              vertical: 'middle'
+            };
+            cell.border = {
+              top: { style: 'thin' },
+              left: { style: 'thin' },
+              bottom: { style: 'thin' },
+              right: { style: 'thin' }
+            };
+            
+            if (index % 2 === 0) {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            }
+          });
+        });
+  
+        // ========== AGE ANALYSIS SUMMARY ==========
+        const ageStartRow = modelTypeHeaderRow + Object.keys(modelTypeSummary).length + 3;
+  
+        // Age Analysis Title
+        summarySheet.mergeCells(`A${ageStartRow}:C${ageStartRow}`);
+        const ageTitleCell = summarySheet.getCell(`A${ageStartRow}`);
+        ageTitleCell.value = 'AGE ANALYSIS SUMMARY';
+        ageTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+        ageTitleCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        ageTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+        // Age Analysis Headers
+        const ageHeaders = ['Age Range', 'Vehicle Count', 'Percentage'];
+        const ageHeaderRow = ageStartRow + 1;
+        ageHeaders.forEach((header, colIndex) => {
+          const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${ageHeaderRow}`);
+          cell.value = header;
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Calculate age distribution
+        const ageGroups = {
+          '0-5 days': finalVehicles.filter(v => (v.ageInDays || 0) <= 5).length,
+          '6-10 days': finalVehicles.filter(v => (v.ageInDays || 0) > 5 && (v.ageInDays || 0) <= 10).length,
+          '11-30 days': finalVehicles.filter(v => (v.ageInDays || 0) > 10 && (v.ageInDays || 0) <= 30).length,
+          '31-60 days': finalVehicles.filter(v => (v.ageInDays || 0) > 30 && (v.ageInDays || 0) <= 60).length,
+          '60+ days': finalVehicles.filter(v => (v.ageInDays || 0) > 60).length
+        };
+  
+        // Add age analysis data
+        Object.entries(ageGroups).forEach(([range, count], index) => {
+          const rowNum = ageHeaderRow + 1 + index;
+          const percentage = finalVehicles.length > 0 ? ((count / finalVehicles.length) * 100).toFixed(1) + '%' : '0%';
+          
+          const rowData = [range, count, percentage];
+          
+          rowData.forEach((value, colIndex) => {
+            const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${rowNum}`);
+            cell.value = value;
+            cell.alignment = { 
+              horizontal: colIndex === 1 ? 'right' : 'left',
+              vertical: 'middle'
+            };
+            cell.border = {
+              top: { style: 'thin' },
+              left: { style: 'thin' },
+              bottom: { style: 'thin' },
+              right: { style: 'thin' }
+            };
+            
+            if (index % 2 === 0) {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            }
+          });
+        });
+  
+        // ========== MODEL-WISE SUMMARY ==========
+        const modelStartRow = ageHeaderRow + Object.keys(ageGroups).length + 3;
+  
+        // Model Summary Title
+        summarySheet.mergeCells(`A${modelStartRow}:C${modelStartRow}`);
+        const modelTitleCell = summarySheet.getCell(`A${modelStartRow}`);
+        modelTitleCell.value = 'MODEL-WISE STOCK SUMMARY';
+        modelTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+        modelTitleCell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        modelTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  
+        // Model Summary Headers
+        const modelHeaders = ['Model Name', 'Model Type', 'Count'];
+        const modelHeaderRow = modelStartRow + 1;
+        modelHeaders.forEach((header, colIndex) => {
+          const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${modelHeaderRow}`);
+          cell.value = header;
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4F81BD' }
+          };
+          cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+  
+        // Group vehicles by model
+        const modelSummary = finalVehicles.reduce((acc, vehicle) => {
+          const modelKey = vehicle.model?._id || 'unknown';
+          const modelName = vehicle.model?.model_name || 'Unknown Model';
+          const modelTypeValue = vehicle.model?.model_type || vehicle.model?.type || '';
+          
+          if (!acc[modelKey]) {
+            acc[modelKey] = {
+              modelName: modelName,
+              modelType: modelTypeValue,
+              count: 0
+            };
+          }
+          
+          acc[modelKey].count++;
+          return acc;
+        }, {});
+        // Add model summary data
+        Object.values(modelSummary).forEach((model, index) => {
+          const rowNum = modelHeaderRow + 1 + index;
+          const rowData = [
+            model.modelName,
+            model.modelType,
+            model.count
+          ];
+          rowData.forEach((value, colIndex) => {
+            const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${rowNum}`);
+            cell.value = value;
+            cell.alignment = { 
+              horizontal: colIndex === 2 ? 'right' : 'left',
+              vertical: 'middle'
+            };
+            cell.border = {
+              top: { style: 'thin' },
+              left: { style: 'thin' },
+              bottom: { style: 'thin' },
+              right: { style: 'thin' }
+            };
+            
+            if (index % 2 === 0) {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFF2F2F2' }
+              };
+            }
+          });
+        });
+  
+        // Set response headers
+        const fileName = `stock_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  
+        await workbook.xlsx.write(res);
+        return res.end();
+  
+      } else {
+        // ========== RETURN JSON FORMAT WITH DROPDOWN DATA ==========
+        const formattedVehicles = finalVehicles.map(vehicle => {
+          // Get model type
+          const modelTypeValue = vehicle.model?.model_type || vehicle.model?.type || '';
+  
+          // Get location details
+          let locationName = '';
+          let locationTypeValue = '';
+          
+          if (vehicle.locationType === 'branch' && vehicle.unloadLocation) {
+            locationName = vehicle.unloadLocation.name || '';
+            locationTypeValue = 'Branch';
+          } else if (vehicle.locationType === 'subdealer' && vehicle.subdealerLocation) {
+            locationName = vehicle.subdealerLocation.name || '';
+            locationTypeValue = 'Subdealer';
+          } else if (vehicle.locationType === 'yard') {
+            locationName = 'Yard';
+            locationTypeValue = 'Yard';
+          }
+  
+          return {
+            chassisNumber: vehicle.chassisNumber,
+            engineNumber: vehicle.engineNumber,
+            model: vehicle.model?.model_name || vehicle.modelName,
+            modelType: modelTypeValue,
+            vehicleType: vehicle.type,
+            color: vehicle.color?.id?.name || vehicle.color?.name,
+            location: {
+              type: locationTypeValue,
+              name: locationName,
+              id: vehicle.locationType === 'branch' ? vehicle.unloadLocation?._id : vehicle.subdealerLocation?._id
+            },
+            inwardDate: vehicle.inwardDate,
+            ageInDays: vehicle.ageInDays || 0,
+            status: vehicle.status,
+            fifoRank: vehicle.fifoRank,
+            requiresGmApproval: vehicle.requiresGmApproval,
+            isUnder10DaysCluster: vehicle.isUnder10DaysCluster
+          };
+        });
+  
+        // Calculate summary statistics
+        const summary = {
+          totalVehicles: finalVehicles.length,
+          branchDistribution: finalVehicles.reduce((acc, v) => {
+            let branchName = '';
+            if (v.locationType === 'branch' && v.unloadLocation) {
+              branchName = v.unloadLocation.name;
+            } else if (v.locationType === 'subdealer' && v.subdealerLocation) {
+              branchName = v.subdealerLocation.name;
+            } else {
+              branchName = 'Other';
+            }
+            if (branchName) {
+              acc[branchName] = (acc[branchName] || 0) + 1;
+            }
+            return acc;
+          }, {}),
+          locationTypeDistribution: finalVehicles.reduce((acc, v) => {
+            const type = v.locationType || 'unknown';
+            acc[type] = (acc[type] || 0) + 1;
+            return acc;
+          }, {}),
+          modelDistribution: finalVehicles.reduce((acc, v) => {
+            const model = v.model?.model_name || 'Unknown';
+            acc[model] = (acc[model] || 0) + 1;
+            return acc;
+          }, {}),
+          modelTypeDistribution: finalVehicles.reduce((acc, v) => {
+            const modelTypeValue = v.model?.model_type || v.model?.type || 'Unknown';
+            acc[modelTypeValue] = (acc[modelTypeValue] || 0) + 1;
+            return acc;
+          }, {}),
+          ageDistribution: finalVehicles.reduce((acc, v) => {
+            const age = v.ageInDays || 0;
+            let range = '';
+            if (age <= 5) range = '0-5 days';
+            else if (age <= 10) range = '6-10 days';
+            else if (age <= 30) range = '11-30 days';
+            else if (age <= 60) range = '31-60 days';
+            else range = '60+ days';
+            
+            acc[range] = (acc[range] || 0) + 1;
+            return acc;
+          }, {}),
+          averageAge: finalVehicles.length > 0 
+            ? Math.round(finalVehicles.reduce((sum, v) => sum + (v.ageInDays || 0), 0) / finalVehicles.length * 10) / 10
+            : 0,
+          gmApprovalRequired: finalVehicles.filter(v => v.requiresGmApproval === true).length,
+          under10DaysCluster: finalVehicles.filter(v => v.isUnder10DaysCluster === true).length
+        };
+  
+        res.status(200).json({
+          success: true,
+          count: finalVehicles.length,
+          summary: summary,
+          data: formattedVehicles,
+          availableBranches: availableBranches,
+          availableSubdealers: availableSubdealers,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            isADBDM: isADBDM,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0,
+            assignedSubdealersCount: user.assignedSubdealers?.length || 0,
+            userBranch: user.branch ? {
+              _id: user.branch._id,
+              name: user.branch.name
+            } : null
+          },
+          filters: {
+            branchId: branchId,
+            subdealerId: subdealerId,
+            locationType: locationType,
+            modelId: modelId,
+            colorId: colorId,
+            vehicleType: vehicleType,
+            modelType: modelType,
+            status: status,
+            chassisAllocated: false
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Error generating stock report:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Error generating stock report',
+        error: error.message,
+        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+  };
+/**
+ * Generate Stock Transfer Report
+ * @route GET /api/v1/reports/stock/transfers
+ * @access Private
+ */
+exports.generateStockTransferReport = async (req, res) => {
+  try {
+    const {
+      fromBranch,
+      toBranch,
+      toType,
+      status,
+      challanStatus,
+      startDate,
+      endDate,
+      modelType, // ADDED: Model type filter
+      format = 'excel'
+    } = req.query;
+
+    // ========== BRANCH ACCESS CONTROL ==========
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data (same as getMe)
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+    // Check user roles and permissions from user object
+    const userRoles = user.roles || [];
+    
+    // Check if user is SUPERADMIN
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    // Check if user has superadmin flag
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    // Get branch access from user
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    // Check if user has all branches access
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      // User can see all active branches
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      // User can see only assigned branches
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      // User can see only their own branch
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // Build filter conditions
+    const filter = {};
+
+    // ========== BRANCH FILTERS WITH ACCESS CONTROL ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        
+        // For fromBranch filter
+        if (fromBranch) {
+          if (fromBranch === 'all') {
+            // User selected "All" - show all accessible branches
+            filter.fromBranch = { $in: accessibleBranchIds };
+            console.log('✅ Showing transfers from all accessible branches');
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(fromBranch);
+            const hasAccess = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this from branch'
+              });
+            }
+            filter.fromBranch = requestedBranchId;
+            console.log(`✅ Filtering transfers by from branch: ${fromBranch}`);
+          }
+        } else {
+          // If no fromBranch specified, show transfers from all accessible branches
+          filter.fromBranch = { $in: accessibleBranchIds };
+          console.log('✅ Showing transfers from all accessible branches (no from branch filter)');
+        }
+        
+        // For toBranch filter (when toType is 'branch')
+        if (toBranch && toType === 'branch') {
+          if (toBranch === 'all') {
+            filter.toBranch = { $in: accessibleBranchIds };
+            console.log('✅ Showing transfers to all accessible branches');
+          } else {
+            const requestedToBranchId = new mongoose.Types.ObjectId(toBranch);
+            const hasAccessTo = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedToBranchId.toString()
+            );
+            
+            if (!hasAccessTo) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this to branch'
+              });
+            }
+            filter.toBranch = requestedToBranchId;
+            console.log(`✅ Filtering transfers by to branch: ${toBranch}`);
+          }
+          filter.toType = 'branch';
+        }
+      } else {
+        // User has only OWN branch access
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          filter.fromBranch = user.branch._id;
+          console.log(`✅ Filtering transfers by own branch: ${user.branch._id}`);
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
+        }
+      }
+    } else {
+      // User has all branches permission
+      if (fromBranch) {
+        if (fromBranch === 'all') {
+          // Show transfers from all branches (no filter)
+          console.log('✅ Showing transfers from ALL branches');
+        } else {
+          filter.fromBranch = new mongoose.Types.ObjectId(fromBranch);
+          console.log(`✅ Filtering transfers by from branch: ${fromBranch}`);
+        }
+      }
+      
+      if (toBranch && toType === 'branch') {
+        if (toBranch === 'all') {
+          console.log('✅ Showing transfers to ALL branches');
+        } else {
+          filter.toBranch = new mongoose.Types.ObjectId(toBranch);
+          console.log(`✅ Filtering transfers by to branch: ${toBranch}`);
+        }
+        filter.toType = 'branch';
+      }
+    }
+
+    // Additional filters (if user has access)
+    if (toType) {
+      filter.toType = toType;
+    }
+
+    // Status filters
+    if (status) {
+      filter.status = status;
+    }
+    if (challanStatus) {
+      filter.challanStatus = challanStatus;
+    }
+
+    // Date range filter
+    if (startDate || endDate) {
+      filter.transferDate = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.transferDate.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.transferDate.$lte = end;
+      }
+    }
+
+    console.log('Stock Transfer Filter:', JSON.stringify(filter, null, 2));
+
+    // Fetch transfers with all required populations
+    const transfers = await StockTransfer.find(filter)
+      .populate('fromBranchDetails', 'name address city state')
+      .populate('toBranchDetails', 'name address city state')
+      .populate('toSubdealerDetails', 'name location')
+      .populate({
+        path: 'items.vehicle',
+        select: 'chassisNumber model modelName type colors color status',
+        populate: [
+          { 
+            path: 'model', 
+            select: 'model_name manufacturer variant fuel_type model_type' // ADDED: model_type
+          },
+          { path: 'colors', select: 'name' },
+          { path: 'color.id', select: 'name' }
+        ]
+      })
+      .sort({ transferDate: -1, _id: -1 })
+      .lean();
+
+    console.log(`Found ${transfers.length} stock transfers`);
+
+    // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+    let filteredTransfers = transfers;
+    
+    if (modelType) {
+      console.log(`Applying model type filter: ${modelType}`);
+      
+      filteredTransfers = transfers.filter(transfer => {
+        // Check if any vehicle in the transfer matches the model type
+        return transfer.items.some(item => {
+          const vehicle = item.vehicle || {};
+          const vehicleModelType = vehicle.model?.model_type || vehicle.model?.type || '';
+          return vehicleModelType.toUpperCase() === modelType.toUpperCase();
+        });
+      });
+      
+      console.log(`Filtered from ${transfers.length} to ${filteredTransfers.length} transfers for model type: ${modelType}`);
+    }
+
+    if (filteredTransfers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No stock transfers found for the specified criteria',
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        },
+        filter: filter
+      });
+    }
+
+    // Generate Excel report
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      // SINGLE SHEET as requested
+      const worksheet = workbook.addWorksheet('Stock Transfer Report');
+
+      // Define column headers (EXACTLY as requested)
+      const columns = [
+        { header: 'S.No', key: 'sno', width: 8 },
+        { header: 'Transfer ID', key: 'transferId', width: 15 },
+        { header: 'Transfer Date', key: 'transferDate', width: 15 },
+        { header: 'From Branch', key: 'fromBranch', width: 25 },
+        { header: 'To Destination', key: 'toDestination', width: 25 },
+        { header: 'Chassis Number', key: 'chassisNumber', width: 20 },
+        { header: 'Model name', key: 'modelName', width: 25 },
+        { header: 'Vehicle Type', key: 'vehicleType', width: 15 },
+        { header: 'Color', key: 'color', width: 15 },
+        { header: 'Transfer Status', key: 'transferStatus', width: 15 },
+        { header: 'Challan Status', key: 'challanStatus', width: 15 }
+      ];
+
+      worksheet.columns = columns;
+
+      // Add data rows
+      let rowCounter = 1;
+      filteredTransfers.forEach((transfer, transferIndex) => {
+        const fromBranchName = transfer.fromBranchDetails?.name || '';
+        let toDestination = '';
+        
+        if (transfer.toType === 'branch' && transfer.toBranchDetails) {
+          toDestination = transfer.toBranchDetails.name || '';
+        } else if (transfer.toType === 'subdealer' && transfer.toSubdealerDetails) {
+          toDestination = transfer.toSubdealerDetails.name || '';
+        }
+
+        const transferDate = transfer.transferDate ? moment(transfer.transferDate).format('DD/MM/YYYY HH:mm') : '';
+        const transferIdShort = transfer._id?.toString().substring(18, 24) || '';
+
+        // Add each vehicle in the transfer
+        transfer.items?.forEach((item) => {
+          const vehicle = item.vehicle || {};
+          const primaryColor = vehicle.color?.id?.name || vehicle.color?.name || '';
+          const modelName = vehicle.model?.model_name || vehicle.modelName || '';
+          const vehicleType = vehicle.model?.model_type || vehicle.type || '';
+
+          const rowData = {
+            sno: rowCounter++,
+            transferId: transferIdShort,
+            transferDate: transferDate,
+            fromBranch: fromBranchName,
+            toDestination: toDestination,
+            chassisNumber: vehicle.chassisNumber || '',
+            modelName: modelName,
+            vehicleType: vehicleType,
+            color: primaryColor,
+            transferStatus: transfer.status ? transfer.status.toUpperCase() : '',
+            challanStatus: transfer.challanStatus ? transfer.challanStatus.toUpperCase() : ''
+          };
+
+          worksheet.addRow(rowData);
+        });
+      });
+
+      // Style the header row
+      const headerRow = worksheet.getRow(1);
+      headerRow.eachCell((cell) => {
+        cell.font = {
+          bold: true,
+          color: { argb: 'FFFFFFFF' },
+          size: 11
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' }
+        };
+        cell.alignment = {
+          vertical: 'middle',
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Format all rows (alternating colors)
+      for (let i = 1; i <= filteredTransfers.reduce((sum, t) => sum + (t.items?.length || 0), 0); i++) {
+        const row = worksheet.getRow(i + 1);
+        
+        // Apply alternating row colors for better readability
+        if (i % 2 === 0) {
+          row.eachCell((cell) => {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          });
+        }
+      }
+
+      // Auto-filter
+      if (worksheet.rowCount > 1) {
+        const lastCol = worksheet.columnCount;
+        let lastColLetter = '';
+        let tempCol = lastCol;
+        while (tempCol > 0) {
+          const remainder = (tempCol - 1) % 26;
+          lastColLetter = String.fromCharCode(65 + remainder) + lastColLetter;
+          tempCol = Math.floor((tempCol - 1) / 26);
+        }
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      // Set response headers
+      const fileName = `stock_transfer_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      await workbook.xlsx.write(res);
+      return res.end();
+
+    } else {
+      // Return JSON format
+      const formattedTransfers = filteredTransfers.map(transfer => {
+        const vehicles = transfer.items?.map(item => {
+          const vehicle = item.vehicle || {};
+          return {
+            chassisNumber: vehicle.chassisNumber,
+            model: vehicle.model?.model_name,
+            modelName: vehicle.modelName,
+            vehicleType: vehicle.model?.model_type || vehicle.type,
+            color: vehicle.color?.id?.name || vehicle.color?.name,
+            colors: vehicle.colors?.map(c => c.name) || [],
+            itemStatus: item.status
+          };
+        }) || [];
+
+        return {
+          transferId: transfer._id,
+          transferDate: transfer.transferDate,
+          fromBranch: {
+            id: transfer.fromBranch,
+            name: transfer.fromBranchDetails?.name,
+            address: transfer.fromBranchDetails?.address,
+            city: transfer.fromBranchDetails?.city,
+            state: transfer.fromBranchDetails?.state
+          },
+          toType: transfer.toType,
+          toDestination: transfer.toType === 'branch' ? {
+            id: transfer.toBranch,
+            name: transfer.toBranchDetails?.name,
+            address: transfer.toBranchDetails?.address,
+            city: transfer.toBranchDetails?.city,
+            state: transfer.toBranchDetails?.state
+          } : {
+            id: transfer.toSubdealer,
+            name: transfer.toSubdealerDetails?.name,
+            location: transfer.toSubdealerDetails?.location
+          },
+          vehicles: vehicles,
+          vehicleCount: vehicles.length,
+          status: transfer.status,
+          challanStatus: transfer.challanStatus
+        };
+      });
+
+      // Calculate summary statistics
+      const summary = {
+        totalTransfers: filteredTransfers.length,
+        totalVehicles: filteredTransfers.reduce((sum, t) => sum + (t.items?.length || 0), 0),
+        statusDistribution: filteredTransfers.reduce((acc, t) => {
+          const status = t.status || 'unknown';
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {}),
+        challanStatusDistribution: filteredTransfers.reduce((acc, t) => {
+          const status = t.challanStatus || 'unknown';
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {}),
+        toTypeDistribution: filteredTransfers.reduce((acc, t) => {
+          const type = t.toType || 'unknown';
+          acc[type] = (acc[type] || 0) + 1;
+          return acc;
+        }, {}),
+        modelTypeDistribution: filteredTransfers.reduce((acc, t) => {
+          t.items?.forEach(item => {
+            const vehicle = item.vehicle || {};
+            const modelType = vehicle.model?.model_type || vehicle.model?.type || vehicle.type || 'UNKNOWN';
+            acc[modelType] = (acc[modelType] || 0) + 1;
+          });
+          return acc;
+        }, {})
+      };
+
+      res.status(200).json({
+        success: true,
+        count: filteredTransfers.length,
+        summary: summary,
+        data: formattedTransfers,
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          fromBranch: fromBranch,
+          toBranch: toBranch,
+          toType: toType,
+          status: status,
+          challanStatus: challanStatus,
+          startDate: startDate,
+          endDate: endDate,
+          modelType: modelType
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating stock transfer report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating stock transfer report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+exports.generateGCReport = async (req, res) => {
+  try {
+    const { 
+      branchId, 
+      startDate, 
+      endDate, 
+      financerId,
+      modelType, // ADDED: Model type filter
+      format = 'excel' 
+    } = req.query;
+
+    // Build filter conditions
+    const filter = {};
+
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data (same as getMe)
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+    // Check user roles and permissions from user object
+    const userRoles = user.roles || [];
+    
+    // Check if user is SUPERADMIN
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    // Check if user has superadmin flag
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    // Get branch access from user
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    // Check if user has all branches access
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      // User can see all active branches
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      // User can see only assigned branches
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      // User can see only their own branch
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // ========== APPLY BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        // User has access to specific assigned branches
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        console.log(`User has access to ${accessibleBranchIds.length} assigned branches`);
+        
+        // If branchId is provided in query, check if it's in accessible branches
+        if (branchId) {
+          if (branchId === 'all') {
+            // User selected "All" - show all accessible branches
+            filter.branch = { $in: accessibleBranchIds };
+            console.log('✅ Showing all accessible branches');
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this branch'
+              });
+            }
+            filter.branch = requestedBranchId;
+            console.log(`✅ Filtering by branch: ${branchId}`);
+          }
+        } else {
+          // If no branchId specified, show all accessible branches
+          filter.branch = { $in: accessibleBranchIds };
+          console.log('✅ Showing all accessible branches (no branch filter)');
+        }
+      } else {
+        // User has only OWN branch access
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          filter.branch = user.branch._id;
+          console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
+        }
+      }
+    } else {
+      // User has all branches permission
+      if (branchId) {
+        if (branchId === 'all') {
+          // Show all branches (no filter)
+          console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+        } else {
+          filter.branch = new mongoose.Types.ObjectId(branchId);
+          console.log(`✅ Filtering by branch: ${branchId}`);
+        }
+      } else {
+        // If no branchId specified, show all branches
+        console.log('✅ Showing ALL branches (no branch filter)');
+      }
+    }
+
+    // ========== DATE RANGE FILTER ==========
+    // Date range filter for receiptDate
+    if (startDate || endDate) {
+      filter.receiptDate = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.receiptDate.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.receiptDate.$lte = end;
+      }
+    }
+
+    // ========== FINANCER FILTER ==========
+    if (financerId) {
+      // First get all bookings with this financer
+      const bookingsWithFinancer = await Booking.find({
+        'payment.financer': new mongoose.Types.ObjectId(financerId)
+      }).select('_id').lean();
+      
+      const bookingIds = bookingsWithFinancer.map(b => b._id);
+      filter.booking = { $in: bookingIds };
+      console.log(`✅ Filtering by financer: ${financerId}, found ${bookingIds.length} bookings`);
+    }
+
+    // ========== FILTER FOR FINANCE DISBURSEMENTS WITH GC AMOUNT ==========
+    // We're looking for ledger entries where paymentMode is 'Finance Disbursement' AND gcAmount > 0
+    filter.paymentMode = 'Finance Disbursement';
+    filter.gcAmount = { $gt: 0 };
+    filter.approvalStatus = 'Approved';
+    filter.isDebit = false; // Only credit entries (receipts)
+
+    console.log('GC Report Filter:', JSON.stringify(filter, null, 2));
+
+    // ========== FETCH LEDGER ENTRIES WITH GC AMOUNTS ==========
+    const ledgerEntries = await Ledger.find(filter)
+      .populate({
+        path: 'booking',
+        select: 'bookingNumber customerDetails model payment branch',
+        populate: [
+          {
+            path: 'model',
+            select: 'model_name model_type' // ADDED: model_type
+          },
+          {
+            path: 'payment.financer',
+            select: 'name'
+          },
+          {
+            path: 'branch',
+            select: 'name'
+          }
+        ]
+      })
+      .populate({
+        path: 'receivedBy',
+        select: 'name email'
+      })
+      .sort({ receiptDate: -1 })
+      .lean();
+
+    console.log(`Found ${ledgerEntries.length} ledger entries with GC amounts`);
+
+    // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+    let filteredLedgerEntries = ledgerEntries;
+    
+    if (modelType) {
+      console.log(`Applying model type filter: ${modelType}`);
+      
+      filteredLedgerEntries = ledgerEntries.filter(entry => {
+        const entryModelType = entry.booking?.model?.model_type || '';
+        return entryModelType.toUpperCase() === modelType.toUpperCase();
+      });
+      
+      console.log(`Filtered from ${ledgerEntries.length} to ${filteredLedgerEntries.length} entries for model type: ${modelType}`);
+    }
+
+    if (filteredLedgerEntries.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No GC payments found for the specified criteria',
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        }
+      });
+    }
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      // Create worksheet name
+      let worksheetName = 'GC Report';
+      if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+        const firstEntry = filteredLedgerEntries[0];
+        if (firstEntry?.booking?.branch?.name) {
+          worksheetName = `${firstEntry.booking.branch.name} GC Report`;
+        }
+      } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+        worksheetName = 'All Branches GC Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      // Define headers
+      const headers = [
+        'S.No',
+        'Receipt Date',
+        'Booking Number',
+        'Branch Name',
+        'Customer Name',
+        'Model',
+        'Model Type', // ADDED: Model Type column
+        'Financier Name',
+        'Total Amount Paid',
+        'GC Amount',
+        'GC Amount Received',
+        'Receipt Number',
+        'Transaction Reference',
+        'Received By'
+      ];
+
+      // Set worksheet columns
+      const columns = headers.map((header, index) => {
+        let width = 20;
+        
+        if (header === 'S.No') width = 8;
+        else if (header === 'Receipt Date') width = 15;
+        else if (header === 'Booking Number') width = 18;
+        else if (header === 'Branch Name') width = 20;
+        else if (header === 'Customer Name') width = 25;
+        else if (header === 'Model') width = 20;
+        else if (header === 'Model Type') width = 15; // ADDED: Model Type width
+        else if (header === 'Financier Name') width = 25;
+        else if (header === 'Total Amount Paid' || header === 'GC Amount' || header === 'GC Amount Received') {
+          width = 18;
+        } else if (header === 'Receipt Number') width = 20;
+        else if (header === 'Transaction Reference') width = 25;
+        else if (header === 'Received By') width = 20;
+
+        return {
+          header: header,
+          key: `col_${index}`,
+          width: width,
+          style: header.includes('Amount') ? { numFmt: '#,##0.00' } : {}
+        };
+      });
+
+      worksheet.columns = columns;
+
+      // Add data rows
+      filteredLedgerEntries.forEach((entry, index) => {
+        const rowData = {};
+        
+        // S.No
+        rowData['col_0'] = index + 1;
+        
+        // Receipt Date
+        rowData['col_1'] = entry.receiptDate ? moment(entry.receiptDate).format('DD/MM/YYYY') : '';
+        
+        // Booking Number
+        rowData['col_2'] = entry.booking?.bookingNumber || '';
+        
+        // Branch Name
+        rowData['col_3'] = entry.booking?.branch?.name || '';
+        
+        // Customer Name
+        rowData['col_4'] = entry.booking?.customerDetails?.name || '';
+        
+        // Model
+        rowData['col_5'] = entry.booking?.model?.model_name || '';
+        
+        // Model Type (ADDED)
+        rowData['col_6'] = entry.booking?.model?.model_type || '';
+        
+        // Financier Name
+        let financierName = '';
+        if (entry.booking?.payment?.type === 'FINANCE' && entry.booking?.payment?.financer) {
+          financierName = entry.booking.payment.financer.name || '';
+        }
+        rowData['col_7'] = financierName;
+        
+        // Total Amount Paid (Gross Amount)
+        rowData['col_8'] = entry.amount || 0;
+        
+        // GC Amount (from ledger entry)
+        rowData['col_9'] = entry.gcAmount || 0;
+        
+        // GC Amount Received (this is the GC amount itself - what was actually received as GC)
+        rowData['col_10'] = entry.gcAmount || 0;
+        
+        // Receipt Number
+        rowData['col_11'] = entry.receiptNumber || '';
+        
+        // Transaction Reference
+        rowData['col_12'] = entry.transactionReference || '';
+        
+        // Received By
+        rowData['col_13'] = entry.receivedBy?.name || '';
+
+        worksheet.addRow(rowData);
+      });
+
+      // Style the header row
+      worksheet.getRow(1).eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FF000000' } },
+          left: { style: 'thin', color: { argb: 'FF000000' } },
+          bottom: { style: 'thin', color: { argb: 'FF000000' } },
+          right: { style: 'thin', color: { argb: 'FF000000' } }
+        };
+      });
+
+      // Format all amount columns
+      for (let i = 1; i <= filteredLedgerEntries.length; i++) {
+        const row = worksheet.getRow(i + 1);
+        
+        // Format amount columns (columns 8, 9, 10 - zero-based)
+        [8, 9, 10].forEach(colIndex => {
+          const cell = row.getCell(colIndex + 1);
+          if (typeof cell.value === 'number') {
+            cell.numFmt = '#,##0.00';
+            cell.alignment = { horizontal: 'right' };
+          }
+        });
+      }
+
+      // Add totals row
+      const totalsRow = worksheet.addRow({});
+      
+      // Calculate totals
+      const totalAmount = filteredLedgerEntries.reduce((sum, entry) => sum + (entry.amount || 0), 0);
+      const totalGCAmount = filteredLedgerEntries.reduce((sum, entry) => sum + (entry.gcAmount || 0), 0);
+      const totalGCReceived = totalGCAmount; // GC Received is same as GC Amount
+      
+      // Set totals
+      totalsRow.getCell(9).value = totalAmount; // Total Amount Paid (column 9)
+      totalsRow.getCell(10).value = totalGCAmount; // GC Amount (column 10)
+      totalsRow.getCell(11).value = totalGCReceived; // GC Amount Received (column 11)
+      
+      // Style totals row
+      totalsRow.eachCell((cell) => {
+        cell.font = { bold: true };
+        if (cell.col >= 9 && cell.col <= 11) {
+          cell.numFmt = '#,##0.00';
+          cell.alignment = { horizontal: 'right' };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFF2F2F2' }
+          };
+        }
+      });
+      
+      // Add label to totals row
+      totalsRow.getCell(1).value = 'TOTALS:';
+      totalsRow.getCell(1).alignment = { horizontal: 'right' };
+      totalsRow.getCell(1).font = { bold: true };
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [
+        { state: 'frozen', ySplit: 1 }
+      ];
+
+      // ========== SUMMARY SHEET ==========
+      const summarySheet = workbook.addWorksheet('Summary');
+
+      // Summary Title
+      summarySheet.mergeCells('A1:D1');
+      const titleCell = summarySheet.getCell('A1');
+      titleCell.value = 'GC REPORT SUMMARY';
+      titleCell.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+      titleCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF4F81BD' }
+      };
+      titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      // Report Info
+      const infoRows = [
+        ['Report Generated:', moment().format('DD MMM YYYY HH:mm:ss')],
+        ['Total GC Entries:', filteredLedgerEntries.length],
+        ['Date Range:', startDate && endDate ? `${moment(startDate).format('DD/MM/YYYY')} to ${moment(endDate).format('DD/MM/YYYY')}` : 'All Dates'],
+        ['Branch Filter:', branchId || (hasAllBranchesAccess ? 'All Branches' : 'User Accessible Branches')],
+        ['Model Type Filter:', modelType || 'All'], // ADDED: Model type filter info
+        ['Financier Filter:', financerId ? 'Specific Financer' : 'All Financiers']
+      ];
+
+      infoRows.forEach(([label, value], index) => {
+        const rowNum = index + 3;
+        summarySheet.getCell(`A${rowNum}`).value = label;
+        summarySheet.getCell(`B${rowNum}`).value = value;
+        summarySheet.getCell(`B${rowNum}`).font = { bold: true };
+      });
+
+      // ========== FINANCIAL SUMMARY ==========
+      const financialStartRow = infoRows.length + 5;
+
+      // Financial Summary Title
+      summarySheet.mergeCells(`A${financialStartRow}:C${financialStartRow}`);
+      const financialTitleCell = summarySheet.getCell(`A${financialStartRow}`);
+      financialTitleCell.value = 'FINANCIAL SUMMARY';
+      financialTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+      financialTitleCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E75B5' }
+      };
+      financialTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      // Financial Summary Headers
+      const financialHeaders = ['Description', 'Amount', 'Percentage'];
+      const financialHeaderRow = financialStartRow + 1;
+      financialHeaders.forEach((header, colIndex) => {
+        const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${financialHeaderRow}`);
+        cell.value = header;
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' }
+        };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Financial Summary Data
+      const financialData = [
+        ['Total Amount Paid', totalAmount],
+        ['Total GC Amount', totalGCAmount],
+        ['Total GC Amount Received', totalGCReceived],
+        ['GC Percentage of Total', totalAmount > 0 ? `${((totalGCAmount / totalAmount) * 100).toFixed(2)}%` : '0%']
+      ];
+
+      financialData.forEach(([description, amount], index) => {
+        const rowNum = financialHeaderRow + 1 + index;
+        
+        summarySheet.getCell(`A${rowNum}`).value = description;
+        summarySheet.getCell(`B${rowNum}`).value = typeof amount === 'number' ? amount : amount;
+        summarySheet.getCell(`C${rowNum}`).value = index === 3 ? amount : totalAmount > 0 ? `${((amount / totalAmount) * 100).toFixed(2)}%` : '0%';
+        
+        // Style
+        [summarySheet.getCell(`A${rowNum}`), summarySheet.getCell(`B${rowNum}`), summarySheet.getCell(`C${rowNum}`)].forEach((cell, cellIndex) => {
+          cell.alignment = { 
+            horizontal: cellIndex === 0 ? 'left' : 'right',
+            vertical: 'middle'
+          };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+          
+          if (index % 2 === 0) {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          }
+          
+          if (cellIndex === 1 && typeof amount === 'number') {
+            cell.numFmt = '#,##0.00';
+          }
+        });
+        
+        // Bold for important rows
+        if (index === 2 || index === 3) {
+          summarySheet.getCell(`A${rowNum}`).font = { bold: true };
+          summarySheet.getCell(`B${rowNum}`).font = { bold: true };
+          summarySheet.getCell(`C${rowNum}`).font = { bold: true };
+        }
+      });
+
+      // ========== BRANCH-WISE SUMMARY ==========
+      const branchStartRow = financialHeaderRow + financialData.length + 3;
+
+      // Branch Summary Title
+      summarySheet.mergeCells(`A${branchStartRow}:C${branchStartRow}`);
+      const branchTitleCell = summarySheet.getCell(`A${branchStartRow}`);
+      branchTitleCell.value = 'BRANCH-WISE GC SUMMARY';
+      branchTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+      branchTitleCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E75B5' }
+      };
+      branchTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      // Branch Summary Headers
+      const branchHeaders = ['Branch Name', 'Total GC Received', 'Percentage of Total GC'];
+      const branchHeaderRow = branchStartRow + 1;
+      branchHeaders.forEach((header, colIndex) => {
+        const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${branchHeaderRow}`);
+        cell.value = header;
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' }
+        };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Group by branch
+      const branchSummary = filteredLedgerEntries.reduce((acc, entry) => {
+        const branchName = entry.booking?.branch?.name || 'Unknown Branch';
+        
+        if (!acc[branchName]) {
+          acc[branchName] = {
+            totalGC: 0,
+            count: 0
+          };
+        }
+        
+        acc[branchName].totalGC += entry.gcAmount || 0;
+        acc[branchName].count++;
+        return acc;
+      }, {});
+
+      // Add branch summary data
+      Object.entries(branchSummary).forEach(([branchName, data], index) => {
+        const rowNum = branchHeaderRow + 1 + index;
+        
+        const percentage = totalGCReceived > 0 ? `${((data.totalGC / totalGCReceived) * 100).toFixed(2)}%` : '0%';
+        
+        summarySheet.getCell(`A${rowNum}`).value = branchName;
+        summarySheet.getCell(`B${rowNum}`).value = data.totalGC;
+        summarySheet.getCell(`C${rowNum}`).value = percentage;
+        
+        // Style
+        [summarySheet.getCell(`A${rowNum}`), summarySheet.getCell(`B${rowNum}`), summarySheet.getCell(`C${rowNum}`)].forEach((cell, cellIndex) => {
+          cell.alignment = { 
+            horizontal: cellIndex === 0 ? 'left' : 'right',
+            vertical: 'middle'
+          };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+          
+          if (index % 2 === 0) {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          }
+          
+          if (cellIndex === 1) {
+            cell.numFmt = '#,##0.00';
+          }
+        });
+      });
+
+      // ========== MODEL TYPE SUMMARY ==========
+      const modelTypeStartRow = branchHeaderRow + Object.keys(branchSummary).length + 3;
+
+      // Model Type Summary Title
+      summarySheet.mergeCells(`A${modelTypeStartRow}:C${modelTypeStartRow}`);
+      const modelTypeTitleCell = summarySheet.getCell(`A${modelTypeStartRow}`);
+      modelTypeTitleCell.value = 'MODEL TYPE SUMMARY';
+      modelTypeTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+      modelTypeTitleCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E75B5' }
+      };
+      modelTypeTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+      // Model Type Summary Headers
+      const modelTypeHeaders = ['Model Type', 'Total GC Received', 'Percentage of Total GC'];
+      const modelTypeHeaderRow = modelTypeStartRow + 1;
+      modelTypeHeaders.forEach((header, colIndex) => {
+        const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${modelTypeHeaderRow}`);
+        cell.value = header;
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' }
+        };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Group by model type
+      const modelTypeSummary = filteredLedgerEntries.reduce((acc, entry) => {
+        const modelTypeValue = entry.booking?.model?.model_type || 'UNKNOWN';
+        
+        if (!acc[modelTypeValue]) {
+          acc[modelTypeValue] = {
+            totalGC: 0,
+            count: 0
+          };
+        }
+        
+        acc[modelTypeValue].totalGC += entry.gcAmount || 0;
+        acc[modelTypeValue].count++;
+        return acc;
+      }, {});
+
+      // Add model type summary data
+      Object.entries(modelTypeSummary).forEach(([modelType, data], index) => {
+        const rowNum = modelTypeHeaderRow + 1 + index;
+        
+        const percentage = totalGCReceived > 0 ? `${((data.totalGC / totalGCReceived) * 100).toFixed(2)}%` : '0%';
+        
+        summarySheet.getCell(`A${rowNum}`).value = modelType;
+        summarySheet.getCell(`B${rowNum}`).value = data.totalGC;
+        summarySheet.getCell(`C${rowNum}`).value = percentage;
+        
+        // Style
+        [summarySheet.getCell(`A${rowNum}`), summarySheet.getCell(`B${rowNum}`), summarySheet.getCell(`C${rowNum}`)].forEach((cell, cellIndex) => {
+          cell.alignment = { 
+            horizontal: cellIndex === 0 ? 'left' : 'right',
+            vertical: 'middle'
+          };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+          
+          if (index % 2 === 0) {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          }
+          
+          if (cellIndex === 1) {
+            cell.numFmt = '#,##0.00';
+          }
+        });
+      });
+
+      // Set response headers for file download
+      const fileName = `gc_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      // Write to response
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedEntries = filteredLedgerEntries.map((entry, index) => {
+        let financierName = '';
+        if (entry.booking?.payment?.type === 'FINANCE' && entry.booking?.payment?.financer) {
+          financierName = entry.booking.payment.financer.name || '';
+        }
+
+        return {
+          sno: index + 1,
+          receiptDate: entry.receiptDate,
+          formattedDate: entry.receiptDate ? moment(entry.receiptDate).format('DD/MM/YYYY') : '',
+          bookingNumber: entry.booking?.bookingNumber || '',
+          branchName: entry.booking?.branch?.name || '',
+          customerName: entry.booking?.customerDetails?.name || '',
+          model: entry.booking?.model?.model_name || '',
+          modelType: entry.booking?.model?.model_type || '', // ADDED: Model Type
+          financierName: financierName,
+          totalAmount: entry.amount || 0,
+          gcAmount: entry.gcAmount || 0,
+          gcAmountReceived: entry.gcAmount || 0,
+          receiptNumber: entry.receiptNumber || '',
+          transactionReference: entry.transactionReference || '',
+          receivedBy: entry.receivedBy?.name || '',
+          bookingId: entry.booking?._id,
+          financierId: entry.booking?.payment?.financer?._id
+        };
+      });
+
+      // Calculate overall totals
+      const totals = {
+        totalAmount: filteredLedgerEntries.reduce((sum, entry) => sum + (entry.amount || 0), 0),
+        totalGCAmount: filteredLedgerEntries.reduce((sum, entry) => sum + (entry.gcAmount || 0), 0),
+        totalGCReceived: filteredLedgerEntries.reduce((sum, entry) => sum + (entry.gcAmount || 0), 0),
+        gcPercentage: 0
+      };
+      
+      totals.gcPercentage = totals.totalAmount > 0 ? (totals.totalGCAmount / totals.totalAmount) * 100 : 0;
+
+      // Branch-wise summary
+      const branchSummary = filteredLedgerEntries.reduce((acc, entry) => {
+        const branchName = entry.booking?.branch?.name || 'Unknown Branch';
+        
+        if (!acc[branchName]) {
+          acc[branchName] = {
+            branchName: branchName,
+            totalGC: 0,
+            totalGCReceived: 0,
+            count: 0,
+            totalAmount: 0
+          };
+        }
+        
+        acc[branchName].totalGC += entry.gcAmount || 0;
+        acc[branchName].totalGCReceived += entry.gcAmount || 0;
+        acc[branchName].totalAmount += entry.amount || 0;
+        acc[branchName].count++;
+        return acc;
+      }, {});
+
+      // Convert to array and calculate percentages
+      const branchSummaryArray = Object.values(branchSummary).map(item => ({
+        ...item,
+        percentageOfTotalGC: totals.totalGCReceived > 0 ? (item.totalGC / totals.totalGCReceived) * 100 : 0,
+        percentageOfTotalAmount: totals.totalAmount > 0 ? (item.totalAmount / totals.totalAmount) * 100 : 0
+      }));
+
+      // Model Type wise summary
+      const modelTypeSummary = filteredLedgerEntries.reduce((acc, entry) => {
+        const modelType = entry.booking?.model?.model_type || 'UNKNOWN';
+        
+        if (!acc[modelType]) {
+          acc[modelType] = {
+            modelType: modelType,
+            totalGC: 0,
+            totalGCReceived: 0,
+            count: 0,
+            totalAmount: 0
+          };
+        }
+        
+        acc[modelType].totalGC += entry.gcAmount || 0;
+        acc[modelType].totalGCReceived += entry.gcAmount || 0;
+        acc[modelType].totalAmount += entry.amount || 0;
+        acc[modelType].count++;
+        return acc;
+      }, {});
+
+      // Convert to array
+      const modelTypeSummaryArray = Object.values(modelTypeSummary).map(item => ({
+        ...item,
+        percentageOfTotalGC: totals.totalGCReceived > 0 ? (item.totalGC / totals.totalGCReceived) * 100 : 0,
+        percentageOfTotalAmount: totals.totalAmount > 0 ? (item.totalAmount / totals.totalAmount) * 100 : 0
+      }));
+
+      // Financier-wise summary
+      const financerSummary = filteredLedgerEntries.reduce((acc, entry) => {
+        let financierName = 'Unknown';
+        let financierId = null;
+        
+        if (entry.booking?.payment?.type === 'FINANCE' && entry.booking?.payment?.financer) {
+          financierName = entry.booking.payment.financer.name || 'Unknown';
+          financierId = entry.booking.payment.financer._id;
+        }
+        
+        const key = financierId ? `${financierName}_${financierId}` : financierName;
+        
+        if (!acc[key]) {
+          acc[key] = {
+            financierName: financierName,
+            financierId: financierId,
+            totalGC: 0,
+            totalGCReceived: 0,
+            count: 0,
+            totalAmount: 0
+          };
+        }
+        
+        acc[key].totalGC += entry.gcAmount || 0;
+        acc[key].totalGCReceived += entry.gcAmount || 0;
+        acc[key].totalAmount += entry.amount || 0;
+        acc[key].count++;
+        return acc;
+      }, {});
+
+      // Convert to array
+      const financerSummaryArray = Object.values(financerSummary).map(item => ({
+        ...item,
+        percentageOfTotalGC: totals.totalGCReceived > 0 ? (item.totalGC / totals.totalGCReceived) * 100 : 0,
+        percentageOfTotalAmount: totals.totalAmount > 0 ? (item.totalAmount / totals.totalAmount) * 100 : 0
+      }));
+
+      res.status(200).json({
+        success: true,
+        count: filteredLedgerEntries.length,
+        totals: totals,
+        data: formattedEntries,
+        summary: {
+          byBranch: branchSummaryArray,
+          byModelType: modelTypeSummaryArray, // ADDED: Model Type summary
+          byFinancer: financerSummaryArray,
+          dateRange: {
+            start: startDate,
+            end: endDate,
+            formatted: startDate && endDate ? 
+              `${moment(startDate).format('DD/MM/YYYY')} to ${moment(endDate).format('DD/MM/YYYY')}` : 
+              'All Dates'
+          }
+        },
+        // ========== DROPDOWN DATA FOR FRONTEND ==========
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          branchId: branchId,
+          startDate: startDate,
+          endDate: endDate,
+          financerId: financerId,
+          modelType: modelType // ADDED: Model type filter
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating GC report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating GC report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+
+exports.generateFieldBasedOutstandingReport = async (req, res) => {
+  try {
+    const { 
+      branchId, 
+      status,
+      minBalance,
+      maxBalance,
+      modelType,
+      format = 'excel' 
+    } = req.query;
+
+    const filter = {};
+    const userId = req.user.id;
+    
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({ path: 'roles', select: 'name isSuperAdmin permissionsCount' })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    let hasAllBranchesAccess = false;
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({ _id: 'all', name: 'All Branches', address: '', city: '' });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // ========== APPLY BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        console.log(`User has access to ${accessibleBranchIds.length} assigned branches`);
+        
+        if (branchId) {
+          if (branchId === 'all') {
+            filter.branch = { $in: accessibleBranchIds };
+            console.log('✅ Showing all accessible branches');
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(id => 
+              id.toString() === requestedBranchId.toString()
+            );
+            if (!hasAccess) {
+              return res.status(403).json({ success: false, message: 'You do not have access to this branch' });
+            }
+            filter.branch = requestedBranchId;
+            console.log(`✅ Filtering by branch: ${branchId}`);
+          }
+        } else {
+          filter.branch = { $in: accessibleBranchIds };
+          console.log('✅ Showing all accessible branches (no branch filter)');
+        }
+      } else {
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          filter.branch = user.branch._id;
+          console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+        } else {
+          return res.status(403).json({ success: false, message: 'You do not have access to any branch' });
+        }
+      }
+    } else {
+      if (branchId) {
+        if (branchId === 'all') {
+          console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+        } else {
+          filter.branch = new mongoose.Types.ObjectId(branchId);
+          console.log(`✅ Filtering by branch: ${branchId}`);
+        }
+      } else {
+        console.log('✅ Showing ALL branches (no branch filter)');
+      }
+    }
+
+    // ========== STATUS FILTER ==========
+    if (status) {
+      filter.status = status;
+    } else {
+      filter.status = { $nin: ['CANCELLED', 'COMPLETED', 'CANCELLED_APPROVE', 'CANCELLED_REJECTED'] };
+    }
+
+    console.log('Outstanding Report Filter:', JSON.stringify(filter, null, 2));
+
+    // ========== FETCH BOOKINGS ==========
+    const bookingsQuery = Booking.find(filter)
+      .populate('model', 'model_name type')
+      .populate('color', 'name')
+      .populate('branch', 'name')
+      .populate('salesExecutive', 'name')
+      .populate({ path: 'payment.financer', select: 'name' })
+      .populate({
+        path: 'vehicleRef',
+        select: 'chassisNumber allocationHistory inwardDate', // ✅ Added inwardDate
+        model: 'Vehicle'
+      })
+      .sort({ createdAt: -1 });
+
+    // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+    if (modelType) {
+      console.log(`Applying model type filter: ${modelType}`);
+      const models = await mongoose.model('Model').find({ 
+        type: modelType.toUpperCase() 
+      }).select('_id').lean();
+      
+      const modelIds = models.map(model => model._id);
+      
+      if (modelIds.length > 0) {
+        bookingsQuery.where('model').in(modelIds);
+        console.log(`Filtering by ${modelIds.length} ${modelType} models`);
+      } else {
+        console.log(`No ${modelType} models found`);
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          workbook.addWorksheet('Outstanding Report');
+          const fileName = `outstanding_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            totals: { totalDealAmount: 0, totalReceivedAmount: 0, totalPendingAmount: 0, totalBalanceAmount: 0 },
+            data: [],
+            availableBranches,
+            userAccessInfo: {
+              hasAllBranchesAccess,
+              branchAccess,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              userBranch: user.branch ? { _id: user.branch._id, name: user.branch.name } : null
+            },
+            filters: { branchId, status, minBalance, maxBalance, modelType }
+          });
+        }
+      }
+    }
+    
+    const bookings = await bookingsQuery.lean();
+    console.log(`Found ${bookings.length} bookings`);
+
+    const bookingIds = bookings.map(b => b._id);
+
+    // ========== FETCH ALL LEDGER ENTRIES ==========
+    const allLedgerEntries = await Ledger.find({ booking: { $in: bookingIds } })
+      .select('amount paymentMode type approvalStatus isDebit booking')
+      .lean();
+
+    console.log(`Found ${allLedgerEntries.length} total ledger entries for these bookings`);
+
+    const ledgerByBooking = {};
+    allLedgerEntries.forEach(entry => {
+      const bookingId = entry.booking.toString();
+      if (!ledgerByBooking[bookingId]) ledgerByBooking[bookingId] = [];
+      ledgerByBooking[bookingId].push(entry);
+    });
+
+    // ========== PROCESS EACH BOOKING ==========
+    const processedBookings = bookings.map(booking => {
+      const bookingLedgerEntries = ledgerByBooking[booking._id.toString()] || [];
+      console.log(`Booking ${booking.bookingNumber}: ${bookingLedgerEntries.length} ledger entries found`);
+      
+      const approvedEntries = bookingLedgerEntries.filter(entry => 
+        entry.approvalStatus === 'Approved' && !entry.isDebit
+      );
+      const pendingEntries = bookingLedgerEntries.filter(entry => 
+        entry.approvalStatus === 'Pending' && !entry.isDebit
+      );
+      
+      if (pendingEntries.length > 0) {
+        console.log(`  Found ${pendingEntries.length} pending entries for booking ${booking.bookingNumber}`);
+      }
+      
+      const totalApprovedAmount = approvedEntries.reduce((sum, entry) => sum + (entry.amount || 0), 0);
+      const totalPendingForApproval = pendingEntries.reduce((sum, entry) => sum + (entry.amount || 0), 0);
+      const dealAmount = booking.discountedAmount || 0;
+      const balanceAmount = dealAmount - totalApprovedAmount;
+      const bookingType = booking.payment?.type || '';
+      
+      let financierName = '';
+      if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+        financierName = booking.payment.financer.name || '';
+      }
+      
+      // ========== VEHICLE ALLOCATION AGE (from allocation date) ==========
+      let allocatedChassisNumber = '';
+      let vehicleAge = '';          // Age from allocation date
+      let vehicleInwardAge = '';    // ✅ NEW: Age from inward/purchase date
+      let allocationDate = null;
+      let ageInDaysFromAllocation = 0;
+      
+      if (booking.vehicleRef) {
+        allocatedChassisNumber = booking.vehicleRef.chassisNumber || '';
+        
+        // ✅ Calculate vehicle inward age from Vehicle model's inwardDate
+        if (booking.vehicleRef.inwardDate) {
+          const inwardDateObj = new Date(booking.vehicleRef.inwardDate);
+          const currentDate = new Date();
+          inwardDateObj.setHours(0, 0, 0, 0);
+          currentDate.setHours(0, 0, 0, 0);
+          const inwardAgeDays = Math.floor((currentDate - inwardDateObj) / (1000 * 60 * 60 * 24));
+          vehicleInwardAge = `${inwardAgeDays}`;
+          console.log(`✅ Booking ${booking.bookingNumber}: Inward Age = ${vehicleInwardAge} days (inward on ${moment(booking.vehicleRef.inwardDate).format('DD/MM/YYYY')})`);
+        }
+        
+        // Calculate allocation age from allocationHistory
+        if (booking.vehicleRef.allocationHistory && booking.vehicleRef.allocationHistory.length > 0) {
+          const allocationEntries = booking.vehicleRef.allocationHistory.filter(
+            history => history.bookingId && 
+                      history.bookingId.toString() === booking._id.toString() &&
+                      history.status === 'ALLOCATED'
+          );
+          
+          if (allocationEntries.length > 0) {
+            allocationEntries.sort((a, b) => new Date(b.allocatedAt) - new Date(a.allocatedAt));
+            const latestAllocation = allocationEntries[0];
+            allocationDate = latestAllocation.allocatedAt;
+            
+            if (allocationDate) {
+              const allocationDateObj = new Date(allocationDate);
+              const currentDate = new Date();
+              allocationDateObj.setHours(0, 0, 0, 0);
+              currentDate.setHours(0, 0, 0, 0);
+              ageInDaysFromAllocation = Math.floor((currentDate - allocationDateObj) / (1000 * 60 * 60 * 24));
+              
+              // ✅ Always show number (0 instead of 'Today')
+              vehicleAge = `${ageInDaysFromAllocation}`;
+              
+              console.log(`✅ Booking ${booking.bookingNumber}: Age from allocation = ${vehicleAge} days (allocated on ${moment(allocationDate).format('DD/MM/YYYY')})`);
+            }
+          } else {
+            console.log(`⚠️ Booking ${booking.bookingNumber}: No allocation entry found in vehicle history for this booking`);
+          }
+        }
+        
+        // Fallback if no allocation date found in history
+        if (!allocationDate) {
+          const fallbackDate = booking.approvedAt || booking.updatedAt || booking.createdAt;
+          if (fallbackDate) {
+            allocationDate = fallbackDate;
+            const fallbackDateObj = new Date(fallbackDate);
+            const currentDate = new Date();
+            fallbackDateObj.setHours(0, 0, 0, 0);
+            currentDate.setHours(0, 0, 0, 0);
+            ageInDaysFromAllocation = Math.floor((currentDate - fallbackDateObj) / (1000 * 60 * 60 * 24));
+            
+            // ✅ Always show number (0 instead of 'Today')
+            vehicleAge = `${ageInDaysFromAllocation}`;
+            
+            console.log(`⚠️ Booking ${booking.bookingNumber}: Using fallback date for age: ${moment(allocationDate).format('DD/MM/YYYY')} -> ${vehicleAge}`);
+          }
+        }
+      }
+      
+      let salesExecutiveName = '';
+      if (booking.salesExecutive) {
+        salesExecutiveName = booking.salesExecutive.name || '';
+      }
+      
+      return {
+        ...booking,
+        bookingType,
+        financierName,
+        totalApprovedAmount,
+        totalPendingForApproval,
+        dealAmount,
+        balanceAmount,
+        approvedEntriesCount: approvedEntries.length,
+        pendingEntriesCount: pendingEntries.length,
+        allocatedChassisNumber,
+        vehicleAge,           // Age from allocation date (numeric string)
+        vehicleInwardAge,     // ✅ NEW: Age from inward date (numeric string)
+        ageInDays: ageInDaysFromAllocation,
+        allocationDate,
+        salesExecutiveName,
+        ledgerEntriesCount: bookingLedgerEntries.length,
+        hasPendingEntries: pendingEntries.length > 0
+      };
+    });
+
+    // Filter bookings with outstanding balance OR pending for approval
+    const outstandingBookings = processedBookings.filter(booking => 
+      booking.balanceAmount > 0 || booking.totalPendingForApproval > 0
+    );
+
+    // Apply balance range filter if specified
+    let filteredBookings = outstandingBookings;
+    if (minBalance || maxBalance) {
+      filteredBookings = outstandingBookings.filter(booking => {
+        if (minBalance && booking.balanceAmount < parseFloat(minBalance)) return false;
+        if (maxBalance && booking.balanceAmount > parseFloat(maxBalance)) return false;
+        return true;
+      });
+    }
+
+    console.log(`Found ${filteredBookings.length} bookings with outstanding or pending amounts`);
+
+    if (filteredBookings.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No bookings with outstanding or pending amounts found',
+        availableBranches,
+        userAccessInfo: { hasAllBranchesAccess, branchAccess, accessibleBranchesCount: user.accessibleBranches?.length || 0 }
+      });
+    }
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      let worksheetName = 'Outstanding Report';
+      if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+        const branch = filteredBookings[0]?.branch;
+        if (branch?.name) worksheetName = `${branch.name} Outstanding Report`;
+      } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+        worksheetName = 'All Branches Outstanding Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      // ✅ Updated headers — added "Vehicle Age (Inward)" column
+      const headers = [
+        'Booking Number',
+        'Customer Name',
+        'Mobile 1',
+        'Mobile 2',
+        'Model',
+        'Model Type',
+        'Color',
+        'Booking Type',
+        'Financier Name',
+        'Sales Executive',
+        'Allocated Chassis Number',
+        'Age (Allocation)',       // ✅ Renamed for clarity
+        'Age (Inward)',           // ✅ NEW column
+        'Allocated Date',
+        'Deal Amount',
+        'Verified Amount',
+        'Pending Verification Amount',
+        'Balance Amount',
+        'Booking Status',
+        'Branch Name',
+        'Booking Date'
+      ];
+
+      const columns = headers.map((header, index) => {
+        let width = 20;
+        if (header === 'Booking Number') width = 18;
+        else if (header === 'Customer Name') width = 25;
+        else if (header === 'Mobile 1' || header === 'Mobile 2') width = 15;
+        else if (header === 'Model') width = 20;
+        else if (header === 'Model Type') width = 12;
+        else if (header === 'Color') width = 15;
+        else if (header === 'Booking Type') width = 15;
+        else if (header === 'Financier Name') width = 25;
+        else if (header === 'Sales Executive') width = 20;
+        else if (header === 'Allocated Chassis Number') width = 22;
+        else if (header === 'Age (Allocation)') width = 16;
+        else if (header === 'Age (Inward)') width = 14;
+        else if (header === 'Allocated Date') width = 15;
+        else if (['Deal Amount', 'Verified Amount', 'Pending Verification Amount', 'Balance Amount'].includes(header)) width = 18;
+        else if (header === 'Booking Status') width = 15;
+        else if (header === 'Branch Name') width = 25;
+        else if (header === 'Booking Date') width = 15;
+
+        return {
+          header,
+          key: `col_${index}`,
+          width,
+          style: header.includes('Amount') ? { numFmt: '#,##0.00' } : {}
+        };
+      });
+
+      worksheet.columns = columns;
+
+      // ✅ Updated row data mapping with new column
+      filteredBookings.forEach((booking) => {
+        const rowData = {};
+        rowData['col_0']  = booking.bookingNumber || '';
+        rowData['col_1']  = booking.customerDetails?.name || '';
+        rowData['col_2']  = booking.customerDetails?.mobile1 || '';
+        rowData['col_3']  = booking.customerDetails?.mobile2 || '';
+        rowData['col_4']  = booking.model?.model_name || '';
+        rowData['col_5']  = booking.model?.type || '';
+        rowData['col_6']  = booking.color?.name || '';
+        rowData['col_7']  = booking.bookingType || '';
+        rowData['col_8']  = booking.financierName || '';
+        rowData['col_9']  = booking.salesExecutiveName || '';
+        rowData['col_10'] = booking.allocatedChassisNumber || '';
+        rowData['col_11'] = booking.vehicleAge || '';           // Age from allocation
+        rowData['col_12'] = booking.vehicleInwardAge || '';     // ✅ Age from inward date
+        rowData['col_13'] = booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '';
+        rowData['col_14'] = booking.dealAmount;
+        rowData['col_15'] = booking.totalApprovedAmount;
+        rowData['col_16'] = booking.totalPendingForApproval;
+        rowData['col_17'] = booking.balanceAmount;
+        rowData['col_18'] = booking.status || '';
+        rowData['col_19'] = booking.branch?.name || '';
+        rowData['col_20'] = booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '';
+        worksheet.addRow(rowData);
+      });
+
+      // Style header row
+      worksheet.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E75B5' } };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        cell.border = {
+          top: { style: 'thin' }, left: { style: 'thin' },
+          bottom: { style: 'thin' }, right: { style: 'thin' }
+        };
+      });
+
+      // Format amount columns (now shifted by 1 due to new column)
+      for (let i = 1; i <= filteredBookings.length; i++) {
+        const row = worksheet.getRow(i + 1);
+        
+        // ✅ Amount columns: Deal(14), Verified(15), Pending(16), Balance(17) → col index 14-17
+        [14, 15, 16, 17].forEach(colIndex => {
+          const cell = row.getCell(colIndex + 1);
+          if (typeof cell.value === 'number') {
+            cell.numFmt = '#,##0.00';
+            cell.alignment = { horizontal: 'right' };
+          }
+        });
+        
+        // ✅ Age columns center-aligned: col_11, col_12
+        [11, 12].forEach(colIndex => {
+          const cell = row.getCell(colIndex + 1);
+          if (cell.value !== '' && cell.value !== null) {
+            cell.alignment = { horizontal: 'center' };
+          }
+        });
+
+        // Date column center-aligned: col_13 (Allocated Date), col_20 (Booking Date)
+        [13, 20].forEach(colIndex => {
+          const cell = row.getCell(colIndex + 1);
+          if (cell.value) cell.alignment = { horizontal: 'center' };
+        });
+      }
+
+      // Add totals row
+      const totalsRow = worksheet.addRow({});
+      const totalDealAmount  = filteredBookings.reduce((sum, b) => sum + b.dealAmount, 0);
+      const totalReceived    = filteredBookings.reduce((sum, b) => sum + b.totalApprovedAmount, 0);
+      const totalPending     = filteredBookings.reduce((sum, b) => sum + b.totalPendingForApproval, 0);
+      const totalBalance     = filteredBookings.reduce((sum, b) => sum + b.balanceAmount, 0);
+      
+      // ✅ Totals shifted by 1 column
+      totalsRow.getCell(15).value = totalDealAmount;
+      totalsRow.getCell(16).value = totalReceived;
+      totalsRow.getCell(17).value = totalPending;
+      totalsRow.getCell(18).value = totalBalance;
+      
+      totalsRow.eachCell((cell) => {
+        cell.font = { bold: true };
+        if (cell.col >= 15 && cell.col <= 18) {
+          cell.numFmt = '#,##0.00';
+          cell.alignment = { horizontal: 'right' };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+        }
+      });
+      
+      totalsRow.getCell(1).value = 'GRAND TOTALS:';
+      totalsRow.getCell(1).alignment = { horizontal: 'right' };
+      totalsRow.getCell(1).font = { bold: true };
+
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = { from: 'A1', to: `${lastColLetter}${worksheet.rowCount}` };
+      }
+
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      const fileName = `outstanding_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedBookings = filteredBookings.map(booking => ({
+        bookingNumber: booking.bookingNumber,
+        customerName: booking.customerDetails?.name || '',
+        mobile1: booking.customerDetails?.mobile1 || '',
+        mobile2: booking.customerDetails?.mobile2 || '',
+        model: booking.model?.model_name || '',
+        modelType: booking.model?.type || '',
+        color: booking.color?.name || '',
+        bookingType: booking.bookingType || '',
+        financierName: booking.financierName || '',
+        salesExecutiveName: booking.salesExecutiveName || '',
+        allocatedChassisNumber: booking.allocatedChassisNumber || '',
+        vehicleAge: booking.vehicleAge || '',               // Age from allocation date
+        vehicleInwardAge: booking.vehicleInwardAge || '',   // ✅ NEW: Age from inward date
+        ageInDays: booking.ageInDays || 0,
+        allocationDate: booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '',
+        allocationDateRaw: booking.allocationDate,
+        dealAmount: booking.dealAmount,
+        totalReceivedAmount: booking.totalApprovedAmount,
+        totalPendingAmount: booking.totalPendingForApproval,
+        balanceAmount: booking.balanceAmount,
+        bookingStatus: booking.status || '',
+        branchName: booking.branch?.name || '',
+        branchId: booking.branch?._id || null,
+        bookingDate: booking.createdAt,
+        formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+        bookingId: booking._id,
+        customerDetails: {
+          aadharNumber: booking.customerDetails?.aadharNumber || '',
+          panNo: booking.customerDetails?.panNo || '',
+          address: booking.customerDetails?.address || ''
+        },
+        paymentType: booking.bookingType || '',
+        ledgerStats: {
+          approvedEntries: booking.approvedEntriesCount,
+          pendingEntries: booking.pendingEntriesCount
+        },
+        hasPendingEntries: booking.hasPendingEntries,
+        ledgerEntriesCount: booking.ledgerEntriesCount
+      }));
+
+      const totals = {
+        totalDealAmount: filteredBookings.reduce((sum, b) => sum + b.dealAmount, 0),
+        totalReceivedAmount: filteredBookings.reduce((sum, b) => sum + b.totalApprovedAmount, 0),
+        totalPendingAmount: filteredBookings.reduce((sum, b) => sum + b.totalPendingForApproval, 0),
+        totalBalanceAmount: filteredBookings.reduce((sum, b) => sum + b.balanceAmount, 0)
+      };
+
+      res.status(200).json({
+        success: true,
+        count: filteredBookings.length,
+        totals,
+        data: formattedBookings,
+        availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess,
+          branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? { _id: user.branch._id, name: user.branch.name } : null
+        },
+        filters: { branchId, status, minBalance, maxBalance, modelType },
+        debug: {
+          totalBookings: bookings.length,
+          totalLedgerEntries: allLedgerEntries.length,
+          bookingsWithPendingAmount: filteredBookings.filter(b => b.totalPendingForApproval > 0).length,
+          bookingsWithAllocationDate: filteredBookings.filter(b => b.allocationDate).length
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating outstanding report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating outstanding report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+
+/**
+ * Generate Broker Report - Exchange vehicles with broker details
+ * @route GET /api/v1/reports/brokers
+ * @access Private
+ * 
+ * EXACT 10 FIELDS:
+ * - Booking Date
+ * - Branch Name
+ * - Booking Number
+ * - Exchange Amount
+ * - Broker Name
+ * - Exchange Vehicle Number
+ * - Exchange Chassis Number
+ * - Customer Name
+ * - Model
+ * - Exchange Reference Number (FROM LEDGER MODEL - transactionReference)
+ * 
+ * FILTERS:
+ * - Start Date
+ * - End Date
+ * - Branch Wise
+ */
+exports.generateBrokerReport = async (req, res) => {
+  try {
+    const { 
+      branchId, 
+      startDate, 
+      endDate 
+    } = req.query;
+
+    // ========== BRANCH ACCESS LOGIC ==========
+    const userId = req.user.id;
+    
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+    }
+
+    // ========== BUILD FILTER ==========
+    // ONLY exchange = true - NO STATUS FILTER, show ALL exchange bookings
+    const filter = {
+      exchange: true
+    };
+
+    // ========== BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      // User does NOT have access to all branches
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        
+        // Check if specific branch requested (case-insensitive 'all' check)
+        if (branchId && branchId.toLowerCase() !== 'all') {
+          // Validate branchId format before creating ObjectId
+          if (!mongoose.Types.ObjectId.isValid(branchId)) {
+            return res.status(400).json({
+              success: false,
+              message: 'Invalid branch ID format'
+            });
+          }
+          
+          const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+          const hasAccess = accessibleBranchIds.some(bid => 
+            bid.toString() === requestedBranchId.toString()
+          );
+          
+          if (!hasAccess) {
+            return res.status(403).json({
+              success: false,
+              message: 'You do not have access to this branch'
+            });
+          }
+          filter.branch = requestedBranchId;
+        } else {
+          // No specific branch requested or 'all' - show all accessible branches
+          filter.branch = { $in: accessibleBranchIds };
+        }
+      } else if (user.branch) {
+        // User has OWN branch access
+        filter.branch = user.branch._id;
+      } else {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have access to any branch'
+        });
+      }
+    } else {
+      // User HAS access to all branches (Super Admin, etc.)
+      if (branchId && branchId.toLowerCase() !== 'all') {
+        // Validate branchId format before creating ObjectId
+        if (!mongoose.Types.ObjectId.isValid(branchId)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid branch ID format'
+          });
+        }
+        filter.branch = new mongoose.Types.ObjectId(branchId);
+      }
+      // If branchId is 'all' or not provided, no branch filter is applied
+    }
+
+    // ========== DATE RANGE FILTER ==========
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      
+      if (startDate) {
+        // Validate date format
+        const start = new Date(startDate);
+        if (isNaN(start.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid start date format'
+          });
+        }
+        start.setHours(0, 0, 0, 0);
+        filter.createdAt.$gte = start;
+      }
+      
+      if (endDate) {
+        // Validate date format
+        const end = new Date(endDate);
+        if (isNaN(end.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid end date format'
+          });
+        }
+        end.setHours(23, 59, 59, 999);
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    console.log('Broker Report Filter:', JSON.stringify(filter, null, 2));
+
+    // ========== FETCH BOOKINGS WITH EXCHANGE ==========
+    const bookings = await Booking.find(filter)
+      .populate('branch', 'name')
+      .populate('model', 'model_name')
+      .populate({
+        path: 'exchangeDetails.broker',
+        select: 'name mobile'
+      })
+      .lean();
+
+    console.log(`Found ${bookings.length} exchange bookings`);
+
+    if (bookings.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No exchange bookings found',
+        hint: 'No bookings with exchange:true found in the database'
+      });
+    }
+
+    // ========== GET BOOKING IDs TO FETCH LEDGER ENTRIES ==========
+    const bookingIds = bookings.map(booking => booking._id);
+    
+    // ========== FETCH LEDGER ENTRIES FOR EXCHANGE REFERENCE NUMBERS ==========
+    // Get ledger entries with paymentMode = 'Exchange' to get transactionReference
+    const ledgerEntries = await Ledger.find({
+      booking: { $in: bookingIds },
+      paymentMode: 'Exchange', // Filter for Exchange payment mode
+      isDebit: false // Credit entries (receipts)
+    })
+    .select('booking transactionReference receiptNumber amount')
+    .lean();
+
+    console.log(`Found ${ledgerEntries.length} exchange ledger entries`);
+
+    // ========== CREATE MAP OF BOOKING ID TO EXCHANGE REFERENCE ==========
+    const exchangeReferenceMap = new Map();
+    
+    ledgerEntries.forEach(ledger => {
+      const bookingId = ledger.booking.toString();
+      
+      // Get transactionReference from ledger - THIS IS THE EXCHANGE REFERENCE NUMBER
+      let exchangeRef = '';
+      
+      // Priority 1: transactionReference field (EXACTLY AS REQUESTED)
+      if (ledger.transactionReference) {
+        exchangeRef = ledger.transactionReference;
+      }
+      // Priority 2: receiptNumber as fallback
+      else if (ledger.receiptNumber) {
+        exchangeRef = ledger.receiptNumber;
+      }
+      
+      // Store the reference in the map (allow multiple references per booking)
+      if (!exchangeReferenceMap.has(bookingId)) {
+        exchangeReferenceMap.set(bookingId, []);
+      }
+      
+      // Only add non-empty references
+      if (exchangeRef && exchangeRef.trim() !== '') {
+        exchangeReferenceMap.get(bookingId).push(exchangeRef);
+      }
+    });
+
+    console.log('Exchange Reference Map created for', exchangeReferenceMap.size, 'bookings');
+
+    // ========== GENERATE EXCEL REPORT ==========
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Broker Report');
+
+    // EXACT 10 COLUMNS - AS REQUESTED
+    const columns = [
+      { header: 'Booking Date', key: 'bookingDate', width: 15 },
+      { header: 'Branch Name', key: 'branchName', width: 25 },
+      { header: 'Booking Number', key: 'bookingNumber', width: 20 },
+      { header: 'Exchange Amount', key: 'exchangeAmount', width: 18, style: { numFmt: '#,##0.00' } },
+      { header: 'Broker Name', key: 'brokerName', width: 25 },
+      { header: 'Exchange Vehicle Number', key: 'vehicleNumber', width: 20 },
+      { header: 'Exchange Chassis Number', key: 'chassisNumber', width: 25 },
+      { header: 'Customer Name', key: 'customerName', width: 25 },
+      { header: 'Model', key: 'model', width: 20 },
+      { header: 'Exchange Reference Number', key: 'referenceNumber', width: 25 }
+    ];
+
+    worksheet.columns = columns;
+
+    // ADD DATA ROWS - ONLY THE 10 FIELDS
+    bookings.forEach((booking) => {
+      const bookingId = booking._id.toString();
+      
+      // Get exchange reference from ledger entries
+      let exchangeReference = '';
+      const references = exchangeReferenceMap.get(bookingId);
+      
+      if (references && references.length > 0) {
+        // Join multiple references if they exist
+        exchangeReference = references.filter(ref => ref && ref.trim() !== '').join(', ');
+      }
+
+      const row = {
+        bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+        branchName: booking.branch?.name || '',
+        bookingNumber: booking.bookingNumber || '',
+        exchangeAmount: booking.exchangeDetails?.price || 0,
+        brokerName: booking.exchangeDetails?.broker?.name || 'NO BROKER ASSIGNED',
+        vehicleNumber: booking.exchangeDetails?.vehicleNumber || '',
+        chassisNumber: booking.exchangeDetails?.chassisNumber || '',
+        customerName: booking.customerDetails?.name || '',
+        model: booking.model?.model_name || '',
+        referenceNumber: exchangeReference // FROM LEDGER MODEL - transactionReference
+      };
+      worksheet.addRow(row);
+    });
+
+    // STYLE HEADER ROW
+    worksheet.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF4F81BD' }
+      };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+    });
+
+    // FORMAT AMOUNT COLUMN AND ALIGNMENT
+    for (let i = 1; i <= bookings.length; i++) {
+      const row = worksheet.getRow(i + 1);
+      
+      // Format amount column
+      const amountCell = row.getCell(4); // Exchange Amount column
+      if (typeof amountCell.value === 'number') {
+        amountCell.numFmt = '#,##0.00';
+        amountCell.alignment = { horizontal: 'right' };
+      }
+      
+      // Center align specific columns
+      const dateCell = row.getCell(1); // Booking Date
+      dateCell.alignment = { horizontal: 'center' };
+      
+      const bookingNoCell = row.getCell(3); // Booking Number
+      bookingNoCell.alignment = { horizontal: 'center' };
+      
+      const refNoCell = row.getCell(10); // Exchange Reference Number
+      refNoCell.alignment = { horizontal: 'center' };
+    }
+
+    // AUTO-FILTER
+    if (worksheet.rowCount > 1) {
+      worksheet.autoFilter = {
+        from: 'A1',
+        to: `J${worksheet.rowCount}`
+      };
+    }
+
+    // FREEZE HEADER
+    worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    // ========== SUMMARY SHEET ==========
+    const summarySheet = workbook.addWorksheet('Summary');
+
+    // Summary Title
+    summarySheet.mergeCells('A1:D1');
+    const titleCell = summarySheet.getCell('A1');
+    titleCell.value = 'BROKER EXCHANGE SUMMARY REPORT';
+    titleCell.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+    titleCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF4F81BD' }
+    };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Calculate totals
+    const totalExchangeAmount = bookings.reduce((sum, b) => sum + (b.exchangeDetails?.price || 0), 0);
+    const uniqueBrokers = [...new Set(bookings.map(b => b.exchangeDetails?.broker?._id?.toString()).filter(Boolean))];
+    const bookingsWithoutBroker = bookings.filter(b => !b.exchangeDetails?.broker).length;
+    const uniqueBookingsWithLedger = new Set(ledgerEntries.map(l => l.booking.toString())).size;
+    const bookingsWithoutLedgerEntries = bookings.length - uniqueBookingsWithLedger;
+
+    // Report Info
+    const infoRows = [
+      ['Report Generated:', moment().format('DD MMM YYYY HH:mm:ss')],
+      ['Total Exchange Bookings:', bookings.length],
+      ['Total Exchange Amount:', `₹${totalExchangeAmount.toFixed(2)}`],
+      ['Unique Brokers:', uniqueBrokers.length],
+      ['Bookings Without Broker:', bookingsWithoutBroker],
+      ['Bookings With Ledger Entries:', uniqueBookingsWithLedger],
+      ['Bookings Without Ledger Entries:', bookingsWithoutLedgerEntries],
+      ['Total Ledger Entries Found:', ledgerEntries.length],
+      ['Date Range:', startDate && endDate ? 
+        `${moment(startDate).format('DD/MM/YYYY')} to ${moment(endDate).format('DD/MM/YYYY')}` : 
+        'All Dates'],
+      ['Branch Filter:', branchId && branchId.toLowerCase() !== 'all' ? 
+        (bookings[0]?.branch?.name || 'Selected Branch') : 
+        (hasAllBranchesAccess ? 'All Branches' : 'User Accessible Branches')]
+    ];
+
+    infoRows.forEach(([label, value], index) => {
+      const rowNum = index + 3;
+      summarySheet.getCell(`A${rowNum}`).value = label;
+      summarySheet.getCell(`B${rowNum}`).value = value;
+      summarySheet.getCell(`A${rowNum}`).font = { bold: true };
+      summarySheet.getCell(`B${rowNum}`).font = { bold: true };
+      
+      if (typeof value === 'string' && value.startsWith('₹')) {
+        summarySheet.getCell(`B${rowNum}`).numFmt = '#,##0.00';
+      }
+    });
+
+    // ========== BROKER-WISE SUMMARY ==========
+    const brokerStartRow = infoRows.length + 5;
+
+    // Broker Summary Title
+    summarySheet.mergeCells(`A${brokerStartRow}:E${brokerStartRow}`);
+    const brokerTitleCell = summarySheet.getCell(`A${brokerStartRow}`);
+    brokerTitleCell.value = 'BROKER-WISE SUMMARY';
+    brokerTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+    brokerTitleCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF2E75B5' }
+    };
+    brokerTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Broker Summary Headers
+    const brokerHeaders = ['Broker Name', 'Mobile', 'Total Exchanges', 'Total Exchange Amount', 'Avg Exchange Amount'];
+    const brokerHeaderRow = brokerStartRow + 1;
+    brokerHeaders.forEach((header, colIndex) => {
+      const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${brokerHeaderRow}`);
+      cell.value = header;
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF4F81BD' }
+      };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+    });
+
+    // Group by broker
+    const brokerSummary = {};
+    
+    // Add "No Broker" category
+    brokerSummary['no_broker'] = {
+      brokerName: 'NO BROKER ASSIGNED',
+      mobile: '',
+      count: 0,
+      totalValue: 0
+    };
+    
+    bookings.forEach(booking => {
+      const broker = booking.exchangeDetails?.broker;
+      if (broker && broker._id) {
+        const brokerId = broker._id.toString();
+        
+        if (!brokerSummary[brokerId]) {
+          brokerSummary[brokerId] = {
+            brokerName: broker.name || 'Unknown',
+            mobile: broker.mobile || '',
+            count: 0,
+            totalValue: 0
+          };
+        }
+        
+        brokerSummary[brokerId].count++;
+        brokerSummary[brokerId].totalValue += booking.exchangeDetails?.price || 0;
+      } else {
+        brokerSummary['no_broker'].count++;
+        brokerSummary['no_broker'].totalValue += booking.exchangeDetails?.price || 0;
+      }
+    });
+
+    // Add broker summary data
+    let brokerRowIndex = 0;
+    Object.values(brokerSummary).forEach((broker) => {
+      if (broker.count === 0) return;
+      
+      const rowNum = brokerHeaderRow + 1 + brokerRowIndex;
+      const avgValue = broker.count > 0 ? broker.totalValue / broker.count : 0;
+      
+      summarySheet.getCell(`A${rowNum}`).value = broker.brokerName;
+      summarySheet.getCell(`B${rowNum}`).value = broker.mobile;
+      summarySheet.getCell(`C${rowNum}`).value = broker.count;
+      summarySheet.getCell(`D${rowNum}`).value = broker.totalValue;
+      summarySheet.getCell(`E${rowNum}`).value = avgValue;
+      
+      // Style
+      ['A', 'B', 'C', 'D', 'E'].forEach((col, colIndex) => {
+        const cell = summarySheet.getCell(`${col}${rowNum}`);
+        cell.alignment = { 
+          horizontal: colIndex === 0 || colIndex === 1 ? 'left' : 'right',
+          vertical: 'middle'
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        
+        if (brokerRowIndex % 2 === 0) {
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFF2F2F2' }
+          };
+        }
+        
+        if (colIndex === 3 || colIndex === 4) {
+          cell.numFmt = '#,##0.00';
+        }
+        
+        if (broker.brokerName === 'NO BROKER ASSIGNED') {
+          cell.font = { color: { argb: 'FFFF0000' }, italic: true };
+        }
+      });
+      
+      brokerRowIndex++;
+    });
+
+    // ========== BRANCH-WISE SUMMARY ==========
+    const branchSummaryStartRow = brokerHeaderRow + brokerRowIndex + 3;
+
+    // Branch Summary Title
+    summarySheet.mergeCells(`A${branchSummaryStartRow}:C${branchSummaryStartRow}`);
+    const branchTitleCell = summarySheet.getCell(`A${branchSummaryStartRow}`);
+    branchTitleCell.value = 'BRANCH-WISE SUMMARY';
+    branchTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+    branchTitleCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF2E75B5' }
+    };
+    branchTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Branch Summary Headers
+    const branchHeaders = ['Branch Name', 'Total Exchanges', 'Total Exchange Amount'];
+    const branchHeaderRow = branchSummaryStartRow + 1;
+    branchHeaders.forEach((header, colIndex) => {
+      const cell = summarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${branchHeaderRow}`);
+      cell.value = header;
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF4F81BD' }
+      };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+    });
+
+    // Group by branch
+    const branchSummary = {};
+    bookings.forEach(booking => {
+      const branchName = booking.branch?.name || 'Unknown Branch';
+      
+      if (!branchSummary[branchName]) {
+        branchSummary[branchName] = {
+          branchName: branchName,
+          count: 0,
+          totalValue: 0
+        };
+      }
+      
+      branchSummary[branchName].count++;
+      branchSummary[branchName].totalValue += booking.exchangeDetails?.price || 0;
+    });
+
+    // Add branch summary data
+    let branchRowIndex = 0;
+    Object.values(branchSummary).forEach((branch) => {
+      const rowNum = branchHeaderRow + 1 + branchRowIndex;
+      
+      summarySheet.getCell(`A${rowNum}`).value = branch.branchName;
+      summarySheet.getCell(`B${rowNum}`).value = branch.count;
+      summarySheet.getCell(`C${rowNum}`).value = branch.totalValue;
+      
+      // Style
+      ['A', 'B', 'C'].forEach((col, colIndex) => {
+        const cell = summarySheet.getCell(`${col}${rowNum}`);
+        cell.alignment = { 
+          horizontal: colIndex === 0 ? 'left' : 'right',
+          vertical: 'middle'
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        
+        if (branchRowIndex % 2 === 0) {
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFF2F2F2' }
+          };
+        }
+        
+        if (colIndex === 2) {
+          cell.numFmt = '#,##0.00';
+        }
+      });
+      
+      branchRowIndex++;
+    });
+
+    // Add totals row
+    const branchTotalRow = branchHeaderRow + branchRowIndex + 1;
+    summarySheet.getCell(`A${branchTotalRow}`).value = 'GRAND TOTAL';
+    summarySheet.getCell(`A${branchTotalRow}`).font = { bold: true };
+    summarySheet.getCell(`A${branchTotalRow}`).alignment = { horizontal: 'right' };
+    
+    summarySheet.getCell(`B${branchTotalRow}`).value = bookings.length;
+    summarySheet.getCell(`B${branchTotalRow}`).font = { bold: true };
+    summarySheet.getCell(`B${branchTotalRow}`).alignment = { horizontal: 'right' };
+    
+    summarySheet.getCell(`C${branchTotalRow}`).value = totalExchangeAmount;
+    summarySheet.getCell(`C${branchTotalRow}`).numFmt = '#,##0.00';
+    summarySheet.getCell(`C${branchTotalRow}`).font = { bold: true };
+    summarySheet.getCell(`C${branchTotalRow}`).alignment = { horizontal: 'right' };
+
+    // ========== LEDGER REFERENCE SUMMARY SHEET ==========
+    const ledgerSummarySheet = workbook.addWorksheet('Ledger References');
+
+    // Ledger Summary Title
+    ledgerSummarySheet.mergeCells('A1:D1');
+    const ledgerTitleCell = ledgerSummarySheet.getCell('A1');
+    ledgerTitleCell.value = 'LEDGER EXCHANGE REFERENCE NUMBERS';
+    ledgerTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+    ledgerTitleCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF4F81BD' }
+    };
+    ledgerTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // Ledger Summary Headers
+    const ledgerHeaders = ['Booking Number', 'Customer Name', 'Exchange Reference Number', 'Receipt Number', 'Amount'];
+    const ledgerHeaderRow = 3;
+    ledgerHeaders.forEach((header, colIndex) => {
+      const cell = ledgerSummarySheet.getCell(`${String.fromCharCode(65 + colIndex)}${ledgerHeaderRow}`);
+      cell.value = header;
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF2E75B5' }
+      };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+    });
+
+    // Add ledger reference data
+    let ledgerRowIndex = 4;
+    ledgerEntries.forEach((ledger) => {
+      const booking = bookings.find(b => b._id.toString() === ledger.booking.toString());
+      if (booking) {
+        ledgerSummarySheet.getCell(`A${ledgerRowIndex}`).value = booking.bookingNumber || '';
+        ledgerSummarySheet.getCell(`B${ledgerRowIndex}`).value = booking.customerDetails?.name || '';
+        ledgerSummarySheet.getCell(`C${ledgerRowIndex}`).value = ledger.transactionReference || '';
+        ledgerSummarySheet.getCell(`D${ledgerRowIndex}`).value = ledger.receiptNumber || '';
+        ledgerSummarySheet.getCell(`E${ledgerRowIndex}`).value = ledger.amount || 0;
+        
+        // Style
+        ['A', 'B', 'C', 'D', 'E'].forEach((col, colIndex) => {
+          const cell = ledgerSummarySheet.getCell(`${col}${ledgerRowIndex}`);
+          cell.alignment = { 
+            horizontal: colIndex === 0 || colIndex === 1 || colIndex === 2 || colIndex === 3 ? 'left' : 'right',
+            vertical: 'middle'
+          };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+          
+          if ((ledgerRowIndex - 4) % 2 === 0) {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          }
+          
+          if (colIndex === 4) {
+            cell.numFmt = '#,##0.00';
+          }
+        });
+        
+        ledgerRowIndex++;
+      }
+    });
+
+    ledgerSummarySheet.columns = [
+      { width: 20 },
+      { width: 25 },
+      { width: 30 },
+      { width: 20 },
+      { width: 18 }
+    ];
+
+    // ========== FILTER INFO SHEET ==========
+    const filterSheet = workbook.addWorksheet('Filter Info');
+
+    filterSheet.mergeCells('A1:C1');
+    const filterTitleCell = filterSheet.getCell('A1');
+    filterTitleCell.value = 'REPORT FILTERS APPLIED';
+    filterTitleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+    filterTitleCell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF4F81BD' }
+    };
+    filterTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+    const filterData = [
+      ['Filter', 'Value'],
+      ['Exchange Status', 'YES (All Exchange Bookings)'],
+      ['Exchange Reference Source', 'Ledger Model - transactionReference'],
+      ['Date Range', startDate && endDate ? 
+        `${moment(startDate).format('DD/MM/YYYY')} to ${moment(endDate).format('DD/MM/YYYY')}` : 
+        'All Dates'],
+      ['Branch', branchId && branchId.toLowerCase() !== 'all' ? 
+        (bookings[0]?.branch?.name || 'Selected Branch') : 
+        (hasAllBranchesAccess ? 'All Branches' : 'User Accessible Branches')],
+      ['Total Exchange Bookings', bookings.length],
+      ['Total Ledger Entries', ledgerEntries.length],
+      ['Generated On', moment().format('DD/MM/YYYY HH:mm:ss')],
+      ['Generated By', user.name || user.email]
+    ];
+
+    filterData.forEach((row, index) => {
+      const rowNum = index + 3;
+      filterSheet.getCell(`A${rowNum}`).value = row[0];
+      filterSheet.getCell(`B${rowNum}`).value = row[1];
+      
+      filterSheet.getCell(`A${rowNum}`).font = index === 0 ? { bold: true } : {};
+      filterSheet.getCell(`B${rowNum}`).font = index === 0 ? { bold: true } : {};
+      
+      filterSheet.getCell(`A${rowNum}`).border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      filterSheet.getCell(`B${rowNum}`).border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+    });
+
+    filterSheet.columns = [
+      { width: 25 },
+      { width: 40 },
+      { width: 20 }
+    ];
+
+    // ========== SEND EXCEL FILE ==========
+    const fileName = `broker_exchange_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+    
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${fileName}"`
+    );
+
+    await workbook.xlsx.write(res);
+    return res.end();
+
+  } catch (error) {
+    console.error('Error generating broker report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating broker report',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Generate Verified Amount Outstanding Report
+ * Shows ONLY bookings with verified/approved payments > 0
+ * REMOVES the "Pending Verification Amount" column
+ * ONLY FETCHES BOOKINGS WHERE Verified Amount > 0
+ * @route GET /api/v1/reports/outstanding/verified
+ * @access Private
+ */
+// exports.generateVerifiedOutstandingReport = async (req, res) => {
 //   try {
-//     const {
-//       chassisNumber,
-//       unloadLocation,
-//       model: modelId,
-//       color: colorInput, // expecting { id, name }
-//       batteryNumber,
-//       keyNumber,
-//       motorNumber,
-//       chargerNumber,
-//       engineNumber,
-//       hasDamage = false,
-//       damages = []
-//     } = req.body;
+//     const { 
+//       branchId, 
+//       startDate, 
+//       endDate, 
+//       status,
+//       minBalance,
+//       maxBalance,
+//       modelType,
+//       format = 'excel' 
+//     } = req.query;
 
-//     // Validate IDs
-//     if (!mongoose.Types.ObjectId.isValid(unloadLocation)) {
-//       return next(new AppError('Invalid branch ID format', 400));
+//     // Build filter conditions
+//     const filter = {};
+
+//     // Get user info from auth middleware
+//     const userId = req.user.id;
+    
+//     // Fetch user with all necessary data
+//     const user = await User.findById(userId)
+//       .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+//       .populate({
+//         path: 'roles',
+//         select: 'name isSuperAdmin permissionsCount'
+//       })
+//       .populate('branch')
+//       .populate({
+//         path: 'accessibleBranches',
+//         model: 'Branch',
+//         select: '_id name address city state pincode phone email is_active logo1'
+//       })
+//       .lean();
+
+//     if (!user) {
+//       return res.status(404).json({
+//         success: false,
+//         message: 'User not found'
+//       });
 //     }
 
-//     if (!mongoose.Types.ObjectId.isValid(modelId)) {
-//       return next(new AppError('Invalid model ID format', 400));
+//     console.log(`👤 User: ${user.name} (${user.email})`);
+//     console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+//     console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+//     console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
+    
+//     // Check user roles and permissions
+//     const userRoles = user.roles || [];
+    
+//     const isActualSuperAdmin = userRoles.some(role => 
+//       role.name === "SUPERADMIN"
+//     ) || false;
+    
+//     const isSuperAdminFlag = userRoles.some(role => 
+//       role.isSuperAdmin === true
+//     ) || false;
+    
+//     const branchAccess = user.branchAccess || 'OWN';
+    
+//     let hasAllBranchesAccess = false;
+    
+//     if (isActualSuperAdmin) {
+//       hasAllBranchesAccess = true;
+//       console.log('✅ User is SUPERADMIN - has access to all branches');
+//     } else if (branchAccess === 'ALL') {
+//       hasAllBranchesAccess = true;
+//       console.log('✅ User has ALL branch access permission');
+//     } else if (isSuperAdminFlag) {
+//       hasAllBranchesAccess = true;
+//       console.log('✅ User is ADMIN/GM - has access to all branches');
+//     } else {
+//       console.log('ℹ️ User has restricted branch access');
 //     }
 
-//     if (!mongoose.Types.ObjectId.isValid(colorInput?.id)) {
-//       return next(new AppError('Invalid color ID format', 400));
+//     // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+//     let availableBranches = [];
+    
+//     if (hasAllBranchesAccess) {
+//       availableBranches = await Branch.find({ is_active: true })
+//         .select('_id name address city')
+//         .sort({ name: 1 })
+//         .lean();
+//       console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+//     } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+//       availableBranches = user.accessibleBranches.map(branch => ({
+//         _id: branch._id,
+//         name: branch.name,
+//         address: branch.address,
+//         city: branch.city
+//       })).sort((a, b) => a.name.localeCompare(b.name));
+//       console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+//     } else if (user.branch) {
+//       availableBranches = [{
+//         _id: user.branch._id,
+//         name: user.branch.name,
+//         address: user.branch.address,
+//         city: user.branch.city
+//       }];
+//       console.log('✅ Using only own branch for dropdown');
+//     }
+    
+//     if (availableBranches.length > 1) {
+//       availableBranches.unshift({
+//         _id: 'all',
+//         name: 'All Branches',
+//         address: '',
+//         city: ''
+//       });
+//       console.log('✅ Added "All Branches" option to dropdown');
 //     }
 
-//     // Fetch referenced model
-//     const model = await Model.findById(modelId).select('model_name type');
-//     if (!model) return next(new AppError('Model not found', 404));
-
-//     // Fetch color to confirm and get its name
-//     const colorDoc = await Color.findById(colorInput.id).select('name');
-//     if (!colorDoc) return next(new AppError('Color not found', 404));
-
-//     // Check chassis duplication
-//     const existing = await Vehicle.findOne({ chassisNumber: chassisNumber.toUpperCase() });
-//     if (existing) {
-//       const branch = await Branch.findById(existing.unloadLocation).select('name');
-//       return next(new AppError(
-//         `Duplicate Entry! Chassis number already exists in ${branch?.name || 'unknown branch'}`,
-//         409
-//       ));
+//     // ========== APPLY BRANCH FILTER ==========
+//     if (!hasAllBranchesAccess) {
+//       if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+//         const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        
+//         if (branchId) {
+//           if (branchId === 'all') {
+//             filter.branch = { $in: accessibleBranchIds };
+//             console.log('✅ Showing all accessible branches');
+//           } else {
+//             const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+//             const hasAccess = accessibleBranchIds.some(branchId => 
+//               branchId.toString() === requestedBranchId.toString()
+//             );
+            
+//             if (!hasAccess) {
+//               return res.status(403).json({
+//                 success: false,
+//                 message: 'You do not have access to this branch'
+//               });
+//             }
+//             filter.branch = requestedBranchId;
+//             console.log(`✅ Filtering by branch: ${branchId}`);
+//           }
+//         } else {
+//           filter.branch = { $in: accessibleBranchIds };
+//           console.log('✅ Showing all accessible branches (no branch filter)');
+//         }
+//       } else {
+//         console.log('User has only OWN branch access');
+//         if (user.branch && user.branch._id) {
+//           filter.branch = user.branch._id;
+//           console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+//         } else {
+//           return res.status(403).json({
+//             success: false,
+//             message: 'You do not have access to any branch'
+//           });
+//         }
+//       }
+//     } else {
+//       if (branchId) {
+//         if (branchId === 'all') {
+//           console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+//         } else {
+//           filter.branch = new mongoose.Types.ObjectId(branchId);
+//           console.log(`✅ Filtering by branch: ${branchId}`);
+//         }
+//       } else {
+//         console.log('✅ Showing ALL branches (no branch filter)');
+//       }
 //     }
 
-//     // Validate damages
-//     if (hasDamage && damages.length > 0) {
-//       for (let damage of damages) {
-//         if (
-//           typeof damage.description !== 'string' ||
-//           damage.description.trim().length === 0 ||
-//           !Array.isArray(damage.images) ||
-//           damage.images.length === 0
-//         ) {
-//           return next(new AppError('Each damage must include a description and at least one image', 400));
+//     // ========== DATE RANGE FILTER ==========
+//     if (startDate || endDate) {
+//       filter.createdAt = {};
+//       if (startDate) {
+//         const start = new Date(startDate);
+//         start.setHours(0, 0, 0, 0);
+//         filter.createdAt.$gte = start;
+//       }
+//       if (endDate) {
+//         const end = new Date(endDate);
+//         end.setHours(23, 59, 59, 999);
+//         filter.createdAt.$lte = end;
+//       }
+//     }
+
+//     // ========== STATUS FILTER ==========
+//     if (status) {
+//       filter.status = status;
+//     } else {
+//       filter.status = { 
+//         $nin: ['CANCELLED', 'COMPLETED', 'CANCELLED_APPROVE', 'CANCELLED_REJECTED'] 
+//       };
+//     }
+
+//     console.log('Verified Outstanding Report Filter:', JSON.stringify(filter, null, 2));
+
+//     // ========== FETCH BOOKINGS ==========
+//     const bookingsQuery = Booking.find(filter)
+//       .populate('model', 'model_name type')
+//       .populate('color', 'name')
+//       .populate('branch', 'name')
+//       .populate('salesExecutive', 'name')
+//       .populate({
+//         path: 'payment.financer',
+//         select: 'name'
+//       })
+//       .sort({ createdAt: -1 });
+
+//     // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+//     if (modelType) {
+//       console.log(`Applying model type filter: ${modelType}`);
+      
+//       const models = await mongoose.model('Model').find({ 
+//         type: modelType.toUpperCase()
+//       }).select('_id').lean();
+      
+//       const modelIds = models.map(model => model._id);
+      
+//       if (modelIds.length > 0) {
+//         bookingsQuery.where('model').in(modelIds);
+//         console.log(`Filtering by ${modelIds.length} ${modelType} models`);
+//       } else {
+//         console.log(`No ${modelType} models found`);
+//         if (format === 'excel') {
+//           const workbook = new ExcelJS.Workbook();
+//           const worksheet = workbook.addWorksheet('Verified Outstanding Report');
+          
+//           // Add headers even for empty report - BRANCH NAME AND BOOKING DATE AT START
+//           const headers = [
+//             'Branch Name',
+//             'Booking Date',
+//             'Booking Number',
+//             'Customer Name',
+//             'Mobile 1',
+//             'Mobile 2',
+//             'Model',
+//             'Model Type',
+//             'Color',
+//             'Booking Type',
+//             'Financier Name',
+//             'Deal Amount',
+//             'Verified Amount',
+//             'Balance Amount',
+//             'Booking Status'
+//           ];
+          
+//           const headerRow = worksheet.addRow(headers);
+//           headerRow.eachCell((cell) => {
+//             cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+//             cell.fill = {
+//               type: 'pattern',
+//               pattern: 'solid',
+//               fgColor: { argb: 'FF2E75B5' }
+//             };
+//           });
+          
+//           const fileName = `verified_outstanding_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+//           res.setHeader(
+//             'Content-Type',
+//             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+//           );
+//           res.setHeader(
+//             'Content-Disposition',
+//             `attachment; filename="${fileName}"`
+//           );
+          
+//           await workbook.xlsx.write(res);
+//           res.end();
+//           return;
+//         } else {
+//           return res.status(200).json({
+//             success: true,
+//             count: 0,
+//             totals: { 
+//               totalDealAmount: 0, 
+//               totalVerifiedAmount: 0, 
+//               totalBalanceAmount: 0
+//             },
+//             data: [],
+//             availableBranches: availableBranches,
+//             userAccessInfo: {
+//               hasAllBranchesAccess: hasAllBranchesAccess,
+//               branchAccess: branchAccess,
+//               accessibleBranchesCount: user.accessibleBranches?.length || 0,
+//               userBranch: user.branch ? {
+//                 _id: user.branch._id,
+//                 name: user.branch.name
+//               } : null
+//             },
+//             filters: {
+//               branchId: branchId,
+//               startDate: startDate,
+//               endDate: endDate,
+//               status: status,
+//               minBalance: minBalance,
+//               maxBalance: maxBalance,
+//               modelType: modelType,
+//               reportType: 'VERIFIED_OUTSTANDING'
+//             }
+//           });
 //         }
 //       }
 //     }
-
-//     // Create payload with proper color structure
-//     const vehiclePayload = {
-//       model: modelId,
-//       modelName: model.model_name,
-//       unloadLocation,
-//       type: model.type,
-//       colors: [colorInput.id],
-//       color: {  // This will store both ID and name
-//         id: colorInput.id,
-//         name: colorDoc.name
-//       },
-//       chassisNumber: chassisNumber.toUpperCase(),
-//       batteryNumber: batteryNumber?.toUpperCase(),
-//       keyNumber: keyNumber?.toUpperCase(),
-//       motorNumber: motorNumber?.toUpperCase(),
-//       chargerNumber: chargerNumber?.toUpperCase(),
-//       engineNumber: engineNumber?.toUpperCase(),
-//       hasDamage,
-//       damages,
-//       addedBy: req.user.id,
-//       status: 'not_approved' // Default status
-//     };
-
-//     const newVehicle = await Vehicle.create(vehiclePayload);
-
-//     // Format response
-//     const response = {
-//       ...newVehicle.toObject(),
-//       color: {
-//         id: colorInput.id,
-//         name: colorDoc.name
-//       }
-//     };
-
-//     // Remove `colors` array from response to avoid duplication
-//     delete response.colors;
-
-//     res.status(201).json({
-//       status: 'success',
-//       data: { vehicle: response }
-//     });
-
-//   } catch (err) {
-//     console.error('Vehicle creation error:', err);
-//     next(new AppError(err.message || 'Internal server error', 500));
-//   }
-// };
-
-
-///////{*********************** Harshali Changes *******************}
-/**
- * @route   GET /api/vehicles/chassis/:chassisNumber/details
- * @desc    Get complete vehicle details by chassis number including booking, transfer history, and stock movements
- * @access  Private
- */
-/**
- * @route   GET /api/vehicles/chassis/:chassisNumber/details
- * @desc    Get specific vehicle details by chassis number
- * @access  Private
- */
-exports.getVehicleDetailsByChassisNumber = async (req, res, next) => {
-  try {
-    const { chassisNumber } = req.params;
-
-    if (!chassisNumber) {
-      return next(new AppError('Chassis number is required', 400));
-    }
-
-    console.log(`[GET-VEHICLE-DETAILS] Fetching details for chassis: ${chassisNumber}`);
-
-    // 1. Find the vehicle by chassis number with specific population
-    const vehicle = await Vehicle.findOne({ 
-      chassisNumber: chassisNumber.toUpperCase() 
-    })
-    .populate([
-      {
-        path: 'model',
-        select: 'model_name type',
-        model: 'Model'
-      },
-      {
-        path: 'color.id',
-        select: 'name',
-        model: 'Color'
-      },
-      {
-        path: 'unloadLocation',
-        select: 'name address city state',
-        model: 'Branch'
-      },
-      {
-        path: 'allocatedBooking',
-        select: 'bookingNumber',
-        model: 'Booking'
-      },
-      {
-        path: 'booking',
-        select: 'bookingNumber',
-        model: 'Booking'
-      }
-    ])
-    .select('chassisNumber keyNumber engineNumber batteryNumber motorNumber chargerNumber model color unloadLocation subdealerLocation locationType status allocatedBooking booking customerName customerPhone customerAadhaar');
-
-    if (!vehicle) {
-      return next(new AppError(`No vehicle found with chassis number: ${chassisNumber}`, 404));
-    }
-
-    console.log(`[GET-VEHICLE-DETAILS] Found vehicle: ${vehicle._id}`);
-
-    // 2. Get booking information
-    let bookingNumber = null;
-    
-    // Check multiple sources for booking number
-    if (vehicle.allocatedBooking && vehicle.allocatedBooking.bookingNumber) {
-      bookingNumber = vehicle.allocatedBooking.bookingNumber;
-    } else if (vehicle.booking && vehicle.booking.bookingNumber) {
-      bookingNumber = vehicle.booking.bookingNumber;
-    }
-
-    // 3. Get current location information
-    let currentLocation = null;
-    
-    if (vehicle.locationType === 'branch' && vehicle.unloadLocation) {
-      const branch = vehicle.unloadLocation;
-      currentLocation = {
-        type: 'branch',
-        locationId: branch._id.toString(),
-        locationName: branch.name || '',
-        address: `${branch.address || ''}, ${branch.city || ''}, ${branch.state || ''}`.trim(),
-        branch: null // As specified in response
-      };
-    } else if (vehicle.locationType === 'subdealer' && vehicle.subdealerLocation) {
-      // If subdealer location, you might need to populate it first
-      // For now, we'll handle basic case
-      const subdealer = vehicle.subdealerLocation;
-      currentLocation = {
-        type: 'subdealer',
-        locationId: subdealer._id ? subdealer._id.toString() : subdealer.toString(),
-        locationName: 'Subdealer Location',
-        address: '',
-        branch: null
-      };
-    }
-
-    // 4. Get model details
-    let modelDetails = null;
-    if (vehicle.model) {
-      modelDetails = {
-        id: vehicle.model._id.toString(),
-        name: vehicle.model.model_name || '',
-        type: vehicle.model.type || vehicle.type || 'UNKNOWN'
-      };
-    }
-
-    // 5. Get color details
-    let colorDetails = null;
-    if (vehicle.color && vehicle.color.id) {
-      // Handle different color data structures
-      if (typeof vehicle.color.id === 'object') {
-        // Color is populated
-        colorDetails = {
-          id: vehicle.color.id._id.toString(),
-          name: vehicle.color.id.name || ''
-        };
-      } else if (vehicle.color.id && vehicle.color.name) {
-        // Color has id and name separately
-        colorDetails = {
-          id: vehicle.color.id.toString(),
-          name: vehicle.color.name || ''
-        };
-      }
-    }
-
-    // 6. Prepare the response exactly as specified
-    const response = {
-      chassisNumber: vehicle.chassisNumber || '',
-      keyNumber: vehicle.keyNumber || '',
-      engineNumber: vehicle.engineNumber || '',
-      batteryNumber: vehicle.batteryNumber || '',
-      model: modelDetails ? {
-        id: modelDetails.id,
-        name: modelDetails.name,
-        type: modelDetails.type
-      } : null,
-      color: colorDetails ? {
-        id: colorDetails.id,
-        name: colorDetails.name
-      } : null,
-      currentLocation: currentLocation,
-      status: {
-        current: vehicle.status || '',
-        description: getStatusDescription(vehicle.status)
-      },
-      bookingInfo: bookingNumber ? {
-        bookingNumber: bookingNumber
-      } : null
-    };
-
-    // Remove null values for cleaner response
-    Object.keys(response).forEach(key => {
-      if (response[key] === null || response[key] === undefined) {
-        delete response[key];
-      }
-    });
-
-    console.log(`[GET-VEHICLE-DETAILS] Successfully fetched details for ${chassisNumber}`);
-
-    res.status(200).json({
-      status: 'success',
-      data: response
-    });
-
-  } catch (err) {
-    console.error(`[GET-VEHICLE-DETAILS] Error: ${err.message}`);
-    console.error(err.stack);
-    
-    logger.error(`Error fetching vehicle details by chassis number: ${err.message}`, {
-      error: err.stack,
-      chassisNumber: req.params.chassisNumber,
-      userId: req.user?.id
-    });
-    
-    next(new AppError('Failed to fetch vehicle details', 500));
-  }
-};
-// Helper function to get status description
-function getStatusDescription(status) {
-  const statusMap = {
-    'not_approved': 'Pending Approval',
-    'in_stock': 'Available for Sale (Open for Sale)',
-    'open_for_sale': 'Available for Sale',
-    'booked': 'Booked by Customer',
-    'blocked': 'Temporarily Blocked',
-    'stock_transfer': 'In Stock Transfer',
-    'in_transit': 'In Transit',
-    'sold': 'Sold',
-    'service': 'In Service',
-    'damaged': 'Damaged',
-    'hold': 'On Hold',
-    'FROZEN': 'Frozen/Unavailable'
-  };
-  
-  return statusMap[status] || status || 'Unknown';
-}
-// Helper function to get status description
-function getStatusDescription(status) {
-  const statusMap = {
-    'not_approved': 'Pending Approval',
-    'in_stock': 'Available for Sale (Open for Sale)',
-    'open_for_sale': 'Available for Sale',
-    'booked': 'Booked by Customer',
-    'blocked': 'Temporarily Blocked',
-    'stock_transfer': 'In Stock Transfer',
-    'in_transit': 'In Transit',
-    'sold': 'Sold',
-    'service': 'In Service',
-    'damaged': 'Damaged',
-    'hold': 'On Hold',
-    'FROZEN': 'Frozen/Unavailable'
-  };
-  
-  return statusMap[status] || status;
-}
-exports.createVehicle = async (req, res, next) => {
-  try {
-    const {
-      chassisNumber,
-      unloadLocation,
-      model: modelId,
-      color: colorInput,
-      batteryNumber,
-      keyNumber,
-      motorNumber,
-      chargerNumber,
-      engineNumber,
-      hasDamage = false,
-      damages = []
-    } = req.body;
-
-    console.log('Received request body:', req.body); // Debug log
-
-    // Basic validation
-    if (!chassisNumber) return next(new AppError('Chassis number is required', 400));
-    if (!unloadLocation) return next(new AppError('Unload location is required', 400));
-    if (!modelId) return next(new AppError('Model is required', 400));
-    if (!colorInput?.id) return next(new AppError('Color is required', 400));
-
-    // Fetch referenced model - GET THE TYPE FROM MODEL
-    const model = await Model.findById(modelId).select('model_name type');
-    if (!model) return next(new AppError('Model not found', 404));
-
-    // Determine vehicle type from model
-    let vehicleType = 'ICE'; // Default to ICE
-    if (model.type) {
-      // Convert model type to EV/ICE
-      if (model.type.toUpperCase().includes('EV') || model.type.toUpperCase().includes('ELECTRIC')) {
-        vehicleType = 'EV';
-      } else {
-        vehicleType = 'ICE';
-      }
-    }
-
-    // Fetch color to confirm and get its name
-    const colorDoc = await Color.findById(colorInput.id).select('name');
-    if (!colorDoc) return next(new AppError('Color not found', 404));
-
-    // Check chassis duplication
-    const existing = await Vehicle.findOne({ chassisNumber: chassisNumber.toUpperCase() });
-    if (existing) {
-      const branch = await Branch.findById(existing.unloadLocation).select('name');
-      return next(new AppError(
-        `Duplicate Entry! Chassis number already exists in ${branch?.name || 'unknown branch'}`,
-        409
-      ));
-    }
-
-    // Validate damages
-    if (hasDamage && damages.length > 0) {
-      for (let damage of damages) {
-        if (
-          typeof damage.description !== 'string' ||
-          damage.description.trim().length === 0 ||
-          !Array.isArray(damage.images) ||
-          damage.images.length === 0
-        ) {
-          return next(new AppError('Each damage must include a description and at least one image', 400));
-        }
-      }
-    }
-
-    // Prepare vehicle payload - GET TYPE FROM MODEL
-    const vehiclePayload = {
-      model: modelId,
-      modelName: model.model_name,
-      unloadLocation,
-      type: vehicleType, // Get from model, not from request
-      colors: [colorInput.id],
-      color: { 
-        id: colorInput.id,
-        name: colorDoc.name
-      },
-      chassisNumber: chassisNumber.toUpperCase(),
-      batteryNumber: batteryNumber?.toUpperCase(),
-      keyNumber: keyNumber?.toUpperCase(),
-      motorNumber: motorNumber?.toUpperCase(),
-      chargerNumber: chargerNumber?.toUpperCase(),
-      engineNumber: engineNumber?.toUpperCase(),
-      hasDamage,
-      damages,
-      addedBy: req.user.id,
-      status: 'not_approved',
-    };
-
-    // Clean up empty strings - IMPORTANT: Don't delete required fields
-    // Only delete optional fields that are empty
-    const optionalFields = ['batteryNumber', 'keyNumber', 'motorNumber', 'chargerNumber', 'engineNumber'];
-    optionalFields.forEach(field => {
-      if (vehiclePayload[field] === '' || vehiclePayload[field] === null || vehiclePayload[field] === undefined) {
-        delete vehiclePayload[field];
-      }
-    });
-
-    console.log('Vehicle payload being saved:', JSON.stringify(vehiclePayload, null, 2)); // Debug log
-
-    // Create vehicle - NO validateBeforeSave option needed
-    const newVehicle = await Vehicle.create(vehiclePayload);
-
-    const qrCodePath = await generateVehicleQRCode(newVehicle);
-   
-    newVehicle.qrCode = qrCodePath;
-    await newVehicle.save();
-
-    // Format response
-    const response = {
-      ...newVehicle.toObject(),
-      color: {
-        id: colorInput.id,
-        name: colorDoc.name
-      }
-    };
-
-    // Remove `colors` array from response to avoid duplication
-    delete response.colors;
-
-    res.status(201).json({
-      status: 'success',
-      data: { 
-        vehicle: response, 
-        qrCodeUrl: `${req.protocol}://${req.get('host')}${qrCodePath}` 
-      }
-    });
-
-  } catch (err) {
-    console.error('Vehicle creation error details:', err);
-    
-    // Handle specific error cases
-    if (err.name === 'ValidationError') {
-      // Extract validation messages
-      const messages = Object.values(err.errors).map(val => val.message);
-      console.log('Validation errors:', messages);
-      return next(new AppError(`Validation failed: ${messages.join(', ')}`, 400));
-    }
-    
-    if (err.code === 11000) {
-      if (err.keyValue?.chassisNumber) {
-        return next(new AppError(`Chassis number ${err.keyValue.chassisNumber} already exists`, 409));
-      }
-      if (err.keyValue?.qrCode) {
-        return next(new AppError('QR Code conflict, please try again', 409));
-      }
-    }
-    
-    next(new AppError(err.message || 'Internal server error', 500));
-  }
-};
-// exports.approveVehicles = async (req, res, next) => {
-//   try {
-//     const { vehicleIds } = req.body;
-
-//     if (!vehicleIds || !Array.isArray(vehicleIds) || vehicleIds.length === 0) {
-//       return next(new AppError('Please provide an array of vehicle IDs to approve', 400));
-//     }
-
-//     // Validate all IDs
-//     const invalidIds = vehicleIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
-//     if (invalidIds.length > 0) {
-//       return next(new AppError(`Invalid vehicle IDs: ${invalidIds.join(', ')}`, 400));
-//     }
-
-//     // Update all vehicles to in_stock status
-//     const result = await Vehicle.updateMany(
-//       { 
-//         _id: { $in: vehicleIds },
-//         status: 'not_approved' // Only approve vehicles that are not already approved
-//       },
-//       { 
-//         $set: { 
-//           status: 'in_stock',
-//           lastUpdatedBy: req.user.id 
-//         } 
-//       }
-//     );
-
-//     if (result.modifiedCount === 0) {
-//       return next(new AppError('No vehicles were approved (either already approved or not found)', 404));
-//     }
-
-//     res.status(200).json({
-//       status: 'success',
-//       data: {
-//         approvedCount: result.modifiedCount,
-//         message: `${result.modifiedCount} vehicle(s) approved successfully`
-//       }
-//     });
-
-//   } catch (err) {
-//     logger.error(`Error approving vehicles: ${err.message}`);
-//     next(new AppError('Server Error', 500));
-//   }
-// };
-
-
-////{*********************************** HARSHALI CHANGES **********************}
-
-exports.approveVehicles = async (req, res, next) => {
-  try {
-    const { vehicleIds } = req.body;
-
-    if (!vehicleIds || !Array.isArray(vehicleIds) || vehicleIds.length === 0) {
-      return next(new AppError('Please provide an array of vehicle IDs to approve', 400));
-    }
-    
-    const invalidIds = vehicleIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
-    if (invalidIds.length > 0) {
-      return next(new AppError(`Invalid vehicle IDs: ${invalidIds.join(', ')}`, 400));
-    }
-
-    const vehiclesToApprove = await Vehicle.find({
-      _id: { $in: vehicleIds },
-      status: 'not_approved'
-    });
-
-    if (vehiclesToApprove.length === 0) {
-      return next(new AppError('No vehicles were found for approval (either already approved or not found)', 404));
-    }
-
-    const updatePromises = vehicleIds.map(async (vehicleId) => {
-      try {
-        const vehicle = await Vehicle.findById(vehicleId);
-        if (!vehicle || vehicle.status !== 'not_approved') {
-          return null;
-        }
-
-        // Store old status
-        const oldStatus = vehicle.status;
-        
-        // Approve vehicle
-        vehicle.status = 'in_stock';
-        vehicle.lastUpdatedBy = req.user.id;
-        await vehicle.save();
-
-        console.log(`[APPROVE-VEHICLE] Vehicle ${vehicle.chassisNumber} approved: ${oldStatus} -> in_stock`);
-
-        // ===== CHECK WAITING LIST FOR THIS VEHICLE =====
-        console.log(`[APPROVE-VEHICLE] Checking waiting list for vehicle: ${vehicle.chassisNumber}`);
-        
-        // Use the imported function
-        const waitingListResult = await checkAndAssignFromWaitingList(vehicle, req.user.id);
-        
-        let autoAllocated = false;
-        let waitingListInfo = null;
-        let qrCodePath = null;
-
-        // If vehicle was auto-allocated from waiting list
-        if (waitingListResult.success) {
-          console.log(`[APPROVE-VEHICLE] Auto-allocated to: ${waitingListResult.waitingEntry.customerName}`);
-          autoAllocated = true;
-          
-          waitingListInfo = {
-            waitingListEntryId: waitingListResult.waitingEntry?._id,
-            customerName: waitingListResult.waitingEntry.customerName,
-            bookingId: waitingListResult.waitingEntry.bookingId,
-            allocationStatus: waitingListResult.status,
-            allocationDate: new Date()
-          };
-
-          // Generate QR code for the auto-allocated vehicle
-          try {
-            qrCodePath = await generateVehicleQRCode(vehicle);
-            vehicle.qrCode = qrCodePath;
-            await vehicle.save();
-            console.log(`[APPROVE-VEHICLE] QR code generated for auto-allocated vehicle`);
-          } catch (qrError) {
-            logger.error(`QR error for ${vehicle._id}: ${qrError.message}`);
-          }
-          
-          // Create audit log for auto-allocation (with valid enum value)
-          try {
-            await mongoose.model('AuditLog').create({
-              action: 'VEHICLE_ALLOCATED', // Changed to valid enum value
-              entity: 'Vehicle',
-              entityId: vehicle._id,
-              user: req.user.id,
-              ip: req.ip,
-              status: 'SUCCESS',
-              metadata: {
-                vehicleChassis: vehicle.chassisNumber,
-                oldStatus: oldStatus,
-                newStatus: vehicle.status,
-                waitingListEntryId: waitingListResult.waitingEntry._id,
-                customerName: waitingListResult.waitingEntry.customerName,
-                bookingId: waitingListResult.waitingEntry.bookingId,
-                allocationType: 'AUTO_FROM_WAITING_LIST'
-              }
-            });
-          } catch (auditError) {
-            console.error(`[APPROVE-VEHICLE] Audit log creation failed:`, auditError.message);
-          }
-        } else {
-          // Vehicle not auto-allocated, just generate QR code
-          console.log(`[APPROVE-VEHICLE] No waiting list match for ${vehicle.chassisNumber}`);
-          
-          try {
-            qrCodePath = await generateVehicleQRCode(vehicle);
-            vehicle.qrCode = qrCodePath;
-            await vehicle.save();
-            console.log(`[APPROVE-VEHICLE] QR code generated for approved vehicle`);
-          } catch (qrError) {
-            logger.error(`QR error for ${vehicle._id}: ${qrError.message}`);
-          }
-          
-          // Create audit log for approval only
-          try {
-            await mongoose.model('AuditLog').create({
-              action: 'VEHICLE_CREATED', // Changed to valid enum value
-              entity: 'Vehicle',
-              entityId: vehicle._id,
-              user: req.user.id,
-              ip: req.ip,
-              status: 'SUCCESS',
-              metadata: {
-                vehicleChassis: vehicle.chassisNumber,
-                oldStatus: oldStatus,
-                newStatus: vehicle.status,
-                approvedBy: req.user.id
-              }
-            });
-          } catch (auditError) {
-            console.error(`[APPROVE-VEHICLE] Audit log creation failed:`, auditError.message);
-          }
-        }
-
-        // Update FIFO rank and eligibility
-        try {
-          await vehicle.updateFifoRankAndEligibility();
-          console.log(`[APPROVE-VEHICLE] FIFO rank updated for ${vehicle.chassisNumber}: ${vehicle.fifoRank}`);
-        } catch (fifoError) {
-          console.warn(`[APPROVE-VEHICLE] FIFO update failed: ${fifoError.message}`);
-        }
-
-        return {
-          vehicleId: vehicle._id,
-          chassisNumber: vehicle.chassisNumber,
-          modelName: vehicle.modelName,
-          color: vehicle.color.name,
-          location: vehicle.unloadLocation,
-          oldStatus: oldStatus,
-          newStatus: vehicle.status,
-          autoAllocated: autoAllocated,
-          waitingListInfo: waitingListInfo,
-          qrCodeGenerated: !!qrCodePath,
-          qrCodePath: qrCodePath,
-          fifoRank: vehicle.fifoRank,
-          requiresGmApproval: vehicle.requiresGmApproval,
-          success: true
-        };
-
-      } catch (error) {
-        console.error(`[APPROVE-VEHICLE] Error approving vehicle ${vehicleId}:`, error.message);
-        console.error(error.stack);
-        
-        // Create error audit log with valid enum value
-        try {
-          await mongoose.model('AuditLog').create({
-            action: 'VEHICLE_UPDATE', // Changed to valid enum value
-            entity: 'Vehicle',
-            entityId: vehicleId,
-            user: req.user.id,
-            ip: req.ip,
-            status: 'FAILED',
-            error: error.message,
-            metadata: {
-              vehicleId: vehicleId,
-              approvedBy: req.user.id
-            }
-          });
-        } catch (auditError) {
-          console.error(`[APPROVE-VEHICLE] Error audit log creation failed:`, auditError.message);
-        }
-        
-        return {
-          vehicleId,
-          error: error.message,
-          success: false
-        };
-      }
-    });
-
-    const results = await Promise.all(updatePromises);
-    
-    // Filter out null results and separate successful/failed
-    const successfulApprovals = results.filter(r => r && r.success);
-    const failedApprovals = results.filter(r => r && !r.success);
-    const skippedVehicles = results.filter(r => r === null);
-    
-    // Count auto-allocations
-    const autoAllocatedVehicles = successfulApprovals.filter(r => r.autoAllocated);
-    
-    // Get vehicle details for response
-    const approvedVehiclesDetails = await Vehicle.find({
-      _id: { $in: successfulApprovals.map(r => r.vehicleId) }
-    })
-    .populate('unloadLocation', 'name')
-    .populate('model', 'model_name')
-    .populate('color.id', 'name')
-    .select('chassisNumber modelName color status unloadLocation qrCode fifoRank');
-
-    // Update response with full vehicle details
-    const enhancedResults = successfulApprovals.map(result => {
-      const vehicleDetail = approvedVehiclesDetails.find(v => v._id.toString() === result.vehicleId.toString());
-      return {
-        ...result,
-        vehicleDetails: vehicleDetail ? {
-          chassisNumber: vehicleDetail.chassisNumber,
-          model: vehicleDetail.model?.model_name || vehicleDetail.modelName,
-          color: vehicleDetail.color?.name || 'Unknown',
-          location: vehicleDetail.unloadLocation?.name || 'Unknown',
-          status: vehicleDetail.status,
-          qrCodeUrl: vehicleDetail.qrCode ? 
-            `${req.protocol}://${req.get('host')}${vehicleDetail.qrCode}` : null,
-          fifoRank: vehicleDetail.fifoRank,
-          requiresGmApproval: vehicleDetail.requiresGmApproval
-        } : null
-      };
-    });
-
-    console.log(`[APPROVE-VEHICLE] Approval summary:`, {
-      totalRequested: vehicleIds.length,
-      successful: successfulApprovals.length,
-      failed: failedApprovals.length,
-      skipped: skippedVehicles.length,
-      autoAllocated: autoAllocatedVehicles.length,
-      remainingInStock: successfulApprovals.length - autoAllocatedVehicles.length
-    });
-
-    res.status(200).json({
-      status: 'success',
-      data: {
-        approvalSummary: {
-          totalRequested: vehicleIds.length,
-          successfullyApproved: successfulApprovals.length,
-          failedApprovals: failedApprovals.length,
-          skippedVehicles: skippedVehicles.length,
-          autoAllocatedToWaitingList: autoAllocatedVehicles.length,
-          remainingInStock: successfulApprovals.length - autoAllocatedVehicles.length
-        },
-        approvedVehicles: enhancedResults,
-        failedApprovals: failedApprovals.map(f => ({
-          vehicleId: f.vehicleId,
-          error: f.error
-        })),
-        autoAllocatedVehicles: autoAllocatedVehicles.map(a => ({
-          vehicleId: a.vehicleId,
-          chassisNumber: a.chassisNumber,
-          customerName: a.waitingListInfo?.customerName,
-          bookingId: a.waitingListInfo?.bookingId,
-          allocationStatus: a.waitingListInfo?.allocationStatus
-        })),
-        message: `${successfulApprovals.length} vehicle(s) approved successfully. ${autoAllocatedVehicles.length} vehicle(s) auto-allocated to waiting customers.`
-      }
-    });
-
-  } catch (err) {
-    console.error(`[APPROVE-VEHICLE] System error:`, err.message);
-    console.error(err.stack);
-    
-    logger.error(`Error approving vehicles: ${err.message}`, {
-      error: err.stack,
-      userId: req.user.id,
-      vehicleIds: req.body.vehicleIds
-    });
-    
-    // Create system error audit log with valid enum value
-    try {
-      await mongoose.model('AuditLog').create({
-        action: 'SYSTEM_ERROR', // Changed to valid enum value
-        entity: 'System',
-        entityId: null,
-        user: req.user.id,
-        ip: req.ip,
-        status: 'FAILED',
-        error: err.message,
-        metadata: {
-          vehicleIds: req.body.vehicleIds,
-          totalVehicles: req.body.vehicleIds?.length || 0,
-          approvedBy: req.user.id
-        }
-      });
-    } catch (auditError) {
-      console.error(`[APPROVE-VEHICLE] System error audit log creation failed:`, auditError.message);
-    }
-    
-    next(new AppError('Server Error while approving vehicles', 500));
-  }
-};
-
-exports.getVehicleCounts = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user.id).populate('branch');
-    
-    if (await user.isSuperAdmin()) {
-      const branches = await Branch.find({ is_active: true });
-      
-      const branchCounts = await Promise.all(
-        branches.map(async (branch) => {
-          const counts = await Vehicle.aggregate([
-            { $match: { unloadLocation: branch._id } },
-            { $group: { 
-              _id: '$status', 
-              count: { $sum: 1 } 
-            }},
-            { $project: { 
-              status: '$_id', 
-              count: 1, 
-              _id: 0 
-            }}
-          ]);
-          
-          const statusCounts = counts.map(item => ({
-            status: item.status,
-            count: item.count
-          }));
-          
-          const total = statusCounts.reduce((sum, item) => sum + item.count, 0);
-          
-          return {
-            branchId: branch._id,
-            branchName: branch.name,
-            branchCity: branch.city,
-            statusCounts,
-            total
-          };
-        })
-      );
-      
-      return res.status(200).json({
-        status: 'success',
-        data: {
-          counts: branchCounts
-        }
-      });
-    }
-    
-    if (!user.branch) {
-      return next(new AppError('User is not assigned to any branch', 400));
-    }
-    
-    const counts = await Vehicle.aggregate([
-      { $match: { unloadLocation: user.branch._id } },
-      { $group: { 
-        _id: '$status', 
-        count: { $sum: 1 } 
-      }},
-      { $project: { 
-        status: '$_id', 
-        count: 1, 
-        _id: 0 
-      }}
-    ]);
-    
-    const statusCounts = counts.map(item => ({
-      status: item.status,
-      count: item.count
-    }));
-    
-    const total = statusCounts.reduce((sum, item) => sum + item.count, 0);
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        branchId: user.branch._id,
-        branchName: user.branch.name,
-        branchCity: user.branch.city,
-        statusCounts,
-        total
-      }
-    });
-    
-  } catch (err) {
-    logger.error(`Error getting vehicle counts: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-// @route   GET /api/v1/vehicles/my-subdealer
-// @desc    Get vehicles assigned to the logged-in subdealer's location
-// @access  Private (Subdealer users only)
-exports.getMySubdealerVehicles = async (req, res, next) => {
-  try {
-    // Get the logged-in user's subdealer ID
-    const userSubdealerId = req.user.subdealer;
-    
-    if (!userSubdealerId) {
-      return next(new AppError('User is not associated with any subdealer', 400));
-    }
-
-    const { type, status, model, color, hasDamage } = req.query;
-    
-    // Build base query for subdealer's vehicles
-    let query = Vehicle.find({
-      locationType: 'subdealer',
-      subdealerLocation: userSubdealerId
-    });
-    
-    // Apply filters
-    if (type && ['EV', 'ICE'].includes(type.toUpperCase())) {
-      query = query.where('type').equals(type.toUpperCase());
-    }
-    
-    if (status) {
-      query = query.where('status').equals(status.toLowerCase());
-    }
-    
-    if (model) {
-      query = query.where('model').equals(model);
-    }
-    
-    if (color) {
-      query = query.where('color').equals(color);
-    }
-    
-    if (hasDamage === 'true') {
-      query = query.where('hasDamage').equals(true);
-    } else if (hasDamage === 'false') {
-      query = query.where('hasDamage').equals(false);
-    }
-    
-    // Populate options
-    const populateOptions = [
-      { path: 'model', select: 'model_name type' },
-      { path: 'subdealerLocation', select: 'name location' },
-      { path: 'color.id', select: 'name hex_code' },
-      { path: 'addedBy', select: 'name email' }
-    ];
-    
-    query = query.populate(populateOptions);
-    
-    // Execute query
-    const vehicles = await query;
-    
-    // Transform response
-    const transformedVehicles = vehicles.map(vehicle => {
-      const vehicleObj = vehicle.toObject();
-      
-      // Ensure modelName is included
-      if (!vehicleObj.modelName && vehicle.model) {
-        vehicleObj.modelName = vehicle.model.model_name || 'Unknown Model';
-      }
-      
-      // Add subdealer details
-      if (!vehicleObj.subdealerLocation && vehicle.subdealerLocation) {
-        vehicleObj.subdealerLocation = {
-          _id: vehicle.subdealerLocation._id,
-          name: vehicle.subdealerLocation.name,
-          location: vehicle.subdealerLocation.location
-        };
-      }
-      
-      // Add addedBy details
-      if (!vehicleObj.addedBy && vehicle.addedBy) {
-        vehicleObj.addedBy = {
-          _id: vehicle.addedBy._id,
-          name: vehicle.addedBy.name || 'Unknown User'
-        };
-      }
-      
-      return vehicleObj;
-    });
-    
-    res.status(200).json({
-      status: 'success',
-      results: transformedVehicles.length,
-      data: {
-        vehicles: transformedVehicles
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting subdealer vehicles: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.getAllVehicles = async (req, res, next) => {
-    try {
-      console.time('[VEHICLE-GET-ALL] Total Time');
-      
-      console.log('[VEHICLE-GET-ALL] Starting with user:', {
-        id: req.user?._id,
-        roles: req.user?.roles,
-        branch: req.user?.branch,
-        branchAccess: req.user?.branchAccess,
-        subdealer: req.user?.subdealer
-      });
-  
-      // ========== PAGINATION PARAMETERS ==========
-      const page = Math.max(1, parseInt(req.query.page) || 1);
-      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
-      const skip = (page - 1) * limit;
-      
-      // Sort configuration
-      const sortField = req.query.sortBy || 'createdAt';
-      const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
-      const sort = { [sortField]: sortOrder, _id: 1 };
-      
-      console.log('[VEHICLE-GET-ALL] Pagination params:', { page, limit, skip, sort });
-  
-      // ========== BUILD FILTER ==========
-      const filter = {};
-      
-      // Handle search parameter - USING REGEX INSTEAD OF TEXT SEARCH
-      if (req.query.search && req.query.search.trim() !== '') {
-        const searchTerm = req.query.search.trim();
-        
-        // Use $or with regex for multiple fields - NO TEXT INDEX NEEDED
-        filter.$or = [
-          { chassisNumber: { $regex: searchTerm, $options: 'i' } },
-          { engineNumber: { $regex: searchTerm, $options: 'i' } },
-          { registrationNumber: { $regex: searchTerm, $options: 'i' } },
-          { vehicleId: { $regex: searchTerm, $options: 'i' } },
-          { modelName: { $regex: searchTerm, $options: 'i' } }
-        ];
-        
-        // If search term looks like an ObjectId (24 hex chars), also search by _id
-        if (searchTerm.match(/^[0-9a-fA-F]{24}$/)) {
-          filter.$or.push({ _id: searchTerm });
-        }
-      }
-      
-      // Add other filters
-      if (req.query.status) {
-        filter.status = req.query.status;
-      }
-      
-      if (req.query.model) {
-        filter.model = req.query.model;
-      }
-      
-      if (req.query.locationType) {
-        filter.locationType = req.query.locationType;
-        
-        if (req.query.locationType === 'branch' && req.query.unloadLocation) {
-          filter.unloadLocation = req.query.unloadLocation;
-        }
-        
-        if (req.query.locationType === 'subdealer' && req.query.subdealerLocation) {
-          filter.subdealerLocation = req.query.subdealerLocation;
-        }
-      }
-      
-      console.log('[VEHICLE-GET-ALL] Final filter:', JSON.stringify(filter, null, 2));
-  
-      // ========== OPTIMIZED COUNT QUERY ==========
-      const countOptions = {};
-      
-      if (filter.status && !filter.$and && !filter.$or) {
-        countOptions.hint = { status: 1 };
-      } else if (filter.model) {
-        countOptions.hint = { model: 1 };
-      }
-      
-      const totalCount = await Vehicle.countDocuments(filter, countOptions);
-      console.log(`[VEHICLE-GET-ALL] Total vehicles matching filter: ${totalCount}`);
-      
-      if (totalCount === 0) {
-        return res.status(200).json({
-          status: 'success',
-          message: 'No vehicles found',
-          data: {
-            vehicles: [],
-            pagination: {
-              page,
-              limit,
-              totalCount: 0,
-              totalPages: 0,
-              hasNextPage: false,
-              hasPrevPage: false
-            },
-            userAccess: req.user ? {
-              id: req.user._id,
-              branch: req.user.branch,
-              branchAccess: req.user.branchAccess,
-              roles: req.user.roles
-            } : null
-          }
-        });
-      }
-  
-      // ========== OPTIMIZED VEHICLE QUERY ==========
-      let query = Vehicle.find(filter)
-        .sort(sort)
-        .skip(skip)
-        .limit(limit)
-        .lean();
-      
-      if (filter.status && !filter.$and && !filter.$or) {
-        query = query.hint({ status: 1, [sortField]: sortOrder });
-      } else if (filter.model) {
-        query = query.hint({ model: 1, [sortField]: sortOrder });
-      } else if (filter.locationType) {
-        if (filter.locationType === 'branch' && filter.unloadLocation) {
-          query = query.hint({ locationType: 1, unloadLocation: 1, [sortField]: sortOrder });
-        } else if (filter.locationType === 'subdealer' && filter.subdealerLocation) {
-          query = query.hint({ locationType: 1, subdealerLocation: 1, [sortField]: sortOrder });
-        }
-      }
-      
-      let vehicles = await query;
-      console.log(`[VEHICLE-GET-ALL] Fetched ${vehicles.length} vehicles`);
-  
-      // ========== BATCH POPULATE ==========
-      if (vehicles.length > 0) {
-        const modelIds = [...new Set(vehicles.map(v => v.model).filter(Boolean))];
-        const branchIds = [...new Set(vehicles.map(v => v.unloadLocation).filter(Boolean))];
-        const subdealerIds = [...new Set(vehicles.map(v => v.subdealerLocation).filter(Boolean))];
-        const colorIds = [...new Set(vehicles.map(v => v.color?.id).filter(Boolean))];
-        const bookingIds = [...new Set(vehicles.map(v => v.allocatedBooking).filter(Boolean))];
-        
-        const [models, branches, subdealers, colors, bookings] = await Promise.all([
-          modelIds.length ? mongoose.model('Model').find({ _id: { $in: modelIds } }).select('model_name').lean() : [],
-          branchIds.length ? mongoose.model('Branch').find({ _id: { $in: branchIds } }).select('name city state').lean() : [],
-          subdealerIds.length ? mongoose.model('Subdealer').find({ _id: { $in: subdealerIds } }).select('name branch').lean() : [],
-          colorIds.length ? mongoose.model('Color').find({ _id: { $in: colorIds } }).select('name hex_code').lean() : [],
-          bookingIds.length ? mongoose.model('Booking').find({ _id: { $in: bookingIds } }).select('bookingNumber customerDetails.name').lean() : []
-        ]);
-        
-        const modelMap = Object.fromEntries(models.map(m => [m._id.toString(), m]));
-        const branchMap = Object.fromEntries(branches.map(b => [b._id.toString(), b]));
-        const subdealerMap = Object.fromEntries(subdealers.map(s => [s._id.toString(), s]));
-        const colorMap = Object.fromEntries(colors.map(c => [c._id.toString(), c]));
-        const bookingMap = Object.fromEntries(bookings.map(b => [b._id.toString(), b]));
-        
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
-        
-        vehicles = vehicles.map(vehicle => {
-          const model = modelMap[vehicle.model?.toString()];
-          const branch = branchMap[vehicle.unloadLocation?.toString()];
-          const subdealer = subdealerMap[vehicle.subdealerLocation?.toString()];
-          const color = colorMap[vehicle.color?.id?.toString()];
-          const booking = bookingMap[vehicle.allocatedBooking?.toString()];
-          
-          const inwardDate = vehicle.inwardDate || vehicle.createdAt;
-          const ageInDays = inwardDate ? 
-            Math.floor((Date.now() - new Date(inwardDate)) / (1000 * 60 * 60 * 24)) : 0;
-          
-          let statusDescription = vehicle.status;
-          switch(vehicle.status) {
-            case 'IN_WAREHOUSE':
-              statusDescription = 'In Warehouse';
-              break;
-            case 'ALLOCATED':
-              statusDescription = 'Allocated to Booking';
-              break;
-            case 'DISPATCHED':
-              statusDescription = 'Dispatched';
-              break;
-            case 'DELIVERED':
-              statusDescription = 'Delivered';
-              break;
-            default:
-              statusDescription = vehicle.status;
-          }
-          
-          return {
-            ...vehicle,
-            modelName: model?.model_name || vehicle.modelName || 'Unknown Model',
-            model: model || vehicle.model,
-            unloadLocation: branch || vehicle.unloadLocation,
-            subdealerLocation: subdealer || vehicle.subdealerLocation,
-            color: color ? { id: color._id, name: color.name, hex_code: color.hex_code } : vehicle.color,
-            allocatedBooking: booking || vehicle.allocatedBooking,
-            ageInDays,
-            isUnder10Days: ageInDays <= 10,
-            qrCodeUrl: vehicle.qrCode ? `${baseUrl}${vehicle.qrCode}` : null,
-            statusDescription
-          };
-        });
-      }
-  
-      // ========== RESPONSE ==========
-      const totalPages = Math.ceil(totalCount / limit);
-      
-      const response = {
-        status: 'success',
-        message: 'Vehicles retrieved successfully',
-        data: {
-          vehicles,
-          pagination: {
-            page,
-            limit,
-            totalCount,
-            totalPages,
-            hasNextPage: page < totalPages,
-            hasPrevPage: page > 1
-          },
-          userAccess: req.user ? {
-            id: req.user._id,
-            branch: req.user.branch,
-            branchAccess: req.user.branchAccess,
-            roles: req.user.roles
-          } : null
-        }
-      };
-      
-      console.timeEnd('[VEHICLE-GET-ALL] Total Time');
-      res.status(200).json(response);
-      
-    } catch (err) {
-      console.error('[VEHICLE-GET-ALL] Error:', err.message);
-      console.error('[VEHICLE-GET-ALL] Stack:', err.stack);
-      
-      if (err.name === 'CastError') {
-        return next(new AppError('Invalid ID format in query parameters', 400));
-      }
-      
-      next(new AppError('Server Error while fetching vehicles', 500));
-    }
-  };
-  
-  // ========== OPTIMIZED FILTER BUILDER ==========
-  async function buildOptimizedFilter(req) {
-    const filter = {};
-    const { query, user } = req;
-    
-    // Basic filters
-    if (query.type && ['EV', 'ICE'].includes(query.type.toUpperCase())) {
-      filter.type = query.type.toUpperCase();
-    }
-    
-    // Status filter (single or multiple)
-    if (query.statuses) {
-      const statuses = query.statuses.split(',').map(s => s.toLowerCase().trim());
-      const validStatuses = statuses.filter(s => 
-        ['not_approved', 'open_for_sale', 'booked', 'blocked', 'stock_transfer', 
-         'in_stock', 'in_transit', 'sold', 'service', 'damaged', 'hold', 'FROZEN'].includes(s)
-      );
-      if (validStatuses.length > 0) {
-        filter.status = { $in: validStatuses };
-      }
-    } else if (query.status) {
-      const statusLower = query.status.toLowerCase();
-      if (['not_approved', 'open_for_sale', 'booked', 'blocked', 'stock_transfer', 
-           'in_stock', 'in_transit', 'sold', 'service', 'damaged', 'hold', 'FROZEN'].includes(statusLower)) {
-        filter.status = statusLower;
-      }
-    }
-    
-    // ID-based filters
-    if (query.model && mongoose.Types.ObjectId.isValid(query.model)) {
-      filter.model = mongoose.Types.ObjectId(query.model);
-    }
-    
-    if (query.color && mongoose.Types.ObjectId.isValid(query.color)) {
-      filter['color.id'] = mongoose.Types.ObjectId(query.color);
-    }
-    
-    // Location filter
-    if (query.location && mongoose.Types.ObjectId.isValid(query.location)) {
-      filter.$or = [
-        { locationType: 'branch', unloadLocation: mongoose.Types.ObjectId(query.location) },
-        { locationType: 'subdealer', subdealerLocation: mongoose.Types.ObjectId(query.location) }
-      ];
-    }
-    
-    // Boolean filters
-    if (query.hasDamage === 'true') filter.hasDamage = true;
-    if (query.hasDamage === 'false') filter.hasDamage = false;
-    
-    // Date range filter
-    if (query.dateFrom || query.dateTo) {
-      filter.createdAt = {};
-      if (query.dateFrom) filter.createdAt.$gte = new Date(query.dateFrom);
-      if (query.dateTo) filter.createdAt.$lte = new Date(query.dateTo);
-    }
-    
-    // Search filter - use $regex for partial matching (more flexible than text search)
-    if (query.search && query.search.trim()) {
-      const searchTerm = query.search.trim();
-      const searchRegex = new RegExp(searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      
-      const searchConditions = [
-        { chassisNumber: searchRegex },
-        { vinNumber: searchRegex },
-        { customerName: searchRegex },
-        { motorNumber: searchRegex },
-        { engineNumber: searchRegex },
-        { batteryNumber: searchRegex },
-        { keyNumber: searchRegex },
-        { chargerNumber: searchRegex }
-      ];
-      
-      if (filter.$or) {
-        filter.$and = [{ $or: searchConditions }, { $or: filter.$or }];
-        delete filter.$or;
-      } else {
-        filter.$or = searchConditions;
-      }
-    }
-    
-    // ========== BRANCH ACCESS FILTER ==========
-    const branchFilter = await buildBranchFilter(user);
-    if (Object.keys(branchFilter).length > 0) {
-      if (Object.keys(filter).length === 0) {
-        return branchFilter;
-      } else if (filter.$and) {
-        filter.$and.push(branchFilter);
-      } else if (filter.$or) {
-        filter.$and = [branchFilter, { $or: filter.$or }];
-        delete filter.$or;
-      } else {
-        return { $and: [filter, branchFilter] };
-      }
-    }
-    
-    return filter;
-  }
-  
-  // ========== BRANCH FILTER BUILDER ==========
-  async function buildBranchFilter(user) {
-    if (!user) return {};
-    
-    const branchAccess = user.branchAccess || 'OWN';
-    
-    if (branchAccess === 'ALL') {
-      console.log('[BRANCH-FILTER] User has ALL access - no filter applied');
-      return {};
-    }
-    
-    const filter = {};
-    const userBranch = user.branch;
-    const userSubdealer = user.subdealer;
-    const accessibleBranches = user.accessibleBranches || [];
-    
-    console.log('[BRANCH-FILTER] Building branch filter:', {
-      branchAccess,
-      userBranchId: userBranch,
-      userSubdealerId: userSubdealer,
-      accessibleBranchesCount: accessibleBranches.length
-    });
-    
-    if (branchAccess === 'OWN') {
-      if (userBranch) {
-        // Get subdealer IDs for this branch
-        const subdealerIds = await mongoose.model('Subdealer')
-          .find({ branch: userBranch })
-          .distinct('_id')
-          .lean();
-        
-        filter.$or = [
-          { locationType: 'branch', unloadLocation: userBranch },
-          { locationType: 'subdealer', subdealerLocation: { $in: subdealerIds } }
-        ];
-      } else if (userSubdealer) {
-        filter.locationType = 'subdealer';
-        filter.subdealerLocation = userSubdealer;
-      }
-    } 
-    else if (branchAccess === 'ASSIGNED') {
-      const branchConditions = [];
-      
-      // Assigned branches
-      if (accessibleBranches.length > 0) {
-        const branchIds = accessibleBranches.map(b => b._id || b);
-        branchConditions.push({
-          locationType: 'branch',
-          unloadLocation: { $in: branchIds }
-        });
-      }
-      
-      // User's own branch
-      if (userBranch) {
-        branchConditions.push({
-          locationType: 'branch',
-          unloadLocation: userBranch
-        });
-      }
-      
-      // User's subdealer
-      if (userSubdealer) {
-        branchConditions.push({
-          locationType: 'subdealer',
-          subdealerLocation: userSubdealer
-        });
-      }
-      
-      if (branchConditions.length > 0) {
-        filter.$or = branchConditions;
-      }
-    }
-    
-    return filter;
-  }
-  
-  // ========== GET USER ACCESS INFO ==========
-  async function getUserAccessInfo(user) {
-    if (!user) return null;
-    
-    let userBranchInfo = null;
-    if (user.branch) {
-      if (user.branchDetails) {
-        userBranchInfo = {
-          _id: user.branch,
-          name: user.branchDetails.name || 'Unknown Branch',
-          city: user.branchDetails.city
-        };
-      } else {
-        const branch = await mongoose.model('Branch')
-          .findById(user.branch)
-          .select('name city')
-          .lean();
-        if (branch) {
-          userBranchInfo = {
-            _id: user.branch,
-            name: branch.name,
-            city: branch.city
-          };
-        }
-      }
-    }
-    
-    return {
-      branchAccess: user.branchAccess || 'OWN',
-      userBranch: userBranchInfo,
-      userSubdealer: user.subdealer ? {
-        _id: user.subdealer,
-        name: user.subdealerDetails?.name || 'Unknown Subdealer'
-      } : null,
-      accessibleBranchesCount: user.accessibleBranches?.length || 0,
-      userRoles: Array.isArray(user.roles) 
-        ? user.roles.map(r => r.name || r) 
-        : []
-    };
-  }
-  
-  // ========== HELPER FUNCTIONS ==========
-  function getSortField(sortBy) {
-    const sortMap = {
-      'createdAt': 'createdAt',
-      'updatedAt': 'updatedAt',
-      'chassisNumber': 'chassisNumber',
-      'status': 'status',
-      'age': 'inwardDate',
-      'inwardDate': 'inwardDate'
-    };
-    return sortMap[sortBy] || 'createdAt';
-  }
-  
-  function getStatusDescription(status) {
-    const descriptions = {
-      'not_approved': 'Pending Approval',
-      'open_for_sale': 'Available for Sale',
-      'booked': 'Booked',
-      'blocked': 'Blocked',
-      'stock_transfer': 'Stock Transfer',
-      'in_stock': 'In Stock',
-      'in_transit': 'In Transit',
-      'sold': 'Sold',
-      'service': 'In Service',
-      'damaged': 'Damaged',
-      'hold': 'On Hold',
-      'FROZEN': 'Frozen'
-    };
-    return descriptions[status] || status;
-  }
-
-
-  
-  // ========== OPTIMIZATION 4: SEPARATE FUNCTION FOR PAGINATED VEHICLES ==========
-  async function getPaginatedVehicles(req) {
-    console.time('[VEHICLE-GET-ALL] Query Time');
-    
-    // Pagination parameters with defaults
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20)); // Max 100 items
-    const skip = (page - 1) * limit;
-    
-    // Sort configuration - index-friendly
-    const sortField = getSortField(req.query.sortBy);
-    const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
-    
-    // Build optimized filter
-    const filter = await buildOptimizedFilter(req);
-    
-    console.log('[VEHICLE-GET-ALL] Optimized filter:', JSON.stringify(filter));
-    
-    // OPTIMIZATION 5: USE AGGREGATION PIPELINE FOR BETTER PERFORMANCE
-    const pipeline = [
-      { $match: filter },
-      
-      // OPTIMIZATION 6: EARLY PROJECTION TO REDUCE DATA SIZE
-      {
-        $project: {
-          chassisNumber: 1,
-          vinNumber: 1,
-          model: 1,
-          'color.id': 1,
-          status: 1,
-          type: 1,
-          locationType: 1,
-          unloadLocation: 1,
-          subdealerLocation: 1,
-          createdAt: 1,
-          updatedAt: 1,
-          inwardDate: 1,
-          hasDamage: 1,
-          qrCode: 1,
-          customerName: 1,
-          // Add computed fields
-          ageInDays: {
-            $floor: {
-              $divide: [
-                { $subtract: [new Date(), { $ifNull: ['$inwardDate', '$createdAt'] }] },
-                1000 * 60 * 60 * 24
-              ]
-            }
-          }
-        }
-      },
-      
-      // OPTIMIZATION 7: EFFICIENT SORTING (USES INDEX)
-      { $sort: { [sortField]: sortOrder, _id: 1 } },
-      
-      // OPTIMIZATION 8: FAST PAGINATION
-      { $skip: skip },
-      { $limit: limit },
-      
-      // OPTIMIZATION 9: OPTIMIZED LOOKUPS - ONLY FETCH NEEDED FIELDS
-      {
-        $lookup: {
-          from: 'models',
-          localField: 'model',
-          foreignField: '_id',
-          as: 'model',
-          pipeline: [
-            { $project: { model_name: 1, type: 1 } }
-          ]
-        }
-      },
-      {
-        $lookup: {
-          from: 'branches',
-          localField: 'unloadLocation',
-          foreignField: '_id',
-          as: 'unloadLocation',
-          pipeline: [
-            { $project: { name: 1, city: 1, state: 1 } }
-          ]
-        }
-      },
-      {
-        $lookup: {
-          from: 'subdealers',
-          localField: 'subdealerLocation',
-          foreignField: '_id',
-          as: 'subdealerLocation',
-          pipeline: [
-            { $project: { name: 1, branch: 1 } }
-          ]
-        }
-      },
-      {
-        $lookup: {
-          from: 'colors',
-          localField: 'color.id',
-          foreignField: '_id',
-          as: 'colorInfo',
-          pipeline: [
-            { $project: { name: 1, hex_code: 1 } }
-          ]
-        }
-      },
-      {
-        $lookup: {
-          from: 'bookings',
-          localField: 'allocatedBooking',
-          foreignField: '_id',
-          as: 'allocatedBooking',
-          pipeline: [
-            { $project: { bookingNumber: 1, 'customerDetails.name': 1 } }
-          ]
-        }
-      },
-      
-      // OPTIMIZATION 10: TRANSFORM DATA STRUCTURE EFFICIENTLY
-      {
-        $addFields: {
-          modelName: { $arrayElemAt: ['$model.model_name', 0] },
-          'unloadLocation': { $arrayElemAt: ['$unloadLocation', 0] },
-          'subdealerLocation': { $arrayElemAt: ['$subdealerLocation', 0] },
-          'color.id': { $arrayElemAt: ['$colorInfo', 0] },
-          'allocatedBooking': { $arrayElemAt: ['$allocatedBooking', 0] },
-          isUnder10Days: { $lte: ['$ageInDays', 10] }
-        }
-      },
-      
-      // OPTIMIZATION 11: FINAL PROJECTION FOR RESPONSE
-      {
-        $project: {
-          chassisNumber: 1,
-          vinNumber: 1,
-          modelName: 1,
-          'color.id.name': 1,
-          'color.id.hex_code': 1,
-          status: 1,
-          type: 1,
-          locationType: 1,
-          'unloadLocation.name': 1,
-          'unloadLocation.city': 1,
-          'subdealerLocation.name': 1,
-          createdAt: 1,
-          inwardDate: 1,
-          ageInDays: 1,
-          isUnder10Days: 1,
-          hasDamage: 1,
-          qrCode: 1,
-          customerName: 1,
-          'allocatedBooking.bookingNumber': 1,
-          'allocatedBooking.customerDetails.name': 1
-        }
-      }
-    ];
-    
-    // OPTIMIZATION 12: PARALLEL COUNT AND DATA QUERIES
-    const [vehicles, totalCount] = await Promise.all([
-      Vehicle.aggregate(pipeline).allowDiskUse(true).hint({ [sortField]: sortOrder, _id: 1 }),
-      Vehicle.countDocuments(filter)
-    ]);
-    
-    console.timeEnd('[VEHICLE-GET-ALL] Query Time');
-    console.log(`[VEHICLE-GET-ALL] Fetched ${vehicles.length}/${totalCount} vehicles in ${skip}-${skip+limit} range`);
-    
-    // OPTIMIZATION 13: TRANSFORM QR CODE URL WITHOUT LOOP (USING MAP)
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
-    vehicles.forEach(v => {
-      if (v.qrCode) {
-        v.qrCodeUrl = `${baseUrl}${v.qrCode}`;
-      }
-      v.statusDescription = getStatusDescription(v.status);
-    });
-    
-    return {
-      vehicles,
-      totalCount,
-      page,
-      limit,
-      totalPages: Math.ceil(totalCount / limit),
-      hasNextPage: page < Math.ceil(totalCount / limit),
-      hasPrevPage: page > 1
-    };
-  }
-  
-  // ========== OPTIMIZATION 14: EFFICIENT FILTER BUILDING ==========
-  async function buildOptimizedFilter(req) {
-    const filter = {};
-    const { query, user } = req;
-    
-    // OPTIMIZATION 15: USE $in FOR MULTIPLE VALUES
-    if (query.statuses) {
-      const statuses = query.statuses.split(',').map(s => s.toLowerCase());
-      filter.status = { $in: statuses };
-    } else if (query.status) {
-      filter.status = query.status.toLowerCase();
-    }
-    
-    if (query.type) {
-      filter.type = query.type.toUpperCase();
-    }
-    
-    // OPTIMIZATION 16: USE OBJECTID CONVERSION ONCE
-    if (query.model && mongoose.Types.ObjectId.isValid(query.model)) {
-      filter.model = mongoose.Types.ObjectId(query.model);
-    }
-    
-    if (query.color && mongoose.Types.ObjectId.isValid(query.color)) {
-      filter['color.id'] = mongoose.Types.ObjectId(query.color);
-    }
-    
-    // OPTIMIZATION 17: BOOLEAN FILTERS
-    if (query.hasDamage === 'true') filter.hasDamage = true;
-    if (query.hasDamage === 'false') filter.hasDamage = false;
-    
-    // OPTIMIZATION 18: DATE RANGE WITH INDEX HINT
-    if (query.dateFrom || query.dateTo) {
-      filter.createdAt = {};
-      if (query.dateFrom) filter.createdAt.$gte = new Date(query.dateFrom);
-      if (query.dateTo) filter.createdAt.$lte = new Date(query.dateTo);
-    }
-    
-    // OPTIMIZATION 19: SEARCH WITH TEXT INDEX
-    if (query.search && query.search.trim()) {
-      // Use text index if available for faster search
-      filter.$text = { $search: query.search.trim() };
-    }
-    
-    // OPTIMIZATION 20: BRANCH ACCESS FILTER (CACHED)
-    const branchFilter = await buildBranchFilter(user);
-    if (Object.keys(branchFilter).length > 0) {
-      return { $and: [filter, branchFilter] };
-    }
-    
-    return filter;
-  }
-  
-  // ========== OPTIMIZATION 21: BRANCH FILTER WITH CACHING ==========
-  async function buildBranchFilter(user) {
-    const branchAccess = user?.branchAccess || 'OWN';
-    
-    if (branchAccess === 'ALL') return {};
-    
-    const filter = {};
-    const userBranch = user?.branch;
-    const userSubdealer = user?.subdealer;
-    
-    if (branchAccess === 'OWN') {
-      if (userBranch) {
-        // OPTIMIZATION: Get subdealer IDs efficiently
-        const subdealerIds = await mongoose.model('Subdealer')
-          .find({ branch: userBranch })
-          .distinct('_id')
-          .lean();
-        
-        filter.$or = [
-          { locationType: 'branch', unloadLocation: userBranch },
-          { locationType: 'subdealer', subdealerLocation: { $in: subdealerIds } }
-        ];
-      } else if (userSubdealer) {
-        filter.locationType = 'subdealer';
-        filter.subdealerLocation = userSubdealer;
-      }
-    } else if (branchAccess === 'ASSIGNED') {
-      const accessibleBranches = user?.accessibleBranches || [];
-      const branchIds = accessibleBranches.map(b => b._id || b);
-      
-      if (branchIds.length > 0 || userBranch) {
-        filter.$or = [
-          { locationType: 'branch', unloadLocation: { $in: [...branchIds, ...(userBranch ? [userBranch] : [])] } }
-        ];
-      }
-      
-      if (userSubdealer) {
-        filter.$or = filter.$or || [];
-        filter.$or.push({ locationType: 'subdealer', subdealerLocation: userSubdealer });
-      }
-    }
-    
-    return filter;
-  }
-  
-  // ========== OPTIMIZATION 22: HELPER FUNCTIONS ==========
-  function getSortField(sortBy) {
-    const sortMap = {
-      'createdAt': 'createdAt',
-      'updatedAt': 'updatedAt',
-      'chassisNumber': 'chassisNumber',
-      'status': 'status',
-      'age': 'inwardDate'
-    };
-    return sortMap[sortBy] || 'createdAt';
-  }
-  
-  async function getUserBranchInfo(user) {
-    if (!user?.branch) return null;
-    
-    if (user.branchDetails) {
-      return {
-        _id: user.branch,
-        name: user.branchDetails.name || 'Unknown Branch',
-        city: user.branchDetails.city
-      };
-    }
-    
-    const branch = await mongoose.model('Branch')
-      .findById(user.branch)
-      .select('name city')
-      .lean();
-      
-    return branch;
-  }
-  
-  async function getUserSubdealerIds(user) {
-    if (!user?.branch) return [];
-    
-    return mongoose.model('Subdealer')
-      .find({ branch: user.branch })
-      .distinct('_id')
-      .lean();
-  }
-  
-  // ========== OPTIMIZATION 23: CREATE INDEXES (RUN ONCE) ==========
-  /*
-  db.vehicles.createIndex({ status: 1, createdAt: -1 });
-  db.vehicles.createIndex({ locationType: 1, unloadLocation: 1 });
-  db.vehicles.createIndex({ locationType: 1, subdealerLocation: 1 });
-  db.vehicles.createIndex({ chassisNumber: "text", vinNumber: "text", customerName: "text" });
-  db.vehicles.createIndex({ createdAt: -1 });
-  db.vehicles.createIndex({ model: 1 });
-  db.vehicles.createIndex({ "color.id": 1 });
-  */
-exports.getVehicleById = async (req, res, next) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-    
-    const vehicle = await Vehicle.findById(req.params.vehicleId)
-      .populate(populateOptions);
-    
-    if (!vehicle) {
-      return next(new AppError('No vehicle found with that ID', 404));
-    }
-
-    const vehicleObj = vehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: vehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: vehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: vehicleObj
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting vehicle by ID: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.getVehicleByQrCode = async (req, res, next) => {
-  try {
-    const { qrCode } = req.params;
-    
-    const vehicle = await Vehicle.findOne({ qrCode })
-      .populate(populateOptions);
-    
-    if (!vehicle) {
-      return next(new AppError('No vehicle found with that QR code', 404));
-    }
-
-    const vehicleObj = vehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: vehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: vehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: vehicleObj
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting vehicle by QR code: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.updateVehicleStatus = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-    const { status } = req.body;
-    
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-    
-    if (!status || !['not_approved', 'in_stock', 'in_transit', 'sold', 'service', 'damaged'].includes(status)) {
-      return next(new AppError('Valid status is required', 400));
-    }
-    
-    const updatedVehicle = await Vehicle.findByIdAndUpdate(
-      vehicleId,
-      { status },
-      { new: true, runValidators: true }
-    ).populate(populateOptions);
-    
-    if (!updatedVehicle) {
-      return next(new AppError('No vehicle found with that ID', 404));
-    }
-
-    const vehicleObj = updatedVehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: updatedVehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: updatedVehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: vehicleObj
-      }
-    });
-  } catch (err) {
-    logger.error(`Error updating vehicle status: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.addDamage = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-    const { description, images } = req.body;
-    
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-    
-    if (!description || !images || images.length === 0) {
-      return next(new AppError('Damage description and at least one image are required', 400));
-    }
-    
-    const updatedVehicle = await Vehicle.findByIdAndUpdate(
-      vehicleId,
-      { 
-        $push: { damages: { description, images } },
-        $set: { hasDamage: true, status: 'damaged' }
-      },
-      { new: true, runValidators: true }
-    ).populate(populateOptions);
-    
-    if (!updatedVehicle) {
-      return next(new AppError('No vehicle found with that ID', 404));
-    }
-
-    const vehicleObj = updatedVehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: updatedVehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: updatedVehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: vehicleObj
-      }
-    });
-  } catch (err) {
-    logger.error(`Error adding damage to vehicle: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.generateQrCode = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-    
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-    
-    const vehicle = await Vehicle.findById(vehicleId)
-      .populate(populateOptions);
-    
-    if (!vehicle) {
-      return next(new AppError('No vehicle found with that ID', 404));
-    }
-
-    const vehicleObj = vehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: vehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: vehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-    
-    const qrCodeData = {
-      model: vehicleObj.model,
-      chassisNumber: vehicle.chassisNumber,
-      color: vehicleObj.color,
-      location: vehicleObj.unloadLocation.name,
-      status: vehicle.status,
-      qrCode: vehicle.qrCode
-    };
-    
-    const qrCodeUrl = await QRCode.toDataURL(JSON.stringify(qrCodeData));
-    
-    const updatedVehicle = await Vehicle.findByIdAndUpdate(
-      vehicleId,
-      { qrCodeImage: qrCodeUrl },
-      { new: true }
-    ).populate(populateOptions);
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: updatedVehicle,
-        qrCodeUrl
-      }
-    });
-  } catch (err) {
-    logger.error(`Error generating QR code: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-exports.getVehiclesBySubdealer = async (req, res, next) => {
-  try {
-    const { subdealerId } = req.params;
-
-    console.log('🚗 GET /subdealer/:subdealerId called');
-    console.log('[VEHICLE-SUBDEALER-DEBUG] Subdealer ID:', subdealerId);
-
-    if (!mongoose.Types.ObjectId.isValid(subdealerId)) {
-      return next(new AppError('Invalid subdealer ID format', 400));
-    }
-
-    // Find vehicles where:
-    // 1. locationType is 'subdealer' AND
-    // 2. subdealerLocation matches the subdealerId
-    const vehicles = await Vehicle.find({ 
-      locationType: 'subdealer',
-      subdealerLocation: subdealerId
-    }).populate(populateOptions);
-
-    console.log('[VEHICLE-SUBDEALER-DEBUG] Found vehicles:', vehicles.length);
-
-    const transformedVehicles = vehicles.map(vehicle => {
-      const vehicleObj = vehicle.toObject();
-      
-      if (!vehicleObj.unloadLocation) {
-        vehicleObj.unloadLocation = {
-          _id: vehicle.unloadLocation,
-          name: 'Unknown Location'
-        };
-      }
-      
-      if (!vehicleObj.addedBy) {
-        vehicleObj.addedBy = {
-          _id: vehicle.addedBy,
-          name: 'Unknown User'
-        };
-      }
-      
-      return vehicleObj;
-    });
-
-    res.status(200).json({
-      status: 'success',
-      results: transformedVehicles.length,
-      data: {
-        vehicles: transformedVehicles
-      }
-    });
-  } catch (err) {
-    console.error('[VEHICLE-SUBDEALER-DEBUG] Error:', err);
-    logger.error(`Error getting vehicles by subdealer: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-exports.getVehiclesByBranch = async (req, res, next) => {
-  try {
-    const { branchId } = req.params;
-    const { locationType } = req.query;
-
-    console.log('[VEHICLE-BRANCH-DEBUG] Branch ID:', branchId);
-    console.log('[VEHICLE-BRANCH-DEBUG] Location Type:', locationType);
-
-    if (!mongoose.Types.ObjectId.isValid(branchId)) {
-      return next(new AppError('Invalid branch ID format', 400));
-    }
-
-    let query = {};
-
-    if (locationType === 'subdealer') {
-      // For subdealer vehicles, we need to find vehicles where:
-      // Option 1: unloadLocation is the branchId AND locationType is 'subdealer'?
-      // OR Option 2: subdealerLocation field exists and matches branchId?
-      
-      // Based on your vehicle data, I can see two possible approaches:
-      
-      // APPROACH 1: If subdealers are linked to this branch through a field
-      // First find all subdealers under this branch (if you have a Branch model with parent-child)
-      const Branch = mongoose.model('Branch');
-      const subdealers = await Branch.find({ 
-        // Try to find how subdealers are linked to main branch
-        // This depends on your Branch schema - check if there's a parentBranch or mainBranch field
-        $or: [
-          { parentBranch: branchId },
-          { mainBranch: branchId },
-          { branchType: 'subdealer' }
-        ]
-      }).select('_id');
-      
-      const subdealerIds = subdealers.map(s => s._id);
-      
-      // Find vehicles that are either at the main branch OR at any subdealer
-      query = {
-        $or: [
-          { unloadLocation: branchId },  // Vehicles at main branch
-          { unloadLocation: { $in: subdealerIds } },  // Vehicles at subdealers
-          { subdealerLocation: { $in: subdealerIds } }  // Alternative field
-        ]
-      };
-      
-      console.log('[VEHICLE-BRANCH-DEBUG] Found subdealers:', subdealerIds.length);
-    } else {
-      // Just vehicles at this specific branch
-      query.unloadLocation = branchId;
-    }
-
-    const vehicles = await Vehicle.find(query)
-      .populate(populateOptions);
-
-    console.log('[VEHICLE-BRANCH-DEBUG] Found vehicles:', vehicles.length);
-
-    const transformedVehicles = vehicles.map(vehicle => {
-      const vehicleObj = vehicle.toObject();
-      
-      if (!vehicleObj.unloadLocation) {
-        vehicleObj.unloadLocation = {
-          _id: vehicle.unloadLocation,
-          name: 'Unknown Location'
-        };
-      }
-      
-      if (!vehicleObj.addedBy) {
-        vehicleObj.addedBy = {
-          _id: vehicle.addedBy,
-          name: 'Unknown User'
-        };
-      }
-      
-      return vehicleObj;
-    });
-
-    res.status(200).json({
-      status: 'success',
-      results: transformedVehicles.length,
-      data: {
-        vehicles: transformedVehicles
-      }
-    });
-  } catch (err) {
-    console.error('[VEHICLE-BRANCH-DEBUG] Error:', err);
-    logger.error(`Error getting vehicles by branch: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.getVehicleByChassisNumber = async (req, res, next) => {
-  try {
-    const { chassisNumber } = req.params;
-
-    if (!chassisNumber) {
-      return next(new AppError('Chassis number is required', 400));
-    }
-
-    const vehicle = await Vehicle.findOne({ chassisNumber: chassisNumber.toUpperCase() })
-      .populate(populateOptions);
-
-    if (!vehicle) {
-      return next(new AppError('No vehicle found with that chassis number', 404));
-    }
-
-    const vehicleObj = vehicle.toObject();
-    
-    if (!vehicleObj.unloadLocation) {
-      vehicleObj.unloadLocation = {
-        _id: vehicle.unloadLocation,
-        name: 'Unknown Location'
-      };
-    }
-    
-    if (!vehicleObj.addedBy) {
-      vehicleObj.addedBy = {
-        _id: vehicle.addedBy,
-        name: 'Unknown User'
-      };
-    }
-
-    res.status(200).json({
-      status: 'success',
-      data: {
-        vehicle: vehicleObj
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting vehicle by chassis number: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.getModelDetails = async (req, res, next) => {
-  try {
-    const { model } = req.params;
-    
-    if (!model) {
-      return next(new AppError('Model name is required', 400));
-    }
-
-    // Get all vehicles of this model
-    const vehicles = await Vehicle.find({ model })
-      .select('chassisNumber color')
-      .sort({ chassisNumber: 1 });
-
-    if (vehicles.length === 0) {
-      return res.status(200).json({
-        status: 'success',
-        results: 0,
-        data: {
-          model,
-          chassisNumbers: [],
-          color: []
-        }
-      });
-    }
-
-    // Extract unique chassis numbers
-    const chassisNumbers = [...new Set(vehicles.map(v => v.chassisNumber))];
-
-    // Extract unique colors
-    const colorMap = new Map();
-    vehicles.forEach(vehicle => {
-      if (vehicle.color && vehicle.color.id && vehicle.color.name) {
-        colorMap.set(vehicle.color.id.toString(), {
-          id: vehicle.color.id,
-          name: vehicle.color.name
-        });
-      }
-    });
-    const colors = Array.from(colorMap.values());
-
-    res.status(200).json({
-      status: 'success',
-      results: chassisNumbers.length,
-      data: {
-        model,
-        chassisNumbers,
-        colors
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting model details: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-/**
- * @route  GET /api/exports/vehicles-csv
- * @query  type=EV|ICE&branch_id=<ObjectId>
- * @desc   Stream a CSV export of vehicles for a given branch and vehicle type.
- */
-exports.exportCSVTemplate = async (req, res, next) => {
-  try {
-    let { type, branch_id } = req.query;
-
-    // ---- Validate inputs ----------------------------------------------------
-    if (!branch_id || !mongoose.Types.ObjectId.isValid(branch_id)) {
-      return next(new AppError("Invalid branch ID", 400));
-    }
-
-    if (!type) {
-      return next(new AppError("Query param 'type' is required (EV or ICE)", 400));
-    }
-
-    type = String(type).trim().toUpperCase();
-    const ALLOWED_TYPES = new Set(["EV", "ICE"]);
-    if (!ALLOWED_TYPES.has(type)) {
-      return next(new AppError("Invalid type. Allowed: EV or ICE", 400));
-    }
-
-    // ---- Fetch branch -------------------------------------------------------
-    const branch = await Branch.findById(branch_id).lean();
-    if (!branch) return next(new AppError("Branch not found", 404));
-
-    // ---- Fetch vehicles for branch & type ----------------------------------
-    const vehicles = await Vehicle.find({
-      type,
-      unloadLocation: branch._id
-    })
-      .populate('model', 'model_name') // Populate the model to get the name
-      .select(
-        "model modelName color batteryNumber keyNumber chassisNumber engineNumber motorNumber chargerNumber"
-      )
-      .sort({ model: 1, chassisNumber: 1 })
-      .lean();
-
-    // ---- Find duplicate chassis numbers (scoped to this branch & type) -----
-    const dupes = await Vehicle.aggregate([
-      {
-        $match: {
-          type,
-          unloadLocation: new mongoose.Types.ObjectId(branch._id)
-        }
-      },
-      {
-        $group: {
-          _id: "$chassisNumber",
-          count: { $sum: 1 }
-        }
-      },
-      { $match: { count: { $gt: 1 } } },
-      { $sort: { count: -1 } }
-    ]);
-
-    // ---- Build CSV rows -----------------------------------------------------
-    const csvData = [];
-
-    // Meta section
-    csvData.push(["BRANCH:", branch.name || ""]);
-    csvData.push(["ADDRESS:", branch.address || ""]);
-    csvData.push(["VEHICLE TYPE:", type]);
-    csvData.push(["EXPORT DATE:", new Date().toLocaleString("en-IN")]);
-
-    if (dupes.length > 0) {
-      csvData.push([]);
-      csvData.push([
-        "WARNING:",
-        `${dupes.length} DUPLICATE CHASSIS NUMBERS IN THIS BRANCH (${type})`
-      ]);
-    }
-
-    csvData.push([]);
-
-    // Headers (as requested)
-    const headers =
-      type === "EV"
-        ? [
-            "Vehicle Model",
-            "Color",
-            "Battery No",
-            "Key No",
-            "Chassis No",
-            "Engine No",
-            "Motor No",
-            "Charger No"
-          ]
-        : ["Vehicle Model", "Color", "Battery No", "Key No", "Chassis No", "Engine No"];
-
-    csvData.push(headers);
-
-    // Data rows
-    for (const v of vehicles) {
-      const color =
-        (v.color && typeof v.color === "object" && v.color.name) ||
-        (typeof v.color === "string" ? v.color : null) ||
-        "N/A";
-
-      // Use model.model_name if populated, otherwise fall back to modelName
-      const modelName = v.model?.model_name || v.modelName || "N/A";
-
-      if (type === "EV") {
-        csvData.push([
-          modelName,
-          color,
-          v.batteryNumber || "",
-          v.keyNumber || "",
-          v.chassisNumber || "",
-          v.engineNumber || "",
-          v.motorNumber || "",
-          v.chargerNumber || ""
-        ]);
-      } else {
-        csvData.push([
-          modelName,
-          color,
-          v.batteryNumber || "",
-          v.keyNumber || "",
-          v.chassisNumber || "",
-          v.engineNumber || ""
-        ]);
-      }
-    }
-
-    // If no vehicles, still provide just the headers so it's a "template"
-    if (vehicles.length === 0) {
-      csvData.push(
-        ...(type === "EV"
-          ? [["", "", "", "", "", "", "", ""]]
-          : [["", "", "", "", "", ""]])
-      );
-    }
-
-    // ---- Stream CSV to response --------------------------------------------
-    const safeBranchName = (branch.name || "branch").replace(/[^\w\-]+/g, "_");
-    const filename = `${safeBranchName}_${type}_${Date.now()}.csv`;
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
-
-    const stringifier = stringify({ header: false });
-    stringifier.on("error", (err) => {
-      // If streaming fails, hand off to error middleware
-      next(new AppError(`CSV stream error: ${err.message}`, 500));
-    });
-
-    stringifier.pipe(res);
-    for (const row of csvData) {
-      stringifier.write(row);
-    }
-    stringifier.end();
-  } catch (err) {
-    next(new AppError(err?.message || "Export failed", 500));
-  }
-};
-
-exports.exportCSVTemplaterow = async (req, res, next) => {
-  try {
-    let { type, branch_id } = req.query;
-
-    // ---- Validate inputs ----------------------------------------------------
-    if (!branch_id || !mongoose.Types.ObjectId.isValid(branch_id)) {
-      return next(new AppError("Invalid branch ID", 400));
-    }
-
-    if (!type) {
-      return next(new AppError("Query param 'type' is required (EV or ICE)", 400));
-    }
-
-    type = String(type).trim().toUpperCase();
-    const ALLOWED_TYPES = new Set(["EV", "ICE"]);
-    if (!ALLOWED_TYPES.has(type)) {
-      return next(new AppError("Invalid type. Allowed: EV or ICE", 400));
-    }
-
-    // ---- Fetch branch -------------------------------------------------------
-    const branch = await Branch.findById(branch_id).lean();
-    if (!branch) return next(new AppError("Branch not found", 404));
-
-    // ---- Build CSV rows (template only, no data) ----------------------------
-    const csvData = [];
-
-    // Meta section
-    csvData.push(["BRANCH:", branch.name || ""]);
-    csvData.push(["ADDRESS:", branch.address || ""]);
-    csvData.push(["VEHICLE TYPE:", type]);
-    csvData.push(["EXPORT DATE:", new Date().toLocaleString("en-IN")]);
-    csvData.push(["NOTE:", "This is a template file. Fill in the data below."]);
-    csvData.push([]);
-
-    // Headers (as requested)
-    const headers =
-      type === "EV"
-        ? [
-            "Vehicle Model",
-            "Color",
-            "Battery No",
-            "Key No",
-            "Chassis No",
-            "Engine No",
-            "Motor No",
-            "Charger No"
-          ]
-        : ["Vehicle Model", "Color", "Battery No", "Key No", "Chassis No", "Engine No"];
-
-    csvData.push(headers);
-
-    // Add empty rows for data entry (5 empty rows as example)
-    for (let i = 0; i < 5; i++) {
-      csvData.push(
-        type === "EV"
-          ? ["", "", "", "", "", "", "", ""]
-          : ["", "", "", "", "", ""]
-      );
-    }
-
-    // ---- Stream CSV to response --------------------------------------------
-    const safeBranchName = (branch.name || "branch").replace(/[^\w\-]+/g, "_");
-    const filename = `${safeBranchName}_${type}_TEMPLATE_${Date.now()}.csv`;
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
-
-    const stringifier = stringify({ header: false });
-    stringifier.on("error", (err) => {
-      // If streaming fails, hand off to error middleware
-      next(new AppError(`CSV stream error: ${err.message}`, 500));
-    });
-
-    stringifier.pipe(res);
-    for (const row of csvData) {
-      stringifier.write(row);
-    }
-    stringifier.end();
-  } catch (err) {
-    next(new AppError(err?.message || "Export failed", 500));
-  }
-};
-// Define the importCSV function as an async function that handles CSV imports
-exports.importCSV = async (req, res, next) => {
-  try {
-    // 1. Check if file was uploaded
-    if (!req.file) {
-      return next(new AppError('Please upload a CSV file', 400));
-    }
-
-    // 2. Extract query parameters
-    const { type, branch_id } = req.query;
-
-    // 3. Validate type parameter
-    if (!type || !['EV', 'ICE'].includes(type.toUpperCase())) {
-      return next(new AppError('Type is required and must be EV or ICE', 400));
-    }
-
-    // 4. Validate branch_id parameter
-    if (!branch_id || !mongoose.Types.ObjectId.isValid(branch_id)) {
-      return next(new AppError('Valid branch ID is required', 400));
-    }
-
-    // 5. Check if branch exists
-    const branchExists = await Branch.exists({ _id: branch_id });
-    if (!branchExists) return next(new AppError('Branch not found', 404));
-
-    // 6. Convert CSV buffer to string and clean it
-    const csvString = req.file.buffer.toString('utf8').trim();
-    const rows = csvString.split('\n').filter(row => row.trim() !== '');
-
-    // 7. Find the header row
-    let headerRowIndex = -1;
-    const headerRow = rows.find((row, index) => {
-      const normalizedRow = row.toLowerCase();
-      if (normalizedRow.includes('chassis no') || normalizedRow.includes('chassisnumber')) {
-        headerRowIndex = index;
-        return true;
-      }
-      return false;
-    });
-
-    // 8. Validate header row exists
-    if (!headerRow) {
-      return next(new AppError('CSV must contain a valid header row with "Chassis No" or "chassisNumber"', 400));
-    }
-
-    // 9. Extract data rows (skip meta rows)
-    const dataRows = rows.slice(headerRowIndex + 1).filter(row => {
-      return row.trim() !== '' && 
-             !row.startsWith('BRANCH:') && 
-             !row.startsWith('ADDRESS:') && 
-             !row.startsWith('VEHICLE TYPE:') && 
-             !row.startsWith('EXPORT DATE:') &&
-             !row.startsWith('WARNING:');
-    });
-
-    // 10. Validate there are data rows
-    if (dataRows.length === 0) {
-      return next(new AppError('CSV must contain data rows after the header', 400));
-    }
-
-    // 11. Define header mapping for CSV columns
-    const headerMapping = {
-      'vehicle model': 'model',
-      'model': 'model',
-      'color': 'color',
-      'battery no': 'batteryNumber',
-      'batterynumber': 'batteryNumber',
-      'key no': 'keyNumber',
-      'keynumber': 'keyNumber',
-      'chassis no': 'chassisNumber',
-      'chassisnumber': 'chassisNumber',
-      'engine no': 'engineNumber',
-      'enginenumber': 'engineNumber',
-      'motor no': 'motorNumber',
-      'motornumber': 'motorNumber',
-      'charger no': 'chargerNumber',
-      'chargernumber': 'chargerNumber'
-    };
-
-    // 12. Process headers
-    const headers = headerRow.split(',')
-      .map(h => h.trim().toLowerCase().replace(/"/g, ''))
-      .filter(h => h !== '')
-      .map(h => headerMapping[h] || h);
-
-    // 13. Initialize counters and error collection
-    const errors = [];
-    let importedCount = 0;
-    let updatedCount = 0;
-
-    // 14. Process each data row
-    for (const row of dataRows) {
-      try {
-        const vehicleData = {};
-        // 15. Split row into cells and clean them
-        const cells = row.split(',')
-          .map(cell => cell.trim().replace(/^"|"$/g, ''))
-          .filter(cell => cell !== '');
-
-        // 16. Validate column count matches headers
-        if (cells.length < headers.length) {
-          errors.push(`Row ${rows.indexOf(row) + 1}: Not enough columns`);
-          continue;
-        }
-
-        // 17. Map cells to vehicle data based on headers
-        headers.forEach((header, index) => {
-          const value = cells[index];
-          if (value && value !== '') {
-            switch (header) {
-              case 'model':
-                vehicleData.modelName = value;
-                break;
-              case 'color':
-                vehicleData.colorName = value;
-                break;
-              case 'batteryNumber':
-                vehicleData.batteryNumber = value.toUpperCase();
-                break;
-              case 'keyNumber':
-                vehicleData.keyNumber = value.toUpperCase();
-                break;
-              case 'chassisNumber':
-                vehicleData.chassisNumber = value.toUpperCase();
-                break;
-              case 'motorNumber':
-                vehicleData.motorNumber = value.toUpperCase();
-                break;
-              case 'chargerNumber':
-                vehicleData.chargerNumber = value.toUpperCase();
-                break;
-              case 'engineNumber':
-                vehicleData.engineNumber = value.toUpperCase();
-                break;
-            }
-          }
-        });
-
-        // 18. Validate required fields
-        if (!vehicleData.modelName || !vehicleData.chassisNumber) {
-          errors.push(`Row ${rows.indexOf(row) + 1}: Missing required fields (model, chassisNumber)`);
-          continue;
-        }
-
-        if (!vehicleData.colorName) {
-          errors.push(`Row ${rows.indexOf(row) + 1}: Color is required`);
-          continue;
-        }
-
-        // 19. Handle model - try to find in Model collection
-        const model = await Model.findOne({ 
-          model_name: { $regex: new RegExp(`^${vehicleData.modelName}$`, 'i') } 
-        });
-        
-        // 20. If model exists, use its ID and proper name
-        if (model) {
-          vehicleData.model = model._id;
-          vehicleData.modelName = model.model_name;
-        } else {
-          // 21. If model doesn't exist, just use the name from CSV
-          vehicleData.modelName = vehicleData.modelName;
-          // Leave model reference undefined
-        }
-
-        // 22. Handle color - find or create
-        let color = await Color.findOne({ 
-          name: { $regex: new RegExp(`^${vehicleData.colorName}$`, 'i') } 
-        });
-        
-        if (!color) {
-          color = await Color.create({
-            name: vehicleData.colorName,
-            status: 'active',
-            addedBy: req.user.id
-          });
-        }
-        vehicleData.colors = [color._id];
-        vehicleData.color = {
-          id: color._id,
-          name: color.name
-        };
-        delete vehicleData.colorName;
-
-        // 23. Validate type-specific fields
-        const normalizedType = type.toUpperCase();
-        if (normalizedType === 'EV') {
-          if (!vehicleData.motorNumber) {
-            errors.push(`Row ${rows.indexOf(row) + 1}: Missing required field for EV (motorNumber)`);
-            continue;
-          }
-          if (!vehicleData.chargerNumber) {
-            errors.push(`Row ${rows.indexOf(row) + 1}: Missing required field for EV (chargerNumber)`);
-            continue;
-          }
-        }
-
-        if (normalizedType === 'ICE' && !vehicleData.engineNumber) {
-          errors.push(`Row ${rows.indexOf(row) + 1}: Missing required field for ICE (engineNumber)`);
-          continue;
-        }
-
-        // 24. Set common vehicle data
-        vehicleData.type = normalizedType;
-        vehicleData.unloadLocation = branch_id;
-        vehicleData.addedBy = req.user.id;
-        vehicleData.status = 'not_approved';
-
-        // 25. Check if vehicle already exists
-        const existingVehicle = await Vehicle.findOne({ chassisNumber: vehicleData.chassisNumber });
-
-        if (existingVehicle) {
-          // 26. Update existing vehicle
-          const update = {
-            ...vehicleData,
-            lastUpdatedBy: req.user.id
-          };
-          await Vehicle.findByIdAndUpdate(existingVehicle._id, update);
-          updatedCount++;
-        } else {
-          // 27. Create new vehicle
-          await Vehicle.create(vehicleData);
-          importedCount++;
-        }
-
-      } catch (rowError) {
-        // 28. Catch and record any row processing errors
-        errors.push(`Row ${rows.indexOf(row) + 1}: ${rowError.message}`);
-      }
-    }
-
-    // 29. Return import results
-    res.status(200).json({
-      status: 'success',
-      message: 'CSV import completed',
-      imported: importedCount,
-      updated: updatedCount,
-      errors: errors.length > 0 ? errors : undefined
-    });
-
-  } catch (err) {
-    // 30. Handle any unexpected errors
-    logger.error(`Error importing CSV: ${err.message}`);
-    next(new AppError('Error processing CSV file', 500));
-  }
-};
-
-exports.getChassisNumbersByModel = async (req, res, next) => {
-  try {
-    const { model } = req.params;
-    
-    if (!model) {
-      return next(new AppError('Model name is required', 400));
-    }
-
-    const vehicles = await Vehicle.find({ model })
-      .select('chassisNumber model')
-      .sort({ chassisNumber: 1 });
-
-    const chassisNumbers = vehicles.map(vehicle => ({
-      chassisNumber: vehicle.chassisNumber,
-      model: vehicle.model
-    }));
-
-    res.status(200).json({
-      status: 'success',
-      results: chassisNumbers.length,
-      data: {
-        chassisNumbers
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting chassis numbers by model: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-exports.getVehiclesByStatus = async (req, res, next) => {
-  try {
-    const { status } = req.params;
-    const { page = 1, limit = 1000 } = req.query;
-
-    // Validate status
-    const validStatuses = ['not_approved', 'in_stock', 'in_transit', 'sold', 'service', 'damaged'];
-    if (!validStatuses.includes(status)) {
-      return next(new AppError(`Invalid status. Must be one of: ${validStatuses.join(', ')}`, 400));
-    }
-
-    // Convert page and limit to numbers
-    const pageNumber = parseInt(page);
-    const limitNumber = parseInt(limit);
-
-    // Create query with pagination
-    const query = Vehicle.find({ status })
-      .populate(populateOptions)
-      .sort({ createdAt: -1 }) // Newest first
-      .skip((pageNumber - 1) * limitNumber)
-      .limit(limitNumber);
-
-    const vehicles = await query;
-
-    // Get total count for pagination info
-    const total = await Vehicle.countDocuments({ status });
-
-    // Transform vehicles to include branch and user details
-    const transformedVehicles = vehicles.map(vehicle => {
-      const vehicleObj = vehicle.toObject();
-      
-      if (!vehicleObj.unloadLocation) {
-        vehicleObj.unloadLocation = {
-          _id: vehicle.unloadLocation,
-          name: 'Unknown Location'
-        };
-      }
-      
-      if (!vehicleObj.addedBy) {
-        vehicleObj.addedBy = {
-          _id: vehicle.addedBy,
-          name: 'Unknown User'
-        };
-      }
-      
-      return vehicleObj;
-    });
-
-    res.status(200).json({
-      status: 'success',
-      results: transformedVehicles.length,
-      total,
-      currentPage: pageNumber,
-      totalPages: Math.ceil(total / limitNumber),
-      data: {
-        vehicles: transformedVehicles
-      }
-    });
-  } catch (err) {
-    logger.error(`Error getting vehicles by status: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-// Replace the exportCSVTemplate function with this Excel export function
-exports.exportExcelWithSheets = async (req, res, next) => {
-  try {
-    let { type, branch_id } = req.query;
-
-    // ---- Validate inputs ----------------------------------------------------
-    if (!branch_id || !mongoose.Types.ObjectId.isValid(branch_id)) {
-      return next(new AppError("Invalid branch ID", 400));
-    }
-
-    if (!type) {
-      return next(new AppError("Query param 'type' is required (EV or ICE)", 400));
-    }
-
-    type = String(type).trim().toUpperCase();
-    const ALLOWED_TYPES = new Set(["EV", "ICE"]);
-    if (!ALLOWED_TYPES.has(type)) {
-      return next(new AppError("Invalid type. Allowed: EV or ICE", 400));
-    }
-
-    // ---- Fetch branch -------------------------------------------------------
-    const branch = await Branch.findById(branch_id).lean();
-    if (!branch) return next(new AppError("Branch not found", 404));
-
-    // ---- Get all models and colors from master data -------------------------
-    const allModels = await Model.find({ status: 'active' })
-      .populate('colors', 'name')
-      .select('model_name colors')
-      .lean();
-    
-    // Create a map of model names to their available colors
-    const modelColorMap = new Map();
-    allModels.forEach(model => {
-      const colorNames = model.colors.map(color => color.name);
-      modelColorMap.set(model.model_name, colorNames);
-    });
-
-    // ---- Fetch vehicles for branch & type ----------------------------------
-    const vehicles = await Vehicle.find({
-      type,
-      unloadLocation: branch._id
-    })
-      .populate('model', 'model_name')
-      .select(
-        "model modelName color batteryNumber keyNumber chassisNumber engineNumber motorNumber chargerNumber"
-      )
-      .sort({ model: 1, chassisNumber: 1 })
-      .lean();
-
-    // ---- Find duplicate chassis numbers (scoped to this branch & type) -----
-    const dupes = await Vehicle.aggregate([
-      {
-        $match: {
-          type,
-          unloadLocation: new mongoose.Types.ObjectId(branch._id)
-        }
-      },
-      {
-        $group: {
-          _id: "$chassisNumber",
-          count: { $sum: 1 }
-        }
-      },
-      { $match: { count: { $gt: 1 } } },
-      { $sort: { count: -1 } }
-    ]);
-
-    // ---- Create Excel workbook ---------------------------------------------
-    const workbook = new excel.Workbook();
-    
-    // Create styles
-    const headerStyle = workbook.createStyle({
-      font: { bold: true, color: '#FFFFFF' },
-      fill: { type: 'pattern', patternType: 'solid', fgColor: '#4472C4' },
-      alignment: { horizontal: 'center' }
-    });
-    
-    const titleStyle = workbook.createStyle({
-      font: { bold: true, size: 14 }
-    });
-    
-    const noteStyle = workbook.createStyle({
-      font: { italic: true }
-    });
-    
-    const warningStyle = workbook.createStyle({
-      font: { bold: true, color: '#FF0000' }
-    });
-
-    // ---- Sheet 1: Template -------------------------------------------------
-    const templateSheet = workbook.addWorksheet('Template');
-    
-    // Add metadata
-    templateSheet.cell(1, 1).string('BRANCH:').style(titleStyle);
-    templateSheet.cell(1, 2).string(branch.name || '');
-    
-    templateSheet.cell(2, 1).string('VEHICLE TYPE:').style(titleStyle);
-    templateSheet.cell(2, 2).string(type);
-    
-    templateSheet.cell(3, 1).string('NOTE:').style(titleStyle);
-    templateSheet.cell(3, 2).string('Fill your data in this sheet for import').style(noteStyle);
-    
-    // Add warning if duplicates exist
-    if (dupes.length > 0) {
-      templateSheet.cell(5, 1).string('WARNING:').style(warningStyle);
-      templateSheet.cell(5, 2).string(`${dupes.length} DUPLICATE CHASSIS NUMBERS IN THIS BRANCH (${type})`).style(warningStyle);
-    }
-    
-    // Add headers
-    const headers = type === "EV"
-      ? ["Vehicle Model", "Color", "Battery No", "Key No", "Chassis No", "Engine No", "Motor No", "Charger No"]
-      : ["Vehicle Model", "Color", "Battery No", "Key No", "Chassis No", "Engine No"];
-    
-    let row = 7;
-    headers.forEach((header, index) => {
-      templateSheet.cell(row, index + 1).string(header).style(headerStyle);
-    });
-    
-    // Add empty rows for data entry (10 empty rows)
-    for (let i = 1; i <= 10; i++) {
-      headers.forEach((_, index) => {
-        templateSheet.cell(row + i, index + 1).string('');
-      });
-    }
-
-    // ---- Sheet 2: Master Data Reference ------------------------------------
-    const masterSheet = workbook.addWorksheet('Master Data Reference');
-
-    // Add metadata
-    masterSheet.cell(1, 1).string('MASTER DATA REFERENCE').style(titleStyle);
-    masterSheet.cell(2, 1).string('Valid Model and Color Combinations').style(titleStyle);
-
-    // Add headers
-    masterSheet.cell(4, 1).string('Model').style(headerStyle);
-    masterSheet.cell(4, 2).string('Color').style(headerStyle);
-
-    // Add model and color data as individual rows
-    let masterRow = 5;
-    for (const [modelName, colors] of modelColorMap.entries()) {
-      if (colors && colors.length > 0) {
-        for (const color of colors) {
-          masterSheet.cell(masterRow, 1).string(modelName);
-          masterSheet.cell(masterRow, 2).string(color);
-          masterRow++;
-        }
-      } else {
-        // If no colors available for this model
-        masterSheet.cell(masterRow, 1).string(modelName);
-        masterSheet.cell(masterRow, 2).string('No colors available');
-        masterRow++;
-      }
-    }
-
-    // ---- Send Excel file ---------------------------------------------------
-    const safeBranchName = (branch.name || "branch").replace(/[^\w\-]+/g, "_");
-    const filename = `${safeBranchName}_${type}_${Date.now()}.xlsx`;
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
-
-    workbook.write(filename, res);
-
-  } catch (err) {
-    next(new AppError(err?.message || "Export failed", 500));
-  }
-};
-// Update the importCSV function to handle Excel files
-exports.importExcel = async (req, res, next) => {
-  try {
-    // 1. Check if file was uploaded
-    if (!req.file) {
-      return next(new AppError('Please upload an Excel file', 400));
-    }
-
-    // 2. Extract query parameters
-    const { type, branch_id } = req.query;
-
-    // 3. Validate type parameter
-    if (!type || !['EV', 'ICE'].includes(type.toUpperCase())) {
-      return next(new AppError('Type is required and must be EV or ICE', 400));
-    }
-
-    // 4. Validate branch_id parameter
-    if (!branch_id || !mongoose.Types.ObjectId.isValid(branch_id)) {
-      return next(new AppError('Valid branch ID is required', 400));
-    }
-
-    // 5. Check if branch exists
-    const branchExists = await Branch.exists({ _id: branch_id });
-    if (!branchExists) return next(new AppError('Branch not found', 404));
-
-    // 6. Check file type
-    if (!req.file.originalname.endsWith('.xlsx') && !req.file.originalname.endsWith('.xls')) {
-      return next(new AppError('Only Excel files (.xlsx, .xls) are allowed', 400));
-    }
-
-    // 7. Parse Excel file using exceljs
-    const workbook = new ExcelJS.Workbook();
-    
-    try {
-      // Load the Excel file from buffer
-      await workbook.xlsx.load(req.file.buffer);
-      logger.info('Excel file loaded successfully');
-    } catch (excelError) {
-      logger.error(`Excel parsing error: ${excelError.message}`);
-      logger.error(`File details: ${req.file.originalname}, size: ${req.file.size} bytes`);
-      return next(new AppError('Invalid Excel file format. Please ensure you\'re uploading a valid Excel file.', 400));
-    }
-    
-    // 8. Try to get the Template sheet or first sheet
-    let templateSheet = workbook.getWorksheet('Template');
-    if (!templateSheet) {
-      // Fallback to first sheet if Template sheet doesn't exist
-      templateSheet = workbook.worksheets[0];
-      if (!templateSheet) {
-        return next(new AppError('No worksheets found in Excel file', 400));
-      }
-      logger.info('Using first sheet as Template sheet was not found');
-    }
-
-    // 9. Find the header row by searching for column headers
-    let headerRowIndex = -1;
-    let headers = [];
-    
-    // Define possible header variations
-    const possibleHeaders = [
-      'vehicle model', 'model', 'color', 'battery no', 'batterynumber',
-      'key no', 'keynumber', 'chassis no', 'chassisnumber', 
-      'engine no', 'enginenumber', 'motor no', 'motornumber',
-      'charger no', 'chargernumber'
-    ];
-
-    // Search for header row
-    for (let rowNumber = 1; rowNumber <= templateSheet.rowCount; rowNumber++) {
-      const row = templateSheet.getRow(rowNumber);
-      let headerCount = 0;
-      const currentHeaders = [];
-      
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        if (cell.value && typeof cell.value === 'string') {
-          const cellValue = cell.value.toString().trim().toLowerCase();
-          currentHeaders.push(cellValue);
-          
-          if (possibleHeaders.includes(cellValue)) {
-            headerCount++;
-          }
-        }
-      });
-      
-      // If we found at least 3 matching headers, consider this the header row
-      if (headerCount >= 3) {
-        headerRowIndex = rowNumber;
-        headers = currentHeaders;
-        logger.info(`Found header row at index ${headerRowIndex} with headers: ${headers.join(', ')}`);
-        break;
-      }
-    }
-
-    if (headerRowIndex === -1 || headers.length === 0) {
-      return next(new AppError('Could not identify header row in Excel file. Please ensure your file has proper column headers.', 400));
-    }
-
-    // 10. Map Excel headers to our field names
-    const headerMapping = {
-      'vehicle model': 'model',
-      'model': 'model',
-      'color': 'color',
-      'battery no': 'batteryNumber',
-      'batterynumber': 'batteryNumber',
-      'key no': 'keyNumber',
-      'keynumber': 'keyNumber',
-      'chassis no': 'chassisNumber',
-      'chassisnumber': 'chassisNumber',
-      'engine no': 'engineNumber',
-      'enginenumber': 'engineNumber',
-      'motor no': 'motorNumber',
-      'motornumber': 'motorNumber',
-      'charger no': 'chargerNumber',
-      'chargernumber': 'chargerNumber'
-    };
-
-    const mappedHeaders = headers.map(h => headerMapping[h] || h);
-
-    // 11. Extract data rows from Template sheet
-    const dataRows = [];
-    for (let i = headerRowIndex + 1; i <= templateSheet.rowCount; i++) {
-      const row = templateSheet.getRow(i);
-      const rowData = {};
-      let isEmpty = true;
-      
-      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-        const header = mappedHeaders[colNumber - 1];
-        if (header && cell.value !== null && cell.value !== undefined && cell.value !== '') {
-          rowData[header] = cell.value.toString().trim();
-          isEmpty = false;
-        }
-      });
-      
-      if (!isEmpty) {
-        dataRows.push(rowData);
-      }
-    }
-
-    // 12. Validate there are data rows
-    if (dataRows.length === 0) {
-      return next(new AppError('No data found in Excel file. Please ensure you have entered data in the Template sheet.', 400));
-    }
-
-    logger.info(`Found ${dataRows.length} data rows to process`);
-
-    // 13. Process each data row - REMOVED I/O/Q VALIDATION
-    const errors = [];
-    let importedCount = 0;
-    let updatedCount = 0;
-    let skippedCount = 0;
-    let modelColorValidationCount = 0;
-    
-    // Cache for model-color validation to avoid repeated DB queries
-    const modelColorValidationCache = new Map();
-
-    // Helper function to escape regex special characters
-    const escapeRegex = (string) => {
-      return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    };
-
-    // Function to validate model exists and has the color mapped
-    // Fix the validateModelAndColor function in importExcel:
-   // Fix the validateModelAndColor function in importExcel:
-const validateModelAndColor = async (modelName, colorName) => {
-  const cacheKey = `${modelName.toLowerCase()}_${colorName.toLowerCase()}`;
-  
-  if (modelColorValidationCache.has(cacheKey)) {
-    return modelColorValidationCache.get(cacheKey);
-  }
-
-  try {
-    console.log(`[VALIDATION] Validating model: "${modelName}", color: "${colorName}"`);
-    
-    // STEP 1: Find the model by name (case-insensitive)
-    const escapedModelName = escapeRegex(modelName.trim());
-    const model = await Model.findOne({ 
-      model_name: { $regex: new RegExp(`^${escapedModelName}$`, 'i') },
-      status: 'active'
-    }).populate({
-      path: 'colors',
-      select: 'name _id',
-      match: { status: 'active' }
-    });
-
-    if (!model) {
-      console.log(`[VALIDATION] Model "${modelName}" not found`);
-      const result = {
-        isValid: false,
-        modelFound: false,
-        model: null,
-        color: null,
-        message: `Model "${modelName}" not found in master data`
-      };
-      modelColorValidationCache.set(cacheKey, result);
-      return result;
-    }
-
-    console.log(`[VALIDATION] Found model: ${model.model_name}`);
-    
-    // STEP 2: Find the color by name (case-insensitive)
-    const escapedColorName = escapeRegex(colorName.trim());
-    const color = await Color.findOne({ 
-      name: { $regex: new RegExp(`^${escapedColorName}$`, 'i') },
-      status: 'active'
-    }).populate({
-      path: 'models',
-      select: 'model_name _id',
-      match: { status: 'active' }
-    });
-
-    if (!color) {
-      console.log(`[VALIDATION] Color "${colorName}" not found`);
-      const result = {
-        isValid: false,
-        modelFound: true,
-        model: model,
-        color: null,
-        message: `Color "${colorName}" not found in master data`
-      };
-      modelColorValidationCache.set(cacheKey, result);
-      return result;
-    }
-
-    console.log(`[VALIDATION] Found color: ${color.name}`);
-    
-    // ========== CRITICAL FIX: Compare by MODEL NAME ==========
     
-    // 1. Check if color has this model in its models array (by model name)
-    let colorHasModel = false;
-    if (color.models && Array.isArray(color.models)) {
-      // Convert both model names to lowercase for comparison
-      const modelNameLower = model.model_name.toLowerCase().trim();
-      
-      colorHasModel = color.models.some(colorModel => {
-        const colorModelName = (colorModel.model_name || '').toLowerCase().trim();
-        return colorModelName === modelNameLower;
-      });
-      
-      console.log(`[VALIDATION] Color "${color.name}" has ${color.models.length} models mapped:`);
-      color.models.forEach((m, i) => {
-        console.log(`  [${i}] ${m.model_name} (matches "${model.model_name}"? ${m.model_name.toLowerCase() === modelNameLower})`);
-      });
-    }
-
-    // 2. Check if model has this color in its colors array
-    let modelHasColor = false;
-    if (model.colors && Array.isArray(model.colors)) {
-      const colorNameLower = color.name.toLowerCase().trim();
-      
-      modelHasColor = model.colors.some(modelColor => {
-        const modelColorName = (modelColor.name || '').toLowerCase().trim();
-        return modelColorName === colorNameLower;
-      });
-      
-      console.log(`[VALIDATION] Model "${model.model_name}" has ${model.colors.length} colors mapped:`);
-      model.colors.forEach((c, i) => {
-        console.log(`  [${i}] ${c.name} (matches "${color.name}"? ${c.name.toLowerCase() === colorNameLower})`);
-      });
-    }
-
-    console.log(`[VALIDATION] Color has model (by name): ${colorHasModel}`);
-    console.log(`[VALIDATION] Model has color (by name): ${modelHasColor}`);
-
-    // If EITHER direction has the mapping, consider it valid
-    const isValidMapping = colorHasModel || modelHasColor;
-
-    if (!isValidMapping) {
-      console.log(`[VALIDATION] Model "${model.model_name}" and color "${color.name}" are not mapped in either direction`);
-      
-      const result = {
-        isValid: false,
-        modelFound: true,
-        colorFound: true,
-        model: model,
-        color: color,
-        message: `Model "${model.model_name}" does not have color "${color.name}" mapped to it`
-      };
-      modelColorValidationCache.set(cacheKey, result);
-      return result;
-    }
-
-    // Valid combination
-    console.log(`[VALIDATION] ✓ Valid combination: ${model.model_name} with ${color.name}`);
-    const result = {
-      isValid: true,
-      model: model,
-      color: color,
-      message: `Model "${model.model_name}" and color "${color.name}" are valid`
-    };
-    modelColorValidationCache.set(cacheKey, result);
-    return result;
-
-  } catch (error) {
-    console.error(`[VALIDATION] Error validating model and color: ${error.message}`);
-    console.error(error.stack);
-    const result = {
-      isValid: false,
-      model: null,
-      color: null,
-      message: `Validation error: ${error.message}`
-    };
-    modelColorValidationCache.set(cacheKey, result);
-    return result;
-  }
-};
-    for (const [index, rowData] of dataRows.entries()) {
-      try {
-        const vehicleData = {};
-        
-        // Map row data to vehicle data
-        Object.keys(rowData).forEach(key => {
-          const value = rowData[key];
-          if (value && value !== '') {
-            switch (key) {
-              case 'model':
-                vehicleData.modelName = value;
-                break;
-              case 'color':
-                vehicleData.colorName = value;
-                break;
-              case 'batteryNumber':
-                vehicleData.batteryNumber = value.toUpperCase();
-                break;
-              case 'keyNumber':
-                vehicleData.keyNumber = value.toUpperCase();
-                break;
-              case 'chassisNumber':
-                // REMOVED I/O/Q RESTRICTION - Allowing all characters
-                vehicleData.chassisNumber = value.toUpperCase();
-                break;
-              case 'motorNumber':
-                vehicleData.motorNumber = value.toUpperCase();
-                break;
-              case 'chargerNumber':
-                vehicleData.chargerNumber = value.toUpperCase();
-                break;
-              case 'engineNumber':
-                vehicleData.engineNumber = value.toUpperCase();
-                break;
-            }
-          }
-        });
-
-        // Validate required fields - SKIP ROW if missing chassisNumber
-        if (!vehicleData.chassisNumber) {
-          errors.push(`Row ${index + 1}: Skipped - Missing required field (chassisNumber)`);
-          skippedCount++;
-          continue;
-        }
-
-        // REMOVED: I/O/Q validation for chassis number
-        // OLD CODE THAT RESTRICTED I, O, Q:
-        // if (/[IOQ]/i.test(vehicleData.chassisNumber)) {
-        //   errors.push(`Row ${index + 1}: Skipped - Chassis number cannot contain I, O, or Q`);
-        //   skippedCount++;
-        //   continue;
-        // }
-
-        // Validate required fields - SKIP ROW if missing model
-        if (!vehicleData.modelName) {
-          errors.push(`Row ${index + 1}: Skipped - Missing required field (model)`);
-          skippedCount++;
-          continue;
-        }
-
-        // Validate required fields - SKIP ROW if missing color
-        if (!vehicleData.colorName) {
-          errors.push(`Row ${index + 1}: Skipped - Color is required`);
-          skippedCount++;
-          continue;
-        }
-
-        // ========== CRITICAL VALIDATION: Check if model exists and has color mapped ==========
-        const validationResult = await validateModelAndColor(
-          vehicleData.modelName, 
-          vehicleData.colorName
-        );
-        modelColorValidationCount++;
-
-        if (!validationResult.isValid) {
-          errors.push(`Row ${index + 1}: Skipped - ${validationResult.message}`);
-          skippedCount++;
-          continue;
-        }
-
-        // Model and color are valid, use the model and color from validation
-        const model = validationResult.model;
-        const color = validationResult.color;
-        
-        // Set model reference
-        vehicleData.model = model._id;
-        vehicleData.modelName = model.model_name;
-        
-        // Determine vehicle type from model
-        let vehicleType = 'ICE'; // Default to ICE
-        if (model.type) {
-          if (model.type.toUpperCase().includes('EV') || model.type.toUpperCase().includes('ELECTRIC')) {
-            vehicleType = 'EV';
-          } else {
-            vehicleType = 'ICE';
-          }
-        }
-        
-        // Set color reference
-        vehicleData.colors = [color._id];
-        vehicleData.color = {
-          id: color._id,
-          name: color.name
-        };
-        delete vehicleData.colorName;
-
-        // Validate type-specific required fields - SKIP ROW if missing
-        const normalizedType = type.toUpperCase();
-        if (normalizedType === 'EV') {
-          if (!vehicleData.motorNumber) {
-            errors.push(`Row ${index + 1}: Skipped - Missing required field for EV (motorNumber)`);
-            skippedCount++;
-            continue;
-          }
-        }
-
-        if (normalizedType === 'ICE' && !vehicleData.engineNumber) {
-          errors.push(`Row ${index + 1}: Skipped - Missing required field for ICE (engineNumber)`);
-          skippedCount++;
-          continue;
-        }
-
-        // Set common vehicle data
-        vehicleData.type = vehicleType; // Use type from model validation, not from query
-        vehicleData.unloadLocation = branch_id;
-        vehicleData.addedBy = req.user.id;
-        vehicleData.status = 'not_approved';
-
-        // Check if vehicle already exists
-        const existingVehicle = await Vehicle.findOne({ chassisNumber: vehicleData.chassisNumber });
-        if (existingVehicle) {
-          // Update existing vehicle
-          const update = {
-            ...vehicleData,
-            lastUpdatedBy: req.user.id
-          };
-          await Vehicle.findByIdAndUpdate(existingVehicle._id, update);
-          updatedCount++;
-          logger.info(`Updated vehicle with chassis: ${vehicleData.chassisNumber}`);
-        } else {
-          // Create new vehicle
-          const newVehicle = await Vehicle.create(vehicleData);
-          
-          // Generate QR code
-          try {
-            const qrCodePath = await generateVehicleQRCode(newVehicle);
-            newVehicle.qrCode = qrCodePath;
-            await newVehicle.save();
-          } catch (qrError) {
-            logger.error(`Failed to generate QR for ${vehicleData.chassisNumber}: ${qrError.message}`);
-          }
-          
-          importedCount++;
-          logger.info(`Imported new vehicle with chassis: ${vehicleData.chassisNumber}`);
-        }
-      } catch (rowError) {
-        logger.error(`Error processing row ${index + 1}: ${rowError.message}`);
-        errors.push(`Row ${index + 1}: ${rowError.message}`);
-      }
-    }
-
-    // 14. Return import results
-    res.status(200).json({
-      status: 'success',
-      message: 'Excel import completed',
-      data: {
-        imported: importedCount,
-        updated: updatedCount,
-        skipped: skippedCount,
-        totalProcessed: dataRows.length,
-        modelColorValidations: modelColorValidationCount,
-        cacheSize: modelColorValidationCache.size,
-        errors: errors.length > 0 ? errors : undefined
-      }
-    });
-
-  } catch (err) {
-    logger.error(`Error importing Excel: ${err.message}`);
-    logger.error(err.stack);
-    next(new AppError('Error processing Excel file. Please ensure the file is a valid Excel format.', 500));
-  }
-};
-// controllers/vehicleInwardController.js  (only the updateVehicle export)
-
-// controllers/vehicleInwardController.js
-
-exports.updateVehicle = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-
-    // 1) Validate path id + load existing
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-    const existing = await Vehicle.findById(vehicleId);
-    if (!existing) return next(new AppError('No vehicle found with that ID', 404));
-
-    // 2) Never allow these from the client
-    const BLOCKED = ['qrCode', 'qrCodeImage', 'addedBy', 'createdAt', 'updatedAt', '_id'];
-    for (const f of BLOCKED) if (f in req.body) delete req.body[f];
-
-    // 3) Gather inputs (all optional)
-    const {
-      model,              // string: ModelObjectId OR plain model name
-      type,               // 'EV' | 'ICE'
-      unloadLocation,     // Branch ObjectId
-      color,              // { id: ColorId }
-      batteryNumber,
-      keyNumber,
-      motorNumber,
-      chargerNumber,
-      engineNumber,
-      hasDamage,
-      chassisNumber       // << ALLOWED now
-    } = req.body;
-
-    const $set = { lastUpdatedBy: req.user.id };
-    const $unset = {};
-
-    // ---- MODEL (accept id or name) ----
-    if (typeof model !== 'undefined') {
-      if (typeof model === 'string' && mongoose.Types.ObjectId.isValid(model)) {
-        const modelDoc = await Model.findById(model).select('model_name type');
-        if (!modelDoc) return next(new AppError('Model not found', 404));
-        $set.model = modelDoc._id;
-        $set.modelName = modelDoc.model_name;
-        if (typeof type === 'undefined' && modelDoc.type) $set.type = modelDoc.type;
-      } else if (typeof model === 'string') {
-        const trimmed = model.trim();
-        if (!trimmed) return next(new AppError('Model name cannot be empty', 400));
-        const byName = await Model.findOne({
-          model_name: { $regex: new RegExp(`^${trimmed}$`, 'i') }
-        }).select('model_name type');
-        if (byName) {
-          $set.model = byName._id;
-          $set.modelName = byName.model_name;
-          if (typeof type === 'undefined' && byName.type) $set.type = byName.type;
-        } else {
-          $set.modelName = trimmed; // free-text model
-          $unset.model = '';
-        }
-      } else {
-        return next(new AppError('Invalid model format. Send a modelId string or a model name string.', 400));
-      }
-    }
-
-    // ---- TYPE ----
-    if (typeof type !== 'undefined') {
-      const T = String(type).toUpperCase();
-      if (!['EV', 'ICE'].includes(T)) {
-        return next(new AppError('Invalid type. Allowed: EV or ICE', 400));
-      }
-      $set.type = T;
-    }
-
-    // ---- BRANCH ----
-    if (typeof unloadLocation !== 'undefined') {
-      if (!mongoose.Types.ObjectId.isValid(unloadLocation)) {
-        return next(new AppError('Invalid branch ID format', 400));
-      }
-      const branchExists = await Branch.exists({ _id: unloadLocation });
-      if (!branchExists) return next(new AppError('Branch not found', 404));
-      $set.unloadLocation = unloadLocation;
-    }
-
-    // ---- COLOR ----
-    if (typeof color !== 'undefined') {
-      if (!color || !color.id || !mongoose.Types.ObjectId.isValid(color.id)) {
-        return next(new AppError('Valid color with ID is required', 400));
-      }
-      const colorDoc = await Color.findById(color.id).select('name');
-      if (!colorDoc) return next(new AppError('Color not found', 404));
-      $set.color = { id: color.id, name: colorDoc.name };
-      $set.colors = [color.id];
-    }
-
-    // ---- SERIALS (uppercase) ----
-    if (typeof batteryNumber !== 'undefined') $set.batteryNumber = batteryNumber?.toUpperCase();
-    if (typeof keyNumber !== 'undefined')     $set.keyNumber     = keyNumber?.toUpperCase();
-    if (typeof motorNumber !== 'undefined')   $set.motorNumber   = motorNumber?.toUpperCase();
-    if (typeof chargerNumber !== 'undefined') $set.chargerNumber = chargerNumber?.toUpperCase();
-    if (typeof engineNumber !== 'undefined')  $set.engineNumber  = engineNumber?.toUpperCase();
-
-    // ---- CHASSIS NUMBER (NOW UPDATABLE) ----
-    if (typeof chassisNumber !== 'undefined') {
-      const newChassis = String(chassisNumber).trim().toUpperCase();
-      if (!newChassis) return next(new AppError('Chassis number cannot be empty', 400));
-
-      if (newChassis !== existing.chassisNumber) {
-        // prevent duplicates (case-insensitive effect via uppercase)
-        const dup = await Vehicle.findOne({ chassisNumber: newChassis });
-        if (dup) {
-          return next(
-            new AppError(`Vehicle with chassis number "${newChassis}" already exists`, 409)
-          );
-        }
-        $set.chassisNumber = newChassis;
-
-        // IMPORTANT: we do NOT change qrCode/qrCodeImage automatically to avoid
-        // breaking printed labels. If you want to regenerate, call your /generate-qr endpoint.
-      }
-    }
-
-    // ---- DAMAGE FLAG ----
-    if (typeof hasDamage !== 'undefined') {
-      $set.hasDamage = hasDamage;
-      if (hasDamage === false && Array.isArray(existing.damages) && existing.damages.length === 0) {
-        $set.status = 'in_stock';
-      }
-    }
-
-    // 4) No-op protection
-    const hasSet = Object.keys($set).length > 1 || ('status' in $set);
-    const hasUnset = Object.keys($unset).length > 0;
-    if (!hasSet && !hasUnset) {
-      const fresh = await Vehicle.findById(vehicleId).populate(populateOptions);
-      const v = fresh.toObject();
-      if (!v.unloadLocation) v.unloadLocation = { _id: fresh.unloadLocation, name: 'Unknown Location' };
-      if (!v.addedBy)        v.addedBy        = { _id: fresh.addedBy,        name: 'Unknown User' };
-      return res.status(200).json({ status: 'success', data: { vehicle: v } });
-    }
-
-    const updateOps = {};
-    if (hasSet)   updateOps.$set = $set;
-    if (hasUnset) updateOps.$unset = $unset;
-
-    // 5) Apply (validators off to allow partial updates under strict:'throw')
-    const updated = await Vehicle.findByIdAndUpdate(
-      vehicleId,
-      updateOps,
-      { new: true, runValidators: false }
-    ).populate(populateOptions);
-
-    if (!updated) return next(new AppError('No vehicle found with that ID', 404));
-
-    // 6) Normalize response
-    const vehicleObj = updated.toObject();
-    if (!vehicleObj.unloadLocation) vehicleObj.unloadLocation = { _id: updated.unloadLocation, name: 'Unknown Location' };
-    if (!vehicleObj.addedBy)        vehicleObj.addedBy        = { _id: updated.addedBy,        name: 'Unknown User' };
-
-    return res.status(200).json({
-      status: 'success',
-      data: { vehicle: vehicleObj }
-    });
-
-  } catch (err) {
-    logger.error(`Error updating vehicle: ${err.message}`);
-    if (err && (err.code === 11000 || err.code === 11001)) {
-      // In case of race to duplicate chassis
-      return next(new AppError('Duplicate value for unique field', 409));
-    }
-    if (err && err.name === 'ValidationError') {
-      return next(new AppError(err.message, 400));
-    }
-    next(new AppError('Server Error', 500));
-  }
-};
-
-
-// exports.getChassisNumbersByModelAndColor = async (req, res, next) => {
-//   try {
-//     const { modelId, colorId } = req.params;
-
-//     // Validate ObjectIDs
-//     if (!mongoose.Types.ObjectId.isValid(modelId)) {
-//       return next(new AppError('Invalid model ID format', 400));
-//     }
-//     if (!mongoose.Types.ObjectId.isValid(colorId)) {
-//       return next(new AppError('Invalid color ID format', 400));
-//     }
+//     const bookings = await bookingsQuery.lean();
 
-//     // Ensure model and color exist
-//     const model = await Model.findById(modelId).select('model_name');
-//     const color = await Color.findById(colorId).select('name');
+//     console.log(`Found ${bookings.length} bookings`);
 
-//     if (!model) {
-//       return next(new AppError('No model found with that ID', 404));
-//     }
-//     if (!color) {
-//       return next(new AppError('No color found with that ID', 404));
-//     }
+//     const bookingIds = bookings.map(b => b._id);
 
-//     // Fetch vehicles with status either in_stock or in_transit - SORT BY CREATEDAT FOR FIFO
-//     const vehicles = await Vehicle.find({
-//       model: modelId,
-//       colors: colorId,
-//       status: { $in: ['in_stock', 'in_transit'] }
+//     // ========== FETCH ALL APPROVED LEDGER ENTRIES ONLY ==========
+//     const allLedgerEntries = await Ledger.find({
+//       booking: { $in: bookingIds },
+//       approvalStatus: 'Approved',
+//       isDebit: false
 //     })
-//       .select('chassisNumber model colors status createdAt')
-//       .sort({ createdAt: 1 }) // Changed from chassisNumber:1 to createdAt:1 for FIFO
-//       .populate('model', 'model_name')
-//       .populate('colors', 'name');
+//     .select('amount paymentMode type approvalStatus isDebit booking')
+//     .lean();
 
-//     // Extract chassis numbers with age
-//     const chassisNumbersWithAge = vehicles.map(vehicle => {
-//       const createdAt = vehicle.createdAt;
-//       const now = new Date();
-//       const ageInMs = now - createdAt;
-//       const ageInDays = Math.floor(ageInMs / (1000 * 60 * 60 * 24));
-//       const ageInHours = Math.floor((ageInMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-//       const ageInMinutes = Math.floor((ageInMs % (1000 * 60 * 60)) / (1000 * 60));
-//       const ageInSeconds = Math.floor((ageInMs % (1000 * 60)) / 1000);
-//       const ageInMonths = Math.floor(ageInDays / 30);
-//       const ageInYears = Math.floor(ageInDays / 365);
-      
-//       let ageDisplay = '';
-//       if (ageInYears > 0) {
-//         const remainingDays = ageInDays % 365;
-//         const remainingHours = ageInHours % 24;
-//         ageDisplay = `${ageInYears} year${ageInYears > 1 ? 's' : ''}${remainingDays > 0 ? ` ${remainingDays} day${remainingDays > 1 ? 's' : ''}` : ''}${remainingHours > 0 ? ` ${remainingHours} hr${remainingHours > 1 ? 's' : ''}` : ''}`;
-//       } else if (ageInMonths > 0) {
-//         const remainingDays = ageInDays % 30;
-//         const remainingHours = ageInHours % 24;
-//         ageDisplay = `${ageInMonths} month${ageInMonths > 1 ? 's' : ''}${remainingDays > 0 ? ` ${remainingDays} day${remainingDays > 1 ? 's' : ''}` : ''}${remainingHours > 0 ? ` ${remainingHours} hr${remainingHours > 1 ? 's' : ''}` : ''}`;
-//       } else if (ageInDays > 0) {
-//         const remainingMinutes = ageInMinutes % 60;
-//         ageDisplay = `${ageInDays} day${ageInDays > 1 ? 's' : ''}${ageInHours > 0 ? ` ${ageInHours} hr${ageInHours > 1 ? 's' : ''}` : ''}${remainingMinutes > 0 ? ` ${remainingMinutes} min${remainingMinutes > 1 ? 's' : ''}` : ''}`;
-//       } else if (ageInHours > 0) {
-//         const remainingSeconds = ageInSeconds % 60;
-//         ageDisplay = `${ageInHours} hr${ageInHours > 1 ? 's' : ''}${ageInMinutes > 0 ? ` ${ageInMinutes} min${ageInMinutes > 1 ? 's' : ''}` : ''}${remainingSeconds > 0 ? ` ${remainingSeconds} sec${remainingSeconds > 1 ? 's' : ''}` : ''}`;
-//       } else if (ageInMinutes > 0) {
-//         ageDisplay = `${ageInMinutes} min${ageInMinutes > 1 ? 's' : ''}${ageInSeconds > 0 ? ` ${ageInSeconds} sec${ageInSeconds > 1 ? 's' : ''}` : ''}`;
-//       } else {
-//         ageDisplay = `${ageInSeconds} sec${ageInSeconds > 1 ? 's' : ''}`;
+//     console.log(`Found ${allLedgerEntries.length} APPROVED CREDIT ledger entries for these bookings`);
+
+//     // Group ledger entries by booking ID
+//     const ledgerByBooking = {};
+//     allLedgerEntries.forEach(entry => {
+//       const bookingId = entry.booking.toString();
+//       if (!ledgerByBooking[bookingId]) {
+//         ledgerByBooking[bookingId] = [];
 //       }
+//       ledgerByBooking[bookingId].push(entry);
+//     });
 
+//     // Process each booking to calculate financials
+//     const processedBookings = bookings.map(booking => {
+//       const bookingLedgerEntries = ledgerByBooking[booking._id.toString()] || [];
+      
+//       const totalApprovedAmount = bookingLedgerEntries.reduce((sum, entry) => 
+//         sum + (entry.amount || 0), 0);
+      
+//       const dealAmount = booking.discountedAmount || 0;
+//       const balanceAmount = dealAmount - totalApprovedAmount;
+      
+//       // Get financier name properly
+//       let financierName = '';
+//       if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+//         if (typeof booking.payment.financer === 'object' && booking.payment.financer.name) {
+//           financierName = booking.payment.financer.name;
+//         } else if (typeof booking.payment.financer === 'string') {
+//           financierName = booking.payment.financer;
+//         }
+//       }
+      
 //       return {
-//         chassisNumber: vehicle.chassisNumber,
-//         age: ageDisplay,
-//         ageInDays: ageInDays,
-//         addedDate: createdAt.toISOString().split('T')[0] // YYYY-MM-DD format
+//         ...booking,
+//         bookingType: booking.payment?.type || '',
+//         financierName: financierName,
+//         totalApprovedAmount,
+//         dealAmount,
+//         balanceAmount,
+//         approvedEntriesCount: bookingLedgerEntries.length,
+//         branchName: booking.branch?.name || '',
+//         formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : ''
 //       };
 //     });
 
-//     res.status(200).json({
-//       status: 'success',
-//       results: chassisNumbersWithAge.length,
-//       data: {
-//         modelId,
-//         modelName: model.model_name,
-//         colorId,
-//         colorName: color.name,
-//         chassisNumbers: chassisNumbersWithAge
-//       }
+//     // Filter: ONLY KEEP BOOKINGS WITH VERIFIED AMOUNT > 0
+//     const bookingsWithVerifiedAmount = processedBookings.filter(booking => {
+//       return booking.totalApprovedAmount > 0;
 //     });
-//   } catch (err) {
-//     logger.error(`Error fetching chassis numbers: ${err.message}`);
-//     next(new AppError('Server Error', 500));
+
+//     console.log(`Found ${bookingsWithVerifiedAmount.length} bookings with verified amount > 0`);
+
+//     // Filter bookings with outstanding balance
+//     let outstandingBookings = bookingsWithVerifiedAmount.filter(booking => {
+//       return booking.balanceAmount > 0;
+//     });
+
+//     // Apply balance range filter
+//     if (minBalance || maxBalance) {
+//       outstandingBookings = outstandingBookings.filter(booking => {
+//         if (minBalance && booking.balanceAmount < parseFloat(minBalance)) return false;
+//         if (maxBalance && booking.balanceAmount > parseFloat(maxBalance)) return false;
+//         return true;
+//       });
+//     }
+
+//     console.log(`Found ${outstandingBookings.length} bookings with verified amount > 0 AND outstanding balance > 0`);
+
+//     if (outstandingBookings.length === 0) {
+//       if (format === 'excel') {
+//         const workbook = new ExcelJS.Workbook();
+//         const worksheet = workbook.addWorksheet('Verified Outstanding Report');
+        
+//         // Add headers even for empty report - BRANCH NAME AND BOOKING DATE AT START
+//         const headers = [
+//           'Branch Name',
+//           'Booking Date',
+//           'Booking Number',
+//           'Customer Name',
+//           'Mobile 1',
+//           'Mobile 2',
+//           'Model',
+//           'Model Type',
+//           'Color',
+//           'Booking Type',
+//           'Financier Name',
+//           'Deal Amount',
+//           'Verified Amount',
+//           'Balance Amount',
+//           'Booking Status'
+//         ];
+        
+//         const headerRow = worksheet.addRow(headers);
+//         headerRow.eachCell((cell) => {
+//           cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+//           cell.fill = {
+//             type: 'pattern',
+//             pattern: 'solid',
+//             fgColor: { argb: 'FF2E75B5' }
+//           };
+//         });
+        
+//         const fileName = `verified_outstanding_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+//         res.setHeader(
+//           'Content-Type',
+//           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+//         );
+//         res.setHeader(
+//           'Content-Disposition',
+//           `attachment; filename="${fileName}"`
+//         );
+        
+//         await workbook.xlsx.write(res);
+//         res.end();
+//         return;
+//       } else {
+//         return res.status(200).json({
+//           success: true,
+//           count: 0,
+//           totals: { 
+//             totalDealAmount: 0, 
+//             totalVerifiedAmount: 0, 
+//             totalBalanceAmount: 0
+//           },
+//           data: [],
+//           availableBranches: availableBranches,
+//           userAccessInfo: {
+//             hasAllBranchesAccess: hasAllBranchesAccess,
+//             branchAccess: branchAccess,
+//             accessibleBranchesCount: user.accessibleBranches?.length || 0
+//           },
+//           message: 'No bookings with verified amount > 0 and outstanding balance found'
+//         });
+//       }
+//     }
+
+//     // ========== GENERATE EXCEL REPORT ==========
+//     if (format === 'excel') {
+//       const workbook = new ExcelJS.Workbook();
+      
+//       let worksheetName = 'Verified Outstanding Report';
+//       if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+//         const branch = outstandingBookings[0]?.branch;
+//         if (branch?.name) {
+//           worksheetName = `${branch.name} Verified Outstanding Report`;
+//         }
+//       } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+//         worksheetName = 'All Branches Verified Outstanding Report';
+//       }
+      
+//       const worksheet = workbook.addWorksheet(worksheetName);
+
+//       // DEFINE HEADERS - BRANCH NAME AND BOOKING DATE AT START
+//       const headers = [
+//         'Branch Name',
+//         'Booking Date',
+//         'Booking Number',
+//         'Customer Name',
+//         'Mobile 1',
+//         'Mobile 2',
+//         'Model',
+//         'Model Type',
+//         'Color',
+//         'Booking Type',
+//         'Financier Name',
+//         'Deal Amount',
+//         'Verified Amount',
+//         'Balance Amount',
+//         'Booking Status'
+//       ];
+
+//       // Add headers row
+//       const headerRow = worksheet.addRow(headers);
+
+//       // Style the header row
+//       headerRow.eachCell((cell) => {
+//         cell.font = { 
+//           bold: true, 
+//           color: { argb: 'FFFFFFFF' },
+//           size: 11
+//         };
+//         cell.fill = {
+//           type: 'pattern',
+//           pattern: 'solid',
+//           fgColor: { argb: 'FF2E75B5' }
+//         };
+//         cell.alignment = { 
+//           vertical: 'middle', 
+//           horizontal: 'center',
+//           wrapText: true
+//         };
+//         cell.border = {
+//           top: { style: 'thin' },
+//           left: { style: 'thin' },
+//           bottom: { style: 'thin' },
+//           right: { style: 'thin' }
+//         };
+//       });
+
+//       // Set column widths
+//       worksheet.columns = [
+//         { key: 'branchName', width: 25 },
+//         { key: 'bookingDate', width: 15 },
+//         { key: 'bookingNumber', width: 18 },
+//         { key: 'customerName', width: 25 },
+//         { key: 'mobile1', width: 15 },
+//         { key: 'mobile2', width: 15 },
+//         { key: 'model', width: 20 },
+//         { key: 'modelType', width: 12 },
+//         { key: 'color', width: 15 },
+//         { key: 'bookingType', width: 15 },
+//         { key: 'financierName', width: 25 },
+//         { key: 'dealAmount', width: 18 },
+//         { key: 'verifiedAmount', width: 18 },
+//         { key: 'balanceAmount', width: 18 },
+//         { key: 'status', width: 15 }
+//       ];
+
+//       // ADD DATA ROWS
+//       outstandingBookings.forEach((booking) => {
+//         const rowData = {
+//           branchName: booking.branch?.name || '',
+//           bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+//           bookingNumber: booking.bookingNumber || '',
+//           customerName: booking.customerDetails?.name || '',
+//           mobile1: booking.customerDetails?.mobile1 || '',
+//           mobile2: booking.customerDetails?.mobile2 || '',
+//           model: booking.model?.model_name || '',
+//           modelType: booking.model?.type || '',
+//           color: booking.color?.name || '',
+//           bookingType: booking.payment?.type || '',
+//           financierName: booking.financierName || '',
+//           dealAmount: booking.dealAmount || 0,
+//           verifiedAmount: booking.totalApprovedAmount || 0,
+//           balanceAmount: booking.balanceAmount || 0,
+//           status: booking.status || ''
+//         };
+
+//         worksheet.addRow(rowData);
+//       });
+
+//       // Format amount columns and apply alternating row colors
+//       for (let i = 0; i < outstandingBookings.length; i++) {
+//         const row = worksheet.getRow(i + 2); // +2 because row 1 is header
+        
+//         // Format amount columns (Deal Amount, Verified Amount, Balance Amount)
+//         // Columns are 0-based: dealAmount (11), verifiedAmount (12), balanceAmount (13)
+//         [11, 12, 13].forEach(colIndex => {
+//           const cell = row.getCell(colIndex + 1); // +1 because ExcelJS columns are 1-based
+//           if (typeof cell.value === 'number') {
+//             cell.numFmt = '#,##0.00';
+//             cell.alignment = { horizontal: 'right' };
+//           }
+//         });
+        
+//         // Apply alternating row colors for better readability
+//         if (i % 2 === 0) {
+//           row.eachCell((cell) => {
+//             cell.fill = {
+//               type: 'pattern',
+//               pattern: 'solid',
+//               fgColor: { argb: 'FFF2F2F2' }
+//             };
+//           });
+//         }
+//       }
+
+//       // Apply auto-filter
+//       if (worksheet.rowCount > 1) {
+//         const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+//         worksheet.autoFilter = {
+//           from: 'A1',
+//           to: `${lastColLetter}${worksheet.rowCount}`
+//         };
+//       }
+
+//       // Freeze header row
+//       worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+//       const fileName = `verified_outstanding_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+//       res.setHeader(
+//         'Content-Type',
+//         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+//       );
+//       res.setHeader(
+//         'Content-Disposition',
+//         `attachment; filename="${fileName}"`
+//       );
+
+//       await workbook.xlsx.write(res);
+//       res.end();
+
+//     } else {
+//       // ========== RETURN JSON FORMAT ==========
+//       const formattedBookings = outstandingBookings.map(booking => {
+//         return {
+//           branchName: booking.branch?.name || '',
+//           bookingDate: booking.createdAt,
+//           formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+//           bookingNumber: booking.bookingNumber,
+//           customerName: booking.customerDetails?.name || '',
+//           mobile1: booking.customerDetails?.mobile1 || '',
+//           mobile2: booking.customerDetails?.mobile2 || '',
+//           model: booking.model?.model_name || '',
+//           modelType: booking.model?.type || '',
+//           color: booking.color?.name || '',
+//           bookingType: booking.bookingType || '',
+//           financierName: booking.financierName || '',
+//           dealAmount: booking.dealAmount,
+//           verifiedAmount: booking.totalApprovedAmount,
+//           balanceAmount: booking.balanceAmount,
+//           bookingStatus: booking.status || '',
+//           bookingId: booking._id,
+//           reportType: 'VERIFIED_OUTSTANDING',
+//           approvedEntriesCount: booking.approvedEntriesCount
+//         };
+//       });
+
+//       // Calculate overall totals
+//       const totals = {
+//         totalDealAmount: outstandingBookings.reduce((sum, booking) => 
+//           sum + booking.dealAmount, 0),
+//         totalVerifiedAmount: outstandingBookings.reduce((sum, booking) => 
+//           sum + booking.totalApprovedAmount, 0),
+//         totalBalanceAmount: outstandingBookings.reduce((sum, booking) => 
+//           sum + booking.balanceAmount, 0)
+//       };
+
+//       res.status(200).json({
+//         success: true,
+//         count: outstandingBookings.length,
+//         totals: totals,
+//         data: formattedBookings,
+//         availableBranches: availableBranches,
+//         userAccessInfo: {
+//           hasAllBranchesAccess: hasAllBranchesAccess,
+//           branchAccess: branchAccess,
+//           accessibleBranchesCount: user.accessibleBranches?.length || 0,
+//           userBranch: user.branch ? {
+//             _id: user.branch._id,
+//             name: user.branch.name
+//           } : null
+//         },
+//         filters: {
+//           branchId: branchId,
+//           startDate: startDate,
+//           endDate: endDate,
+//           status: status,
+//           minBalance: minBalance,
+//           maxBalance: maxBalance,
+//           modelType: modelType,
+//           reportType: 'VERIFIED_OUTSTANDING'
+//         },
+//         debug: {
+//           totalBookingsWithVerifiedAmount: bookingsWithVerifiedAmount.length,
+//           totalBookingsWithOutstanding: outstandingBookings.length,
+//           totalApprovedLedgerEntries: allLedgerEntries.length,
+//           totalVerifiedAmount: totals.totalVerifiedAmount
+//         }
+//       });
+//     }
+
+//   } catch (error) {
+//     console.error('Error generating verified outstanding report:', error);
+//     res.status(500).json({
+//       success: false,
+//       message: 'Error generating verified outstanding report',
+//       error: error.message,
+//       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+//     });
 //   }
 // };
 
-
-
-///////////{ ******************* Added by Harshali********************}
-
-exports.getChassisNumbersByModelAndColor = async (req, res, next) => {
+/**
+ * Generate Pending Verification Amount Outstanding Report
+ * Shows bookings with pending verification amounts
+ * REMOVES the "Verified Amount" column
+ * @route GET /api/v1/reports/outstanding/pending-verification
+ * @access Private
+ */
+exports.generatePendingVerificationOutstandingReport = async (req, res) => {
   try {
-    const { modelId, colorId } = req.params;
+    const { 
+      branchId, 
+      startDate, 
+      endDate, 
+      status,
+      minPendingAmount,
+      maxPendingAmount,
+      modelType,
+      format = 'excel' 
+    } = req.query;
 
-    // Validate ObjectIDs
-    if (!mongoose.Types.ObjectId.isValid(modelId)) {
-      return next(new AppError('Invalid model ID format', 400));
-    }
-    if (!mongoose.Types.ObjectId.isValid(colorId)) {
-      return next(new AppError('Invalid color ID format', 400));
-    }
+    // Build filter conditions
+    const filter = {};
 
-    // Ensure model and color exist
-    const model = await Model.findById(modelId).select('model_name type');
-    const color = await Color.findById(colorId).select('name');
-
-    if (!model) {
-      return next(new AppError('No model found with that ID', 404));
-    }
-    if (!color) {
-      return next(new AppError('No color found with that ID', 404));
-    }
+    // Get user info from auth middleware
+    const userId = req.user.id;
     
-    // Subdealer filter
-    const { branchId, subdealerId } = req.query;
+    // Fetch user with all necessary data
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
 
-    let locationFilter = {};
-
-    if (branchId && mongoose.Types.ObjectId.isValid(branchId)) {
-      locationFilter = {
-        locationType: 'branch',
-        unloadLocation: branchId
-      };
-    }
-
-    if (subdealerId && mongoose.Types.ObjectId.isValid(subdealerId)) {
-      locationFilter = {
-        locationType: 'subdealer',
-        subdealerLocation: subdealerId
-      };
-    }
-
-    // Build the base query for vehicle fetching
-    let vehicleQuery = {
-      'color.id': colorId,
-      status: { $in: ['in_stock', 'in_transit', 'booked', 'blocked'] },
-      ...locationFilter
-    };
-
-    // CRITICAL LOGIC: Handle CSD model differently
-    if (model.type === 'CSD') {
-      console.log(`[INFO] Model "${model.model_name}" is CSD type, fetching ICE vehicles by name matching`);
-      
-      const csdModelName = model.model_name;
-      
-      // Find ICE models with similar names
-      const iceModels = await Model.find({
-        type: 'ICE',
-        model_name: { 
-          $regex: csdModelName.replace(/[^a-zA-Z0-9\s]/g, ''),
-          $options: 'i'
-        }
-      }).select('_id model_name');
-      
-      console.log(`[INFO] Found ${iceModels.length} ICE models matching CSD name "${csdModelName}":`, 
-        iceModels.map(m => m.model_name));
-      
-      if (iceModels.length > 0) {
-        vehicleQuery.model = { $in: iceModels.map(m => m._id) };
-        vehicleQuery.type = 'ICE';
-      } else {
-        console.log(`[WARNING] No exact ICE model match found for CSD: "${csdModelName}"`);
-        
-        // Try alternative matching
-        const simplifiedName = csdModelName
-          .replace(/OBD\s*IIB?/gi, '')
-          .replace(/\s+/g, ' ')
-          .trim();
-        
-        console.log(`[INFO] Trying simplified name: "${simplifiedName}"`);
-        
-        const alternativeIceModels = await Model.find({
-          type: 'ICE',
-          $or: [
-            { model_name: { $regex: simplifiedName, $options: 'i' } },
-            { model_name: { $regex: csdModelName.replace(/[^a-zA-Z0-9]/g, ''), $options: 'i' } }
-          ]
-        }).select('_id model_name');
-        
-        if (alternativeIceModels.length > 0) {
-          vehicleQuery.model = { $in: alternativeIceModels.map(m => m._id) };
-          vehicleQuery.type = 'ICE';
-          console.log(`[INFO] Found ${alternativeIceModels.length} alternative ICE models`);
-        } else {
-          console.log(`[ERROR] No ICE models found for CSD: "${csdModelName}"`);
-          vehicleQuery.model = null;
-        }
-      }
-    } else {
-      vehicleQuery.model = modelId;
-    }
-
-    // Fetch vehicles WITHOUT populating location initially - ADDED engineNumber to select
-    const vehicles = await Vehicle.find(vehicleQuery)
-      .select('chassisNumber model modelName color status type createdAt customerName allocatedBooking ageInDays qrCode locationType unloadLocation subdealerLocation engineNumber')
-      .sort({ createdAt: 1 })
-      .populate('model', 'model_name type')
-      .populate('color.id', 'name');
-
-    // Extract chassis numbers with age, booking info, vehicle type and location - ADDED engineNumber to return
-    const chassisNumbersWithDetails = await Promise.all(vehicles.map(async (vehicle) => {
-      const createdAt = vehicle.createdAt;
-      const now = new Date();
-      const ageInMs = now - createdAt;
-      const ageInDays = Math.floor(ageInMs / (1000 * 60 * 60 * 24));
-      const ageInHours = Math.floor((ageInMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-      const ageInMinutes = Math.floor((ageInMs % (1000 * 60 * 60)) / (1000 * 60));
-      const ageInSeconds = Math.floor((ageInMs % (1000 * 60)) / 1000);
-      
-      let ageDisplay = '';
-      if (ageInDays > 0) {
-        ageDisplay = `${ageInDays} day${ageInDays > 1 ? 's' : ''}`;
-        if (ageInHours > 0) {
-          ageDisplay += ` ${ageInHours} hr${ageInHours > 1 ? 's' : ''}`;
-        }
-        if (ageInMinutes > 0) {
-          ageDisplay += ` ${ageInMinutes} min${ageInMinutes > 1 ? 's' : ''}`;
-        }
-      } else if (ageInHours > 0) {
-        ageDisplay = `${ageInHours} hr${ageInHours > 1 ? 's' : ''}`;
-        if (ageInMinutes > 0) {
-          ageDisplay += ` ${ageInMinutes} min${ageInMinutes > 1 ? 's' : ''}`;
-        }
-      } else if (ageInMinutes > 0) {
-        ageDisplay = `${ageInMinutes} min${ageInMinutes > 1 ? 's' : ''}`;
-      } else {
-        ageDisplay = `${ageInSeconds} sec${ageInSeconds > 1 ? 's' : ''}`;
-      }
-
-      // Initialize booking info
-      let bookingInfo = null;
-      let customerName = vehicle.customerName || null;
-      let allocatedBookingId = vehicle.allocatedBooking;
-
-      // Get vehicle type
-      const vehicleType = vehicle.type || (vehicle.model?.type) || 'UNKNOWN';
-      
-      // Get actual vehicle model name
-      const actualModelName = vehicle.model?.model_name || vehicle.modelName || 'Unknown Model';
-      
-      // ========== CRITICAL FIX: Handle Location Information ==========
-      let locationInfo = null;
-      
-      if (vehicle.locationType === 'branch' && vehicle.unloadLocation) {
-        try {
-          // Fetch branch details directly
-          const branch = await mongoose.model('Branch').findById(vehicle.unloadLocation)
-            .select('name address city state')
-            .lean();
-          
-          if (branch) {
-            locationInfo = {
-              type: 'branch',
-              id: vehicle.unloadLocation,
-              name: branch.name || 'Unknown Branch',
-              branch: null, // This is a branch itself, no parent branch
-              fullAddress: `${branch.address || ''}, ${branch.city || ''}, ${branch.state || ''}`.trim() || ', ,'
-            };
-          } else {
-            // Branch not found
-            locationInfo = {
-              type: 'branch',
-              id: vehicle.unloadLocation,
-              name: 'Unknown Branch',
-              branch: null,
-              fullAddress: ', ,'
-            };
-          }
-        } catch (error) {
-          console.warn(`Error fetching branch ${vehicle.unloadLocation}:`, error.message);
-          locationInfo = {
-            type: 'branch',
-            id: vehicle.unloadLocation,
-            name: 'Unknown Branch',
-            branch: null,
-            fullAddress: ', ,'
-          };
-        }
-      } else if (vehicle.locationType === 'subdealer' && vehicle.subdealerLocation) {
-        try {
-          // CRITICAL FIX: Use 'Subdealer' (lowercase 'd') to match vehicle schema
-          // Try to get the Subdealer model - check both capitalizations
-          let SubdealerModel;
-          if (mongoose.models.Subdealer) {
-            SubdealerModel = mongoose.models.Subdealer;
-          } else if (mongoose.models.SubDealer) {
-            SubdealerModel = mongoose.models.SubDealer;
-          } else {
-            // Try to require it
-            SubdealerModel = mongoose.model('Subdealer');
-          }
-          
-          // Fetch subdealer details directly
-          const subdealer = await SubdealerModel.findById(vehicle.subdealerLocation)
-            .select('name address city state location branch')
-            .populate('branch', 'name city state')
-            .lean();
-          
-          if (subdealer) {
-            let branchInfo = null;
-            if (subdealer.branch) {
-              branchInfo = {
-                name: subdealer.branch.name,
-                city: subdealer.branch.city,
-                state: subdealer.branch.state
-              };
-            }
-            
-            locationInfo = {
-              type: 'subdealer',
-              id: vehicle.subdealerLocation,
-              name: subdealer.name || 'Unknown Subdealer',
-              branch: branchInfo,
-              fullAddress: `${subdealer.address || ''}, ${subdealer.city || ''}, ${subdealer.state || ''}`.trim() || ', ,'
-            };
-          } else {
-            // Subdealer not found - check if subdealer exists in database
-            console.warn(`Subdealer with ID ${vehicle.subdealerLocation} not found in database`);
-            
-            // Try to get just the name from the database
-            try {
-              const subdealerName = await SubdealerModel.findById(vehicle.subdealerLocation)
-                .select('name')
-                .lean();
-              
-              locationInfo = {
-                type: 'subdealer',
-                id: vehicle.subdealerLocation,
-                name: subdealerName?.name || 'Unknown Subdealer',
-                branch: null,
-                fullAddress: ', ,'
-              };
-            } catch (nameError) {
-              locationInfo = {
-                type: 'subdealer',
-                id: vehicle.subdealerLocation,
-                name: 'Unknown Subdealer',
-                branch: null,
-                fullAddress: ', ,'
-              };
-            }
-          }
-        } catch (error) {
-          console.warn(`Error fetching subdealer ${vehicle.subdealerLocation}:`, error.message);
-          
-          // Check what's actually in the database
-          console.log('DEBUG - Checking available models:', Object.keys(mongoose.models));
-          
-          locationInfo = {
-            type: 'subdealer',
-            id: vehicle.subdealerLocation,
-            name: 'Unknown Subdealer',
-            branch: null,
-            fullAddress: ', ,'
-          };
-        }
-      } else {
-        // No location specified
-        locationInfo = {
-          type: 'unknown',
-          id: null,
-          name: 'Unknown Location',
-          branch: null,
-          fullAddress: ', ,'
-        };
-      }
-      
-      // Check multiple sources for booking ID
-      let bookingIdToFetch = allocatedBookingId;
-      
-      if (!bookingIdToFetch && ['booked', 'blocked', 'sold'].includes(vehicle.status)) {
-        try {
-          const bookingByVehicleRef = await Booking.findOne({ 
-            vehicleRef: vehicle._id 
-          }).select('_id').lean();
-          
-          if (bookingByVehicleRef) {
-            bookingIdToFetch = bookingByVehicleRef._id;
-          }
-        } catch (error) {
-          console.warn(`Error finding booking by vehicleRef:`, error.message);
-        }
-      }
-
-      // If we have a booking ID, fetch booking details
-      if (bookingIdToFetch) {
-        try {
-          const booking = await Booking.findById(bookingIdToFetch)
-            .select('bookingNumber customerDetails.name customerDetails.salutation')
-            .lean();
-          
-          if (booking) {
-            bookingInfo = {
-              bookingId: booking._id,
-              bookingNumber: booking.bookingNumber,
-              customerName: booking.customerDetails?.name || customerName,
-              customerSalutation: booking.customerDetails?.salutation || null
-            };
-            
-            if (booking.customerDetails?.name && !customerName) {
-              customerName = booking.customerDetails.name;
-            }
-          }
-        } catch (bookingError) {
-          console.error(`Error fetching booking ${bookingIdToFetch}:`, bookingError.message);
-        }
-      }
-
-      // Get QR code URL
-      const qrCodeUrl = vehicle.qrCode ? 
-        `${req.protocol}://${req.get('host')}${vehicle.qrCode}` : 
-        null;
-
-      // Determine if vehicle is eligible for CSD models
-      const isEligibleForCsd = (model.type === 'CSD' && vehicleType === 'ICE') || model.type !== 'CSD';
-
-      return {
-        vehicleId: vehicle._id,
-        chassisNumber: vehicle.chassisNumber,
-        engineNumber: vehicle.engineNumber, // ADDED engine number here
-        status: vehicle.status,
-        type: vehicleType,
-        actualModelName: actualModelName,
-        age: ageDisplay,
-        ageInDays: ageInDays,
-        addedDate: createdAt.toISOString().split('T')[0],
-        customerName: customerName,
-        allocatedBooking: allocatedBookingId,
-        bookingInfo: bookingInfo,
-        qrCode: vehicle.qrCode,
-        qrCodeUrl: qrCodeUrl,
-        isBookedOrBlocked: ['booked', 'blocked', 'sold'].includes(vehicle.status),
-        
-        // Location information (now properly fetched)
-        locationType: vehicle.locationType,
-        location: locationInfo,
-        
-        // Add CSD-specific eligibility
-        isCsdModel: model.type === 'CSD',
-        isCsdCompatible: isEligibleForCsd,
-        requestedCsdModel: model.model_name,
-        
-        // Add eligibility info
-        isEligibleForBooking: (vehicle.status === 'in_stock' || vehicle.status === 'in_transit') && isEligibleForCsd,
-        eligibilityMessage: !isEligibleForCsd ? 'Not compatible with CSD model' :
-                            vehicle.status === 'in_stock' ? 'Available for booking' : 
-                            vehicle.status === 'in_transit' ? 'In transit - Will be available soon' :
-                            vehicle.status === 'booked' ? `Booked by ${customerName || 'customer'}` :
-                            vehicle.status === 'blocked' ? `Blocked by ${customerName || 'customer'}` : 'Not available'
-      };
-    }));
-
-    // Filter based on status if requested
-    const { statusFilter, typeFilter, locationTypeFilter } = req.query;
-    let filteredChassisNumbers = chassisNumbersWithDetails;
-    
-    if (statusFilter && ['in_stock', 'in_transit', 'booked', 'blocked'].includes(statusFilter)) {
-      filteredChassisNumbers = filteredChassisNumbers.filter(v => v.status === statusFilter);
-    }
-    
-    if (typeFilter && ['EV', 'ICE'].includes(typeFilter.toUpperCase())) {
-      filteredChassisNumbers = filteredChassisNumbers.filter(v => v.type === typeFilter.toUpperCase());
-    }
-    
-    if (locationTypeFilter && ['branch', 'subdealer'].includes(locationTypeFilter.toLowerCase())) {
-      filteredChassisNumbers = filteredChassisNumbers.filter(v => v.locationType === locationTypeFilter.toLowerCase());
-    }
-
-    // Count vehicles by type
-    const typeCounts = chassisNumbersWithDetails.reduce((acc, vehicle) => {
-      const type = vehicle.type || 'UNKNOWN';
-      if (!acc[type]) acc[type] = 0;
-      acc[type]++;
-      return acc;
-    }, {});
-
-    // Count vehicles by location type
-    const locationTypeCounts = chassisNumbersWithDetails.reduce((acc, vehicle) => {
-      const locationType = vehicle.locationType || 'unknown';
-      if (!acc[locationType]) acc[locationType] = 0;
-      acc[locationType]++;
-      return acc;
-    }, {});
-
-    // Count vehicles by specific location
-    const locationCounts = chassisNumbersWithDetails.reduce((acc, vehicle) => {
-      if (vehicle.location) {
-        const locationName = vehicle.location.name || 'Unknown Location';
-        if (!acc[locationName]) {
-          acc[locationName] = {
-            count: 0,
-            type: vehicle.locationType,
-            locationDetails: vehicle.location
-          };
-        }
-        acc[locationName].count++;
-      }
-      return acc;
-    }, {});
-
-    // Add CSD-specific statistics
-    const csdStats = model.type === 'CSD' ? {
-      csdModel: true,
-      requestedCsdModel: model.model_name,
-      compatibleVehicles: chassisNumbersWithDetails.filter(v => v.isCsdCompatible).length,
-      incompatibleVehicles: chassisNumbersWithDetails.filter(v => !v.isCsdCompatible).length
-    } : {
-      csdModel: false
-    };
-
-    res.status(200).json({
-      status: 'success',
-      results: filteredChassisNumbers.length,
-      data: {
-        modelId,
-        modelName: model.model_name,
-        modelType: model.type,
-        colorId,
-        colorName: color.name,
-        csdModel: model.type === 'CSD',
-        requestedCsdModel: model.type === 'CSD' ? model.model_name : null,
-        chassisNumbers: filteredChassisNumbers,
-        counts: {
-          total: chassisNumbersWithDetails.length,
-          in_stock: chassisNumbersWithDetails.filter(v => v.status === 'in_stock').length,
-          in_transit: chassisNumbersWithDetails.filter(v => v.status === 'in_transit').length,
-          booked: chassisNumbersWithDetails.filter(v => v.status === 'booked').length,
-          blocked: chassisNumbersWithDetails.filter(v => v.status === 'blocked').length,
-          byType: typeCounts,
-          byLocationType: locationTypeCounts,
-          byLocation: locationCounts,
-          ...csdStats
-        },
-        locationSummary: {
-          totalLocations: Object.keys(locationCounts).length,
-          branchLocations: chassisNumbersWithDetails.filter(v => v.locationType === 'branch').length,
-          subdealerLocations: chassisNumbersWithDetails.filter(v => v.locationType === 'subdealer').length
-        },
-        compatibilityInfo: model.type === 'CSD' ? {
-          message: `CSD model "${model.model_name}" matches with ICE vehicles`,
-          compatibleVehicleTypes: ['ICE'],
-          incompatibleVehicleTypes: ['EV']
-        } : {
-          message: 'Compatible with all vehicle types',
-          compatibleVehicleTypes: ['EV', 'ICE']
-        }
-      }
-    });
-  } catch (err) {
-    logger.error(`Error fetching chassis numbers: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-exports.deleteVehicle = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
-    }
-
-    // Check if vehicle exists
-    const vehicle = await Vehicle.findById(vehicleId);
-    if (!vehicle) {
-      return next(new AppError('No vehicle found with that ID', 404));
-    }
-
-    // Prevent deletion of vehicles that are not in not_approved or in_stock status
-    if (!['not_approved', 'in_transit','in_stock','blocked','booked','FROZEN'].includes(vehicle.status)) {
-      return next(new AppError(
-        `Cannot delete vehicle with status "${vehicle.status}". Only vehicles with "not_approved" or "in_stock" status can be deleted.`,
-        400
-      ));
-    }
-
-    await Vehicle.findByIdAndDelete(vehicleId);
-
-    res.status(204).json({
-      status: 'success',
-      data: null
-    });
-
-  } catch (err) {
-    logger.error(`Error deleting vehicle: ${err.message}`);
-    next(new AppError('Server Error', 500));
-  }
-};
-
-
-///////{*****************************}
-
-
-exports.unblockAndAssignVehicle = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-    const {
-      assignReplacement = true,
-      reason = 'Vehicle unblocked by system'
-    } = req.body;
-
-    // REMOVED: userId from destructuring since we don't need it
-
-    /* ----------------------------------------------------
-     * 1. Validate vehicleId
-     * -------------------------------------------------- */
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid vehicle ID'
-      });
-    }
-
-    /* ----------------------------------------------------
-     * 2. Fetch vehicle
-     * -------------------------------------------------- */
-    const vehicle = await Vehicle.findById(vehicleId)
-      .populate('model', 'model_name')
-      .populate('color.id', 'name')
-      .populate('unloadLocation', 'name')
-      .populate('subdealerLocation', 'name')
-      .populate('booking', 'bookingNumber status customerName')
-      .populate('allocatedBooking', 'bookingNumber status customerName');
-
-    if (!vehicle) {
+    if (!user) {
       return res.status(404).json({
         success: false,
-        message: 'Vehicle not found'
+        message: 'User not found'
       });
     }
 
-    /* ----------------------------------------------------
-     * 3. Check if vehicle can be unblocked
-     * -------------------------------------------------- */
-    const allowedStatuses = ['blocked', 'booked'];
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    console.log(`🏢 Accessible Branches: ${user.accessibleBranches?.length || 0}`);
     
-    if (!allowedStatuses.includes(vehicle.status)) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot unblock vehicle. Current status: ${vehicle.status}.`,
-        allowedStatuses
+    const userRoles = user.roles || [];
+    
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
       });
+      console.log('✅ Added "All Branches" option to dropdown');
     }
 
-    /* ----------------------------------------------------
-     * 4. Save current info before modifying
-     * -------------------------------------------------- */
-    const previousStatus = vehicle.status;
-    const previousCustomerName = vehicle.customerName;
-    const previousBookingId = vehicle.allocatedBooking || vehicle.booking;
-
-    /* ----------------------------------------------------
-     * 5. For BOOKED vehicles - auto-cancel booking
-     * -------------------------------------------------- */
-    let bookingCancelled = false;
-    
-    if (vehicle.status === 'booked' && vehicle.booking) {
-      // Automatically cancel booking
-      vehicle.booking.status = 'cancelled';
-      vehicle.booking.cancellationReason = reason;
-      vehicle.booking.cancelledAt = new Date();
-      vehicle.booking.cancelledBy = req.user.id;
-      await vehicle.booking.save();
-      bookingCancelled = true;
-    }
-
-    /* ----------------------------------------------------
-     * 6. FREEZE VEHICLE (24 HOURS) - MAIN ACTION
-     * -------------------------------------------------- */
-    // Store original values
-    const originalStatus = vehicle.status;
-    
-    // Update vehicle status to FROZEN - THIS IS CRITICAL
-    vehicle.status = 'FROZEN';
-    
-    // Set freeze info
-    vehicle.freezeInfo = {
-      isFrozen: true,
-      frozenAt: new Date(),
-      frozenUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      frozenBy: req.user.id,
-      frozenReason: reason,
-      originalStatus: originalStatus
-    };
-
-    /* 🔥 CLEAR ALL ALLOCATION DATA */
-    vehicle.customerName = null;
-    vehicle.allocatedBooking = null;
-    vehicle.booking = null;
-    vehicle.bookingReceivedAmount = 0;
-    vehicle.requiredMinAmount = 0;
-    vehicle.minAmountPercentage = 0;
-    vehicle.lastUpdatedBy = req.user.id;
-    vehicle.lastUpdatedAt = new Date();
-
-    /* ----------------------------------------------------
-     * 7. Add to unblock history
-     * -------------------------------------------------- */
-    if (!vehicle.unblockHistory) {
-      vehicle.unblockHistory = [];
-    }
-    
-    const historyEntry = {
-      unblockedAt: new Date(),
-      unblockedBy: req.user.id,
-      reason: `${reason} | Previous status: ${previousStatus}`,
-      customerNameAtUnblock: previousCustomerName,
-      allocatedBookingAtUnblock: previousBookingId?._id || previousBookingId
-    };
-    
-    vehicle.unblockHistory.push(historyEntry);
-
-    // Save the vehicle
-    await vehicle.save();
-    console.log('✅ Vehicle frozen with status:', vehicle.status);
-
-    /* ----------------------------------------------------
-     * 8. Try replacement allocation
-     * -------------------------------------------------- */
-    let replacementVehicle = null;
-    let assignmentResult = null;
-
-    // Only assign replacement if there was a customer
-    if (assignReplacement && previousCustomerName) {
-      const replacementQuery = {
-        model: vehicle.model,
-        'color.id': vehicle.color.id,
-        locationType: vehicle.locationType,
-        status: 'in_stock',
-        'freezeInfo.isFrozen': { $ne: true },
-        _id: { $ne: vehicle._id },
-        $or: [
-          { customerName: { $exists: false } },
-          { customerName: null },
-          { customerName: '' }
-        ]
-      };
-
-      // Add location filter
-      if (vehicle.locationType === 'branch') {
-        replacementQuery.unloadLocation = vehicle.unloadLocation;
-      } else {
-        replacementQuery.subdealerLocation = vehicle.subdealerLocation;
-      }
-
-      // Find available vehicle
-      replacementVehicle = await Vehicle.findOne(replacementQuery)
-        .sort({ inwardDate: 1 })
-        .exec();
-
-      /* ------------------------------------------------
-       * 8A. Replacement FOUND
-       * ---------------------------------------------- */
-      if (replacementVehicle) {
-        const bookingId = previousBookingId?._id || previousBookingId;
+    // ========== APPLY BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
         
-        if (bookingId) {
-          const booking = await Booking.findById(bookingId);
-          
-          if (booking) {
-            // Determine new status
-            const newStatus = previousStatus === 'booked' ? 'booked' : 'blocked';
-            
-            // Allocate replacement
-            replacementVehicle.status = newStatus;
-            replacementVehicle.customerName = previousCustomerName;
-            replacementVehicle.allocatedBooking = bookingId;
-            
-            if (newStatus === 'booked') {
-              replacementVehicle.booking = bookingId;
-              // Restore booking
-              booking.status = 'confirmed';
-              booking.vehicleRef = replacementVehicle._id;
-              booking.chassisNumber = replacementVehicle.chassisNumber;
-              booking.cancellationReason = undefined;
-              booking.cancelledAt = undefined;
-              booking.cancelledBy = undefined;
-            }
-            
-            replacementVehicle.lastUpdatedBy = req.user.id;
-            replacementVehicle.lastUpdatedAt = new Date();
-
-            // Add to allocation history
-            if (!replacementVehicle.allocationHistory) {
-              replacementVehicle.allocationHistory = [];
-            }
-            
-            replacementVehicle.allocationHistory.push({
-              bookingId: bookingId,
-              allocatedAt: new Date(),
-              allocatedBy: req.user.id,
-              status: 'ALLOCATED',
-              note: `Replacement for ${previousStatus} vehicle ${vehicle.chassisNumber}`
-            });
-
-            await replacementVehicle.save();
-            await booking.save();
-
-            // Update the history entry with replacement vehicle
-            if (vehicle.unblockHistory.length > 0) {
-              const lastEntry = vehicle.unblockHistory[vehicle.unblockHistory.length - 1];
-              lastEntry.replacedWithVehicle = replacementVehicle._id;
-              await vehicle.save();
-            }
-
-            assignmentResult = {
-              type: 'REPLACEMENT_ASSIGNED',
-              message: 'Replacement vehicle assigned successfully',
-              status: newStatus,
-              vehicle: {
-                _id: replacementVehicle._id,
-                chassisNumber: replacementVehicle.chassisNumber,
-                status: replacementVehicle.status
-              }
-            };
-          }
-        }
-      }
-
-      /* ------------------------------------------------
-       * 8B. NO replacement → waiting list (SIMPLIFIED)
-       * ---------------------------------------------- */
-      if (!replacementVehicle) {
-        try {
-          // Get names
-          const modelName = vehicle.model?.model_name || 'Unknown';
-          const colorName = vehicle.color.id?.name || 'Unknown';
-
-          let locationName = 'Unknown';
-          let locationId = null;
-
-          if (vehicle.locationType === 'branch') {
-            locationName = vehicle.unloadLocation?.name || 'Unknown';
-            locationId = vehicle.unloadLocation;
+        if (branchId) {
+          if (branchId === 'all') {
+            filter.branch = { $in: accessibleBranchIds };
+            console.log('✅ Showing all accessible branches');
           } else {
-            locationName = vehicle.subdealerLocation?.name || 'Unknown';
-            locationId = vehicle.subdealerLocation;
-          }
-
-          // SIMPLIFIED: Create waiting list without userId if not required
-          const waitingListData = {
-            customerName: previousCustomerName,
-            model: vehicle.model?._id,
-            modelName: modelName,
-            color: vehicle.color.id?._id,
-            colorName: colorName,
-            location: locationId,
-            locationName,
-            locationType: vehicle.locationType,
-            bookingId: previousBookingId?._id || previousBookingId,
-            priority: 'HIGH',
-            reason: `Waiting for replacement after vehicle ${vehicle.chassisNumber} was unblocked`,
-            createdBy: req.user.id,
-            createdAt: new Date()
-          };
-
-          console.log('Creating waiting list with data:', waitingListData);
-
-          // Create waiting list entry
-          const waitingListEntry = await VehicleWaitingList.create(waitingListData);
-
-          assignmentResult = {
-            type: 'WAITING_LIST',
-            message: 'Customer added to waiting list for replacement vehicle',
-            waitingListId: waitingListEntry._id
-          };
-        } catch (waitingListError) {
-          console.error('Error creating waiting list:', waitingListError);
-          
-          // If error is about userId, try without it
-          if (waitingListError.message.includes('userId')) {
-            try {
-              // Try creating without userId
-              const waitingListEntry = await VehicleWaitingList.create({
-                customerName: previousCustomerName,
-                model: vehicle.model?._id,
-                modelName: vehicle.model?.model_name || 'Unknown',
-                color: vehicle.color.id?._id,
-                colorName: vehicle.color.id?.name || 'Unknown',
-                location: vehicle.locationType === 'branch' ? vehicle.unloadLocation : vehicle.subdealerLocation,
-                locationType: vehicle.locationType,
-                bookingId: previousBookingId?._id || previousBookingId,
-                priority: 'HIGH',
-                reason: `Waiting for replacement after unblock`,
-                createdBy: req.user.id
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(branchId => 
+              branchId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this branch'
               });
-              
-              assignmentResult = {
-                type: 'WAITING_LIST',
-                message: 'Customer added to waiting list',
-                waitingListId: waitingListEntry._id
-              };
-            } catch (retryError) {
-              console.error('Retry also failed:', retryError);
-              assignmentResult = {
-                type: 'WAITING_LIST_ERROR',
-                message: 'Could not add to waiting list'
-              };
             }
-          } else {
-            assignmentResult = {
-              type: 'WAITING_LIST_ERROR',
-              message: 'Could not add to waiting list'
-            };
+            filter.branch = requestedBranchId;
+            console.log(`✅ Filtering by branch: ${branchId}`);
           }
+        } else {
+          filter.branch = { $in: accessibleBranchIds };
+          console.log('✅ Showing all accessible branches (no branch filter)');
+        }
+      } else {
+        console.log('User has only OWN branch access');
+        if (user.branch && user.branch._id) {
+          filter.branch = user.branch._id;
+          console.log(`✅ Filtering by own branch: ${user.branch._id}`);
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
         }
       }
-    }
-
-    /* ----------------------------------------------------
-     * 9. Regenerate QR Code
-     * -------------------------------------------------- */
-    try {
-      const { generateVehicleQRCode } = require('../utils/qrGenerator');
-      vehicle.qrCode = await generateVehicleQRCode(vehicle);
-      await vehicle.save();
-    } catch (qrError) {
-      console.warn('QR code regeneration skipped:', qrError.message);
-    }
-
-    /* ----------------------------------------------------
-     * 10. Response
-     * -------------------------------------------------- */
-    return res.status(200).json({
-      success: true,
-      message: `Vehicle unblocked successfully${bookingCancelled ? ' (Booking cancelled)' : ''}`,
-      data: {
-        frozenVehicle: {
-          _id: vehicle._id,
-          chassisNumber: vehicle.chassisNumber,
-          status: vehicle.status, // Should be 'FROZEN'
-          previousStatus: previousStatus,
-          freezeUntil: vehicle.freezeInfo.frozenUntil
-        },
-        bookingCancelled: bookingCancelled,
-        assignmentResult
+    } else {
+      if (branchId) {
+        if (branchId === 'all') {
+          console.log('✅ Showing ALL branches (SUPERADMIN/ADMIN with "All" selected)');
+        } else {
+          filter.branch = new mongoose.Types.ObjectId(branchId);
+          console.log(`✅ Filtering by branch: ${branchId}`);
+        }
+      } else {
+        console.log('✅ Showing ALL branches (no branch filter)');
       }
-    });
-
-  } catch (err) {
-    console.error('Unblock error:', {
-      message: err.message,
-      name: err.name,
-      stack: err.stack
-    });
-    
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to unblock vehicle',
-      error: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
-    });
-  }
-};
-    
-exports.getEligibleCustomersForFrozenVehicle = async (req, res, next) => {
-  try {
-    const { vehicleId } = req.params;
-    
-    // Validate vehicle ID
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
     }
 
-    console.log(`[ELIGIBLE-CUSTOMERS] Looking for frozen vehicle with ID: ${vehicleId}`);
-    
-    // Find the frozen vehicle with all details
-    const vehicle = await Vehicle.findById(vehicleId)
-      .populate('model', 'model_name')
-      .populate('color.id', 'name')
-      .populate('unloadLocation', 'name')
-      .populate('subdealerLocation', 'name');
-
-    if (!vehicle) {
-      console.log(`[ELIGIBLE-CUSTOMERS] Vehicle not found with ID: ${vehicleId}`);
-      return next(new AppError('Vehicle not found', 404));
-    }
-
-    // Check if vehicle is frozen
-    if (!vehicle.freezeInfo || !vehicle.freezeInfo.isFrozen) {
-      console.log(`[ELIGIBLE-CUSTOMERS] Vehicle ${vehicle.chassisNumber} is not frozen. Status: ${vehicle.status}`);
-      return next(new AppError(`Vehicle is not frozen. Current status: ${vehicle.status}`, 400));
-    }
-
-    // Get exact vehicle criteria for matching
-    const vehicleModel = vehicle.model._id;
-    const vehicleColor = vehicle.color.id;
-    const vehicleLocationType = vehicle.locationType;
-    const vehicleLocationId = vehicleLocationType === 'branch' 
-      ? vehicle.unloadLocation._id 
-      : vehicle.subdealerLocation._id;
-
-    console.log(`[ELIGIBLE-CUSTOMERS] Found frozen vehicle: ${vehicle.chassisNumber}`);
-    console.log(`[ELIGIBLE-CUSTOMERS] Exact match criteria:`, {
-      vehicleId: vehicle._id,
-      chassisNumber: vehicle.chassisNumber,
-      model: {
-        id: vehicleModel,
-        name: vehicle.model?.model_name
-      },
-      color: {
-        id: vehicleColor,
-        name: vehicle.color?.name
-      },
-      locationType: vehicleLocationType,
-      locationId: vehicleLocationId,
-      locationName: vehicleLocationType === 'branch' 
-        ? vehicle.unloadLocation?.name 
-        : vehicle.subdealerLocation?.name
-    });
-
-    // Helper function to calculate priority score
-    const calculatePriorityScore = (waitingEntry, paymentInfo) => {
-      let score = 0;
-      
-      // Base score from waiting list priority
-      const priorityBonus = {
-        'HIGH': 100,
-        'MEDIUM': 70,
-        'LOW': 40
-      };
-      score += priorityBonus[waitingEntry.priority] || 0;
-      
-      // Bonus for older requests (FIFO consideration)
-      const daysOld = (Date.now() - new Date(waitingEntry.requestedAt).getTime()) / (1000 * 60 * 60 * 24);
-      score += Math.min(daysOld * 5, 50); // Max 50 points for age
-      
-      // Bonus for payment status
-      const paymentStatus = paymentInfo.paymentStatus || 'BELOW_MIN';
-      const paymentStatusBonus = {
-        'FULLY_PAID': 80,
-        'MEETS_MIN': 60,
-        'BELOW_MIN': 0
-      };
-      score += paymentStatusBonus[paymentStatus] || 0;
-      
-      // Bonus for meetsMinimum
-      if (paymentInfo.meetsMinimum) {
-        score += 30;
+    // ========== DATE RANGE FILTER ==========
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.createdAt.$gte = start;
       }
-      
-      // Bonus for higher received amount
-      const receivedAmount = paymentInfo.receivedAmount || 0;
-      if (receivedAmount >= 50000) score += 40;
-      if (receivedAmount >= 100000) score += 60;
-      if (receivedAmount >= 200000) score += 80;
-      
-      return Math.round(score);
-    };
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.createdAt.$lte = end;
+      }
+    }
 
-    // 1. Get ALL waiting list entries for exact match
-    const waitingListQuery = {
-      model: vehicleModel,
-      color: vehicleColor,
-      location: vehicleLocationId,
-      locationType: vehicleLocationType,
-      status: 'PENDING'
-    };
+    // ========== STATUS FILTER ==========
+    if (status) {
+      filter.status = status;
+    } else {
+      filter.status = { 
+        $nin: ['CANCELLED', 'COMPLETED', 'CANCELLED_APPROVE', 'CANCELLED_REJECTED'] 
+      };
+    }
 
-    console.log(`[ELIGIBLE-CUSTOMERS] Waiting list query:`, JSON.stringify(waitingListQuery, null, 2));
+    console.log('Pending Verification Report Filter:', JSON.stringify(filter, null, 2));
 
-    // First, get waiting list entries
-    const allWaitingListEntries = await VehicleWaitingList.find(waitingListQuery)
-      .populate('model', 'model_name')
+    // ========== FETCH BOOKINGS ==========
+    const bookingsQuery = Booking.find(filter)
+      .populate('model', 'model_name type')
       .populate('color', 'name')
+      .populate('branch', 'name')
+      .populate('salesExecutive', 'name')
       .populate({
-        path: 'bookingId',
-        select: 'bookingNumber vehicleRef payment status customerDetails',
-        populate: [
-          { path: 'vehicleRef', select: 'chassisNumber' }
-        ]
+        path: 'payment.financer',
+        select: 'name'
       })
-      .sort({ priority: -1, requestedAt: 1 });
+      .sort({ createdAt: -1 });
 
-    console.log(`[ELIGIBLE-CUSTOMERS] Found ${allWaitingListEntries.length} waiting list entries with exact model, color, and location match`);
-
-    // 2. Process waiting list entries
-    const eligibleWaitingListCustomers = [];
-    const processedBookings = new Set(); // Track processed bookings to avoid duplicates
-
-    for (const waitingEntry of allWaitingListEntries) {
-      try {
-        console.log(`[ELIGIBLE-CUSTOMERS] Processing waiting list entry:`, {
-          id: waitingEntry._id,
-          customerName: waitingEntry.customerName,
-          bookingId: waitingEntry.bookingId?._id,
-          bookingNumber: waitingEntry.bookingNumber,
-          hasBooking: !!waitingEntry.bookingId,
-          paymentInfo: waitingEntry.paymentInfo
-        });
-
-        // Skip if this booking was already processed (avoid duplicates)
-        if (waitingEntry.bookingId && processedBookings.has(waitingEntry.bookingId._id.toString())) {
-          console.log(`[ELIGIBLE-CUSTOMERS] Skipping duplicate booking ${waitingEntry.bookingNumber}`);
-          continue;
-        }
-
-        // Mark this booking as processed
-        if (waitingEntry.bookingId) {
-          processedBookings.add(waitingEntry.bookingId._id.toString());
-        }
-
-        // Get payment info
-        const paymentInfo = waitingEntry.paymentInfo || {};
-        const receivedAmount = paymentInfo.receivedAmount || 0;
-        const requiredMinAmount = paymentInfo.requiredMinAmount || 0;
-        const minPercentage = paymentInfo.minPercentage || 10;
-        const paymentStatus = paymentInfo.paymentStatus || 'BELOW_MIN';
-        const meetsMinimum = paymentInfo.meetsMinimum || false;
-
-        console.log(`[ELIGIBLE-CUSTOMERS] Payment info:`, {
-          receivedAmount,
-          requiredMinAmount,
-          minPercentage,
-          paymentStatus,
-          meetsMinimum
-        });
-
-        // Check eligibility - SIMPLIFIED: If meetsMinimum is true OR paymentStatus is MEETS_MIN/FULLY_PAID
-        let isEligible = false;
-        let eligibilityReason = '';
-
-        if (meetsMinimum || paymentStatus === 'MEETS_MIN' || paymentStatus === 'FULLY_PAID') {
-          isEligible = true;
-          eligibilityReason = `Payment status: ${paymentStatus}, meetsMinimum: ${meetsMinimum}`;
-        } else if (requiredMinAmount > 0) {
-          // Check if meets percentage requirement
-          const receivedPercentage = (receivedAmount / requiredMinAmount) * 100;
-          if (receivedPercentage >= minPercentage) {
-            isEligible = true;
-            eligibilityReason = `Payment meets ${minPercentage}% minimum (${receivedPercentage.toFixed(2)}% paid)`;
-          } else {
-            eligibilityReason = `Payment below ${minPercentage}% minimum (${receivedPercentage.toFixed(2)}% paid)`;
-          }
-        } else if (receivedAmount > 0) {
-          // If no requiredMinAmount but has payment, consider eligible
-          isEligible = true;
-          eligibilityReason = `Payment received: ₹${receivedAmount}`;
-        } else {
-          eligibilityReason = 'No payment received';
-        }
-
-        console.log(`[ELIGIBLE-CUSTOMERS] Eligibility check:`, {
-          customerName: waitingEntry.customerName,
-          isEligible,
-          eligibilityReason
-        });
-
-        if (isEligible) {
-          // Get booking details if exists
-          let bookingDetails = null;
-          let hasVehicleAllocated = false;
+    // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+    if (modelType) {
+      console.log(`Applying model type filter: ${modelType}`);
+      
+      const models = await mongoose.model('Model').find({ 
+        type: modelType.toUpperCase()
+      }).select('_id').lean();
+      
+      const modelIds = models.map(model => model._id);
+      
+      if (modelIds.length > 0) {
+        bookingsQuery.where('model').in(modelIds);
+        console.log(`Filtering by ${modelIds.length} ${modelType} models`);
+      } else {
+        console.log(`No ${modelType} models found`);
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Pending Verification Report');
           
-          if (waitingEntry.bookingId) {
-            const booking = waitingEntry.bookingId;
-            hasVehicleAllocated = !!booking.vehicleRef;
-            
-            bookingDetails = {
-              bookingId: booking._id,
-              bookingNumber: booking.bookingNumber,
-              paymentType: booking.payment?.type,
-              financerName: booking.payment?.financer?.name,
-              status: booking.status,
-              customerName: booking.customerDetails?.name,
-              vehicleAllocated: hasVehicleAllocated,
-              vehicleChassis: booking.vehicleRef?.chassisNumber
+          // Add headers even for empty report - BRANCH NAME AND BOOKING DATE AT START
+          const headers = [
+            'Branch Name',
+            'Booking Date',
+            'Booking Number',
+            'Customer Name',
+            'Mobile 1',
+            'Mobile 2',
+            'Model',
+            'Model Type',
+            'Color',
+            'Booking Type',
+            'Financier Name',
+            'Deal Amount',
+            'Pending Verification Amount',
+            'Balance Amount',
+            'Booking Status'
+          ];
+          
+          const headerRow = worksheet.addRow(headers);
+          headerRow.eachCell((cell) => {
+            cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FF2E75B5' }
             };
-          }
-
-          // Skip if booking already has vehicle allocated
-          if (hasVehicleAllocated) {
-            console.log(`[ELIGIBLE-CUSTOMERS] Skipping ${waitingEntry.customerName} - Booking already has vehicle ${bookingDetails?.vehicleChassis}`);
-            continue;
-          }
-
-          const waitingCustomerDetails = {
-            waitingListId: waitingEntry._id,
-            customerName: waitingEntry.customerName,
-            modelName: waitingEntry.modelName,
-            colorName: waitingEntry.colorName,
-            locationName: waitingEntry.locationName,
-            locationType: waitingEntry.locationType,
-            paymentType: bookingDetails?.paymentType || 'WAITING_LIST',
-            receivedAmount: receivedAmount,
-            requiredMinAmount: requiredMinAmount,
-            minPercentage: minPercentage,
-            paymentStatus: paymentStatus,
-            meetsMinimum: meetsMinimum,
-            priority: waitingEntry.priority,
-            requestedAt: waitingEntry.requestedAt,
-            reason: waitingEntry.reason,
-            eligibilityReason: eligibilityReason,
-            isEligible: isEligible,
-            source: bookingDetails ? 'WAITING_LIST_WITH_BOOKING' : 'WAITING_LIST_DIRECT',
-            hasBooking: !!waitingEntry.bookingId,
-            bookingDetails: bookingDetails,
-            priorityScore: calculatePriorityScore(waitingEntry, paymentInfo)
-          };
-
-          eligibleWaitingListCustomers.push(waitingCustomerDetails);
-          console.log(`[ELIGIBLE-CUSTOMERS]   Added eligible customer ${waitingEntry.customerName}: ${eligibilityReason}`);
+          });
+          
+          const fileName = `pending_verification_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+          res.setHeader(
+            'Content-Type',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          );
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${fileName}"`
+          );
+          
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
         } else {
-          console.log(`[ELIGIBLE-CUSTOMERS] ❌ ${waitingEntry.customerName} is NOT eligible: ${eligibilityReason}`);
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            totals: { 
+              totalDealAmount: 0, 
+              totalPendingAmount: 0, 
+              totalBalanceAmount: 0
+            },
+            data: [],
+            availableBranches: availableBranches,
+            userAccessInfo: {
+              hasAllBranchesAccess: hasAllBranchesAccess,
+              branchAccess: branchAccess,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null
+            },
+            filters: {
+              branchId: branchId,
+              startDate: startDate,
+              endDate: endDate,
+              status: status,
+              minPendingAmount: minPendingAmount,
+              maxPendingAmount: maxPendingAmount,
+              modelType: modelType,
+              reportType: 'PENDING_VERIFICATION'
+            }
+          });
         }
-      } catch (error) {
-        console.error(`[ELIGIBLE-CUSTOMERS] Error processing waiting list entry ${waitingEntry._id}:`, error.message);
-        console.error(error.stack);
-        continue;
+      }
+    }
+    
+    const bookings = await bookingsQuery.lean();
+
+    console.log(`Found ${bookings.length} bookings`);
+
+    const bookingIds = bookings.map(b => b._id);
+
+    // ========== FETCH ALL LEDGER ENTRIES ==========
+    // Fetch ALL ledger entries (both Approved and Pending)
+    const allLedgerEntries = await Ledger.find({
+      booking: { $in: bookingIds }
+    })
+    .select('amount paymentMode type approvalStatus isDebit booking')
+    .lean();
+
+    console.log(`Found ${allLedgerEntries.length} total ledger entries for these bookings`);
+
+    // Separate approved and pending entries
+    const ledgerByBooking = {};
+    allLedgerEntries.forEach(entry => {
+      const bookingId = entry.booking.toString();
+      if (!ledgerByBooking[bookingId]) {
+        ledgerByBooking[bookingId] = [];
+      }
+      ledgerByBooking[bookingId].push(entry);
+    });
+
+    // Process each booking to calculate financials - FOCUS ON PENDING AMOUNTS
+    const processedBookings = bookings.map(booking => {
+      const bookingLedgerEntries = ledgerByBooking[booking._id.toString()] || [];
+      
+      console.log(`Booking ${booking.bookingNumber}: ${bookingLedgerEntries.length} ledger entries found`);
+      
+      // Approved entries (verified)
+      const approvedEntries = bookingLedgerEntries.filter(entry => 
+        entry.approvalStatus === 'Approved' && !entry.isDebit
+      );
+      
+      // Pending entries (waiting for verification)
+      const pendingEntries = bookingLedgerEntries.filter(entry => 
+        entry.approvalStatus === 'Pending' && !entry.isDebit
+      );
+      
+      const totalApprovedAmount = approvedEntries.reduce((sum, entry) => 
+        sum + (entry.amount || 0), 0);
+      
+      const totalPendingForApproval = pendingEntries.reduce((sum, entry) => 
+        sum + (entry.amount || 0), 0);
+      
+      const dealAmount = booking.discountedAmount || 0;
+      const balanceAmount = dealAmount - totalApprovedAmount;
+      
+      const bookingType = booking.payment?.type || '';
+      
+      let financierName = '';
+      if (booking.payment?.type === 'FINANCE' && booking.payment?.financer) {
+        if (typeof booking.payment.financer === 'object' && booking.payment.financer.name) {
+          financierName = booking.payment.financer.name;
+        } else if (typeof booking.payment.financer === 'string') {
+          financierName = booking.payment.financer;
+        }
+      }
+      
+      return {
+        ...booking,
+        bookingType: bookingType,
+        financierName: financierName,
+        totalApprovedAmount: 0, // NOT SHOWN IN THIS REPORT, SET TO ZERO
+        totalPendingForApproval,
+        dealAmount,
+        balanceAmount,
+        approvedEntriesCount: approvedEntries.length,
+        pendingEntriesCount: pendingEntries.length,
+        ledgerEntriesCount: bookingLedgerEntries.length,
+        hasPendingEntries: pendingEntries.length > 0,
+        branchName: booking.branch?.name || '',
+        formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : ''
+      };
+    });
+
+    // Filter bookings with pending verification amounts
+    let pendingVerificationBookings = processedBookings.filter(booking => {
+      return booking.totalPendingForApproval > 0;
+    });
+
+    // Apply pending amount range filter if specified
+    if (minPendingAmount || maxPendingAmount) {
+      pendingVerificationBookings = pendingVerificationBookings.filter(booking => {
+        if (minPendingAmount && booking.totalPendingForApproval < parseFloat(minPendingAmount)) return false;
+        if (maxPendingAmount && booking.totalPendingForApproval > parseFloat(maxPendingAmount)) return false;
+        return true;
+      });
+    }
+
+    console.log(`Found ${pendingVerificationBookings.length} bookings with pending verification amounts`);
+
+    if (pendingVerificationBookings.length === 0) {
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Pending Verification Report');
+        
+        // Add headers even for empty report - BRANCH NAME AND BOOKING DATE AT START
+        const headers = [
+          'Branch Name',
+          'Booking Date',
+          'Booking Number',
+          'Customer Name',
+          'Mobile 1',
+          'Mobile 2',
+          'Model',
+          'Model Type',
+          'Color',
+          'Booking Type',
+          'Financier Name',
+          'Deal Amount',
+          'Pending Verification Amount',
+          'Balance Amount',
+          'Booking Status'
+        ];
+        
+        const headerRow = worksheet.addRow(headers);
+        headerRow.eachCell((cell) => {
+          cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF2E75B5' }
+          };
+        });
+        
+        const fileName = `pending_verification_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${fileName}"`
+        );
+        
+        await workbook.xlsx.write(res);
+        res.end();
+        return;
+      } else {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          totals: { 
+            totalDealAmount: 0, 
+            totalPendingAmount: 0, 
+            totalBalanceAmount: 0
+          },
+          data: [],
+          availableBranches: availableBranches,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0
+          },
+          message: 'No bookings with pending verification amounts found'
+        });
       }
     }
 
-    console.log(`[ELIGIBLE-CUSTOMERS] Total eligible customers: ${eligibleWaitingListCustomers.length}`);
+    // ========== GENERATE EXCEL REPORT - PENDING VERIFICATION ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      let worksheetName = 'Pending Verification Report';
+      if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+        const branch = pendingVerificationBookings[0]?.branch;
+        if (branch?.name) {
+          worksheetName = `${branch.name} Pending Verification Report`;
+        }
+      } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+        worksheetName = 'All Branches Pending Verification Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
 
-    // 3. Sort by priority score (highest first)
-    eligibleWaitingListCustomers.sort((a, b) => b.priorityScore - a.priorityScore);
+      // DEFINE HEADERS - BRANCH NAME AND BOOKING DATE AT START, WITHOUT "Verified Amount" COLUMN
+      const headers = [
+        'Branch Name',
+        'Booking Date',
+        'Booking Number',
+        'Customer Name',
+        'Mobile 1',
+        'Mobile 2',
+        'Model',
+        'Model Type',
+        'Color',
+        'Booking Type',
+        'Financier Name',
+        'Deal Amount',
+        'Pending Verification Amount',
+        'Balance Amount',
+        'Booking Status'
+      ];
 
-    // 4. Prepare response
-    res.status(200).json({
-      status: 'success',
-      data: {
-        matchingCriteria: {
-          model: {
-            id: vehicleModel,
-            name: vehicle.model?.model_name
-          },
-          color: {
-            id: vehicleColor,
-            name: vehicle.color?.name
-          },
-          location: {
-            type: vehicleLocationType,
-            id: vehicleLocationId,
-            name: vehicleLocationType === 'branch' 
-              ? vehicle.unloadLocation?.name 
-              : vehicle.subdealerLocation?.name
-          },
-          vehicle: {
-            id: vehicle._id,
-            chassisNumber: vehicle.chassisNumber,
-            status: vehicle.status,
-            freezeInfo: vehicle.freezeInfo
+      // Add headers row
+      const headerRow = worksheet.addRow(headers);
+
+      // Style the header row
+      headerRow.eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Set column widths
+      worksheet.columns = [
+        { key: 'branchName', width: 25 },
+        { key: 'bookingDate', width: 15 },
+        { key: 'bookingNumber', width: 18 },
+        { key: 'customerName', width: 25 },
+        { key: 'mobile1', width: 15 },
+        { key: 'mobile2', width: 15 },
+        { key: 'model', width: 20 },
+        { key: 'modelType', width: 12 },
+        { key: 'color', width: 15 },
+        { key: 'bookingType', width: 15 },
+        { key: 'financierName', width: 25 },
+        { key: 'dealAmount', width: 18 },
+        { key: 'pendingAmount', width: 18 },
+        { key: 'balanceAmount', width: 18 },
+        { key: 'status', width: 15 }
+      ];
+
+      // ADD DATA ROWS
+      pendingVerificationBookings.forEach((booking) => {
+        const rowData = {
+          branchName: booking.branch?.name || '',
+          bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+          bookingNumber: booking.bookingNumber || '',
+          customerName: booking.customerDetails?.name || '',
+          mobile1: booking.customerDetails?.mobile1 || '',
+          mobile2: booking.customerDetails?.mobile2 || '',
+          model: booking.model?.model_name || '',
+          modelType: booking.model?.type || '',
+          color: booking.color?.name || '',
+          bookingType: booking.bookingType || '',
+          financierName: booking.financierName || '',
+          dealAmount: booking.dealAmount || 0,
+          pendingAmount: booking.totalPendingForApproval || 0,
+          balanceAmount: booking.balanceAmount || 0,
+          status: booking.status || ''
+        };
+
+        worksheet.addRow(rowData);
+      });
+
+      // Format amount columns and apply alternating row colors
+      for (let i = 0; i < pendingVerificationBookings.length; i++) {
+        const row = worksheet.getRow(i + 2); // +2 because row 1 is header
+        
+        // Format amount columns (Deal Amount, Pending Amount, Balance Amount)
+        // Columns are 0-based: dealAmount (11), pendingAmount (12), balanceAmount (13)
+        [11, 12, 13].forEach(colIndex => {
+          const cell = row.getCell(colIndex + 1); // +1 because ExcelJS columns are 1-based
+          if (typeof cell.value === 'number') {
+            cell.numFmt = '#,##0.00';
+            cell.alignment = { horizontal: 'right' };
           }
+        });
+        
+        // Apply alternating row colors for better readability
+        if (i % 2 === 0) {
+          row.eachCell((cell) => {
+            cell.fill = {
+              type: 'pattern',
+              pattern: 'solid',
+              fgColor: { argb: 'FFF2F2F2' }
+            };
+          });
+        }
+      }
+
+      // Apply auto-filter
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+      const fileName = `pending_verification_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedBookings = pendingVerificationBookings.map(booking => {
+        return {
+          branchName: booking.branch?.name || '',
+          bookingDate: booking.createdAt,
+          formattedBookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+          bookingNumber: booking.bookingNumber,
+          customerName: booking.customerDetails?.name || '',
+          mobile1: booking.customerDetails?.mobile1 || '',
+          mobile2: booking.customerDetails?.mobile2 || '',
+          model: booking.model?.model_name || '',
+          modelType: booking.model?.type || '',
+          color: booking.color?.name || '',
+          bookingType: booking.bookingType || '',
+          financierName: booking.financierName || '',
+          dealAmount: booking.dealAmount,
+          pendingVerificationAmount: booking.totalPendingForApproval,
+          balanceAmount: booking.balanceAmount,
+          bookingStatus: booking.status || '',
+          bookingId: booking._id,
+          pendingEntriesCount: booking.pendingEntriesCount,
+          reportType: 'PENDING_VERIFICATION'
+        };
+      });
+
+      const totals = {
+        totalDealAmount: pendingVerificationBookings.reduce((sum, booking) => 
+          sum + booking.dealAmount, 0),
+        totalPendingAmount: pendingVerificationBookings.reduce((sum, booking) => 
+          sum + booking.totalPendingForApproval, 0),
+        totalBalanceAmount: pendingVerificationBookings.reduce((sum, booking) => 
+          sum + booking.balanceAmount, 0)
+      };
+
+      res.status(200).json({
+        success: true,
+        count: pendingVerificationBookings.length,
+        totals: totals,
+        data: formattedBookings,
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
         },
-        eligibleCustomers: eligibleWaitingListCustomers,
-        summary: {
-          totalEligibleCustomers: eligibleWaitingListCustomers.length,
-          totalWaitingListEntries: allWaitingListEntries.length,
-          withBooking: eligibleWaitingListCustomers.filter(c => c.hasBooking).length,
-          withoutBooking: eligibleWaitingListCustomers.filter(c => !c.hasBooking).length,
-          priorityBreakdown: {
-            HIGH: eligibleWaitingListCustomers.filter(c => c.priority === 'HIGH').length,
-            MEDIUM: eligibleWaitingListCustomers.filter(c => c.priority === 'MEDIUM').length,
-            LOW: eligibleWaitingListCustomers.filter(c => c.priority === 'LOW').length
-          },
-          paymentStatusBreakdown: {
-            FULLY_PAID: eligibleWaitingListCustomers.filter(c => c.paymentStatus === 'FULLY_PAID').length,
-            MEETS_MIN: eligibleWaitingListCustomers.filter(c => c.paymentStatus === 'MEETS_MIN').length,
-            BELOW_MIN: eligibleWaitingListCustomers.filter(c => c.paymentStatus === 'BELOW_MIN').length
-          }
+        filters: {
+          branchId: branchId,
+          startDate: startDate,
+          endDate: endDate,
+          status: status,
+          minPendingAmount: minPendingAmount,
+          maxPendingAmount: maxPendingAmount,
+          modelType: modelType,
+          reportType: 'PENDING_VERIFICATION'
         },
         debug: {
-          waitingListQuery: waitingListQuery,
-          vehicleDetails: {
-            chassisNumber: vehicle.chassisNumber,
-            model: vehicle.model?.model_name,
-            color: vehicle.color?.name,
-            location: vehicleLocationType === 'branch' 
-              ? vehicle.unloadLocation?.name 
-              : vehicle.subdealerLocation?.name
-          }
+          totalBookings: bookings.length,
+          totalLedgerEntries: allLedgerEntries.length,
+          totalPendingEntries: pendingVerificationBookings.reduce((sum, b) => sum + b.pendingEntriesCount, 0)
         }
-      }
-    });
+      });
+    }
 
-  } catch (err) {
-    console.error(`[ELIGIBLE-CUSTOMERS] System error:`, err.message);
-    console.error(err.stack);
-    
-    logger.error(`Error getting eligible customers: ${err.message}`, {
-      error: err.stack,
-      vehicleId: req.params.vehicleId,
-      userId: req.user?.id
+  } catch (error) {
+    console.error('Error generating pending verification report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating pending verification report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
-    
-    next(new AppError('Server Error while finding eligible customers', 500));
   }
 };
 
+/**
+ * Get all approved receipts filtered by approved date
+ * @route GET /api/v1/reports/approved-receipts
+ * @access Private
+ */
+/**
+ * Get all approved receipts filtered by approval date
+ * @route GET /api/v1/reports/approved-receipts
+ * @access Private
+ */
 
-
-exports.allocateFrozenVehicleToCustomer = async (req, res, next) => {
+exports.generateVerifiedOutstandingReport = async (req, res) => {
   try {
-    const { vehicleId } = req.params;
-    const { waitingListId, bookingId, customerName, allocationNotes } = req.body;
+    const {
+      branchId,
+      startDate,
+      endDate,
+      paymentMode,
+      bookingNumber,
+      customerId,
+      bookingType,
+      customerType,
+      modelId,
+      colorId,
+      salesExecutiveId,
+      page = 1,
+      limit = 100,
+      format = 'json'
+    } = req.query;
 
-    console.log('[ALLOCATE-FROZEN] Starting allocation:', {
-      vehicleId,
-      waitingListId,
-      bookingId,
-      customerName,
-      allocationNotes
+    console.log('🔍 Received filters:', { 
+      bookingNumber, 
+      customerId,
+      startDate, 
+      endDate,
+      paymentMode 
     });
 
-    // 1. Validate inputs
-    if (!mongoose.Types.ObjectId.isValid(vehicleId)) {
-      return next(new AppError('Invalid vehicle ID format', 400));
+    // ========== BRANCH ACCESS LOGIC ==========
+    const userId = req.user.id;
+
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({ path: 'roles', select: 'name isSuperAdmin permissionsCount' })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    if (!waitingListId || !mongoose.Types.ObjectId.isValid(waitingListId)) {
-      return next(new AppError('Valid waiting list ID is required', 400));
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === 'SUPERADMIN') || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+
+    let hasAllBranchesAccess = false;
+    if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
     }
 
-    // 2. Find the frozen vehicle
-    const vehicle = await Vehicle.findById(vehicleId)
-      .populate('model', 'model_name')
-      .populate('color.id', 'name')
-      .populate('unloadLocation', 'name')
-      .populate('subdealerLocation', 'name');
-
-    if (!vehicle) {
-      return next(new AppError('Vehicle not found', 404));
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+      availableBranches = user.accessibleBranches.map(b => ({
+        _id: b._id, 
+        name: b.name, 
+        address: b.address, 
+        city: b.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+    } else if (user.branch) {
+      availableBranches = [{ 
+        _id: user.branch._id, 
+        name: user.branch.name, 
+        address: user.branch.address, 
+        city: user.branch.city 
+      }];
     }
 
-    console.log('[ALLOCATE-FROZEN] Found vehicle:', {
-      chassisNumber: vehicle.chassisNumber,
-      status: vehicle.status,
-      model: vehicle.model?.model_name,
-      color: vehicle.color,
-      freezeInfo: vehicle.freezeInfo
-    });
+    // ========== BUILD BOOKING FILTER FIRST ==========
+    let bookingFilter = {};
 
-    // 3. Check if vehicle is frozen
-    if (!vehicle.freezeInfo || !vehicle.freezeInfo.isFrozen) {
-      return next(new AppError(`Vehicle is not frozen. Current status: ${vehicle.status}`, 400));
-    }
+    // Apply branch access filter
+    if (!hasAllBranchesAccess) {
+      let allowedBranchIds = [];
 
-    // 4. Check if vehicle is still within freeze period
-    if (vehicle.freezeInfo.frozenUntil && new Date() > vehicle.freezeInfo.frozenUntil) {
-      return next(new AppError('Vehicle freeze period has expired', 400));
-    }
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+        allowedBranchIds = user.accessibleBranches.map(b => b._id);
 
-    // 5. Find the waiting list entry
-    const waitingListEntry = await VehicleWaitingList.findById(waitingListId)
-      .populate('model', 'model_name')
-      .populate('color', 'name');
-
-    if (!waitingListEntry) {
-      return next(new AppError('Waiting list entry not found', 404));
-    }
-
-    console.log('[ALLOCATE-FROZEN] Found waiting list entry:', {
-      customerName: waitingListEntry.customerName,
-      model: waitingListEntry.model?.model_name,
-      color: waitingListEntry.color,
-      location: waitingListEntry.locationName
-    });
-
-    // 6. Verify matching criteria - FIXED COLOR COMPARISON
-    const vehicleModelId = vehicle.model._id.toString();
-    const waitingModelId = waitingListEntry.model._id.toString();
-
-    // Extract vehicle color ID - handle different data structures
-    let vehicleColorId;
-    if (vehicle.color) {
-      // Case 1: color is an object with id property
-      if (vehicle.color.id) {
-        if (typeof vehicle.color.id === 'object') {
-          // Case 1a: color.id is an object { id: "xxx", name: "color" }
-          vehicleColorId = vehicle.color.id.id ? vehicle.color.id.id.toString() : vehicle.color.id._id.toString();
-        } else {
-          // Case 1b: color.id is a string
-          vehicleColorId = vehicle.color.id.toString();
+        if (branchId && branchId !== 'all') {
+          const requestedId = new mongoose.Types.ObjectId(branchId);
+          const hasAccess = allowedBranchIds.some(id => id.toString() === requestedId.toString());
+          if (!hasAccess) {
+            return res.status(403).json({ success: false, message: 'You do not have access to this branch' });
+          }
+          allowedBranchIds = [requestedId];
         }
-      } else if (vehicle.color._id) {
-        // Case 2: color is populated document
-        vehicleColorId = vehicle.color._id.toString();
+      } else if (user.branch?._id) {
+        allowedBranchIds = [user.branch._id];
+        
+        if (branchId && branchId !== 'all' && branchId !== user.branch._id.toString()) {
+          return res.status(403).json({ success: false, message: 'You do not have access to this branch' });
+        }
       } else {
-        // Case 3: color is just an ID string
-        vehicleColorId = vehicle.color.toString();
+        return res.status(403).json({ success: false, message: 'You do not have access to any branch' });
       }
+
+      bookingFilter.branch = { $in: allowedBranchIds };
     } else {
-      return next(new AppError('Vehicle color information is missing', 400));
-    }
-
-    // Extract waiting list color ID
-    let waitingColorId;
-    if (waitingListEntry.color) {
-      if (typeof waitingListEntry.color === 'object') {
-        // Case 1: color is populated document
-        waitingColorId = waitingListEntry.color._id ? waitingListEntry.color._id.toString() : waitingListEntry.color.toString();
-      } else {
-        // Case 2: color is just an ID string
-        waitingColorId = waitingListEntry.color.toString();
+      // SuperAdmin - apply optional branch filter
+      if (branchId && branchId !== 'all') {
+        bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
       }
-    } else {
-      return next(new AppError('Waiting list color information is missing', 400));
     }
 
-    console.log('[ALLOCATE-FROZEN] Color comparison:', {
-      vehicleColorId,
-      waitingColorId,
-      vehicleColor: vehicle.color,
-      waitingListColor: waitingListEntry.color,
-      areEqual: vehicleColorId === waitingColorId
-    });
-
-    // Model comparison
-    if (vehicleModelId !== waitingModelId) {
-      return next(new AppError('Vehicle model does not match waiting list entry', 400));
-    }
-
-    // Color comparison
-    if (vehicleColorId !== waitingColorId) {
-      return next(new AppError('Vehicle color does not match waiting list entry', 400));
-    }
-
-    // 7. Verify location match
-    let locationMatch = false;
+    // Apply booking-level filters
+    if (bookingType) bookingFilter.bookingType = bookingType;
+    if (customerType) bookingFilter.customerType = customerType;
+    if (modelId) bookingFilter.model = new mongoose.Types.ObjectId(modelId);
+    if (colorId) bookingFilter.color = new mongoose.Types.ObjectId(colorId);
+    if (salesExecutiveId) bookingFilter.salesExecutive = new mongoose.Types.ObjectId(salesExecutiveId);
     
-    if (vehicle.locationType === 'branch' && waitingListEntry.locationType === 'branch') {
-      const vehicleLocationId = vehicle.unloadLocation._id.toString();
-      const waitingLocationId = waitingListEntry.location.toString();
-      locationMatch = vehicleLocationId === waitingLocationId;
-      console.log('[ALLOCATE-FROZEN] Branch location match:', {
-        vehicleLocationId,
-        waitingLocationId,
-        locationMatch
-      });
-    } else if (vehicle.locationType === 'subdealer' && waitingListEntry.locationType === 'subdealer') {
-      const vehicleLocationId = vehicle.subdealerLocation._id.toString();
-      const waitingLocationId = waitingListEntry.location.toString();
-      locationMatch = vehicleLocationId === waitingLocationId;
-      console.log('[ALLOCATE-FROZEN] Subdealer location match:', {
-        vehicleLocationId,
-        waitingLocationId,
-        locationMatch
-      });
+    // IMPORTANT FIX: Apply customerId filter directly to booking
+    if (customerId) {
+      bookingFilter['customerDetails.custId'] = customerId; // Exact match
+      console.log('🔍 Filtering by customerId:', customerId);
     }
-
-    if (!locationMatch) {
-      return next(new AppError('Vehicle location does not match waiting list entry', 400));
-    }
-
-    // 8. Get booking details if provided
-    let bookingDetails = null;
-    if (bookingId) {
-      bookingDetails = await Booking.findById(bookingId)
-        .select('bookingNumber customerDetails payment status vehicleRef');
-      
-      if (!bookingDetails) {
-        return next(new AppError('Booking not found', 404));
-      }
-
-      // Check if booking already has a vehicle allocated
-      if (bookingDetails.vehicleRef) {
-        const existingAllocatedVehicle = await Vehicle.findById(bookingDetails.vehicleRef);
-        if (existingAllocatedVehicle && ['booked', 'blocked'].includes(existingAllocatedVehicle.status)) {
-          return next(new AppError(
-            `Booking ${bookingDetails.bookingNumber} already has vehicle ${existingAllocatedVehicle.chassisNumber} allocated`,
-            400
-          ));
-        }
-      }
-    }
-
-    // 9. Check GM approval requirements if vehicle is over 10 days
-    let requiresGmApproval = false;
-    let gmApprovalStatus = 'NOT_REQUIRED';
     
-    if (vehicle.ageInDays > 10) {
-      requiresGmApproval = true;
-      gmApprovalStatus = 'PENDING';
+    // IMPORTANT FIX: Apply bookingNumber filter directly to booking
+    if (bookingNumber) {
+      bookingFilter.bookingNumber = new RegExp(bookingNumber, 'i'); // Case-insensitive partial match
+      console.log('🔍 Filtering by bookingNumber:', bookingNumber);
     }
 
-    // 10. Store current state for audit
-    const previousStatus = vehicle.status;
-    const previousCustomerName = vehicle.customerName;
-    const previousAllocatedBooking = vehicle.allocatedBooking;
-
-    // 11. Update vehicle status and allocation
-    vehicle.status = 'booked';
-    vehicle.customerName = customerName || waitingListEntry.customerName;
-    vehicle.allocatedBooking = bookingId || waitingListEntry.bookingId;
-    vehicle.lastUpdatedBy = req.user.id;
-    
-    // Store customer info in vehicle
-    if (bookingDetails?.customerDetails) {
-      vehicle.customerPhone = bookingDetails.customerDetails.mobile;
-      vehicle.customerAadhaar = bookingDetails.customerDetails.aadhaarNumber;
-    }
-
-    // Set freeze info to inactive
-    vehicle.freezeInfo.isFrozen = false;
-    vehicle.freezeInfo.autoUnfrozenAt = new Date();
-
-    // Add to allocation history
-    vehicle.allocationHistory.push({
-      bookingId: bookingId || waitingListEntry.bookingId,
-      bookingNumber: bookingDetails?.bookingNumber || waitingListEntry.bookingNumber,
-      allocatedAt: new Date(),
-      allocatedBy: req.user.id,
-      status: 'ALLOCATED',
-      gmApprovalRequired: requiresGmApproval,
-      gmApprovalStatus: gmApprovalStatus,
-      note: allocationNotes || `Allocated from waiting list (frozen vehicle) - Waiting list ID: ${waitingListEntry._id}`,
-      source: 'MANUAL_ALLOCATION_FROZEN',
-      previousStatus: previousStatus,
-      previousCustomerName: previousCustomerName
-    });
-
-    // Update waiting list entry
-    waitingListEntry.status = 'ASSIGNED';
-    waitingListEntry.assignedVehicle = vehicle._id;
-    waitingListEntry.assignedAt = new Date();
-    waitingListEntry.assignedBy = req.user.id;
-    waitingListEntry.lastUpdatedBy = req.user.id;
-
-    // 12. If booking exists, update booking with vehicle reference
-    if (bookingDetails) {
-      bookingDetails.vehicleRef = vehicle._id;
-      bookingDetails.chassisNumber = vehicle.chassisNumber;
-      bookingDetails.lastUpdatedBy = req.user.id;
-      await bookingDetails.save();
-      console.log('[ALLOCATE-FROZEN] Updated booking with vehicle reference');
-    }
-
-    // 13. Save all changes
-    await Promise.all([
-      vehicle.save(),
-      waitingListEntry.save()
-    ]);
-
-    console.log('[ALLOCATE-FROZEN] Vehicle and waiting list updated successfully');
-
-    // 14. Generate QR code for the allocated vehicle
-    let qrCodePath = null;
-    let qrCodeUrl = null;
-    try {
-      // Ensure vehicle has latest data before generating QR
-      const freshVehicle = await Vehicle.findById(vehicleId)
-        .populate('model', 'model_name')
-        .populate('color.id', 'name')
-        .populate('unloadLocation', 'name')
-        .populate('subdealerLocation', 'name');
+    // ========== GET MATCHING BOOKING IDS ==========
+    let matchingBookingIds = [];
+    if (Object.keys(bookingFilter).length > 0) {
+      const matchingBookings = await Booking.find(bookingFilter).select('_id').lean();
+      matchingBookingIds = matchingBookings.map(b => b._id);
       
-      const { generateVehicleQRCode } = require('../utils/qrGenerator');
-      qrCodePath = await generateVehicleQRCode(freshVehicle);
-      
-      // Update vehicle with new QR code
-      vehicle.qrCode = qrCodePath;
-      await vehicle.save();
-      
-      qrCodeUrl = `${req.protocol}://${req.get('host')}${qrCodePath}`;
-      console.log('[ALLOCATE-FROZEN] QR code generated:', qrCodeUrl);
-    } catch (qrError) {
-      console.warn('[ALLOCATE-FROZEN] QR code generation failed:', qrError.message);
-    }
+      console.log(`📚 Found ${matchingBookingIds.length} bookings matching filters`);
 
-    // 15. Create audit log
-    try {
-      await mongoose.model('AuditLog').create({
-        action: 'VEHICLE_ALLOCATED',
-        entity: 'Vehicle',
-        entityId: vehicle._id,
-        user: req.user.id,
-        ip: req.ip,
-        status: 'SUCCESS',
-        metadata: {
-          vehicleChassis: vehicle.chassisNumber,
-          oldStatus: previousStatus,
-          newStatus: vehicle.status,
-          oldCustomerName: previousCustomerName,
-          newCustomerName: vehicle.customerName,
-          oldAllocatedBooking: previousAllocatedBooking,
-          newAllocatedBooking: vehicle.allocatedBooking,
-          waitingListEntryId: waitingListEntry._id,
-          bookingId: bookingDetails?._id,
-          allocationType: 'MANUAL_FROZEN_VEHICLE',
-          allocationNotes: allocationNotes,
-          qrCodeGenerated: !!qrCodePath,
-          qrCodePath: qrCodePath
-        }
-      });
-      console.log('[ALLOCATE-FROZEN] Audit log created');
-    } catch (auditError) {
-      console.warn('[ALLOCATE-FROZEN] Audit log creation failed:', auditError.message);
-    }
-
-    // 16. Prepare response
-    const responseData = {
-      vehicle: {
-        _id: vehicle._id,
-        chassisNumber: vehicle.chassisNumber,
-        status: vehicle.status,
-        model: vehicle.model?.model_name || vehicle.modelName,
-        color: {
-          id: vehicleColorId,
-          name: vehicle.color?.name || 'Unknown'
-        },
-        location: vehicle.locationType === 'branch' 
-          ? vehicle.unloadLocation?.name 
-          : vehicle.subdealerLocation?.name,
-        locationType: vehicle.locationType,
-        customerName: vehicle.customerName,
-        customerPhone: vehicle.customerPhone,
-        customerAadhaar: vehicle.customerAadhaar,
-        allocatedBooking: vehicle.allocatedBooking,
-        ageInDays: vehicle.ageInDays,
-        requiresGmApproval: requiresGmApproval,
-        gmApprovalStatus: gmApprovalStatus,
-        qrCode: vehicle.qrCode,
-        qrCodeUrl: qrCodeUrl,
-        freezeInfo: {
-          wasFrozen: true,
-          frozenAt: vehicle.freezeInfo.frozenAt,
-          frozenUntil: vehicle.freezeInfo.frozenUntil,
-          autoUnfrozenAt: vehicle.freezeInfo.autoUnfrozenAt
-        }
-      },
-      waitingListEntry: {
-        _id: waitingListEntry._id,
-        customerName: waitingListEntry.customerName,
-        model: waitingListEntry.modelName,
-        color: waitingListEntry.colorName,
-        status: waitingListEntry.status,
-        assignedAt: waitingListEntry.assignedAt,
-        assignedVehicle: waitingListEntry.assignedVehicle
-      },
-      booking: bookingDetails ? {
-        bookingId: bookingDetails._id,
-        bookingNumber: bookingDetails.bookingNumber,
-        customerName: bookingDetails.customerDetails?.name,
-        vehicleAssigned: true,
-        chassisNumber: bookingDetails.chassisNumber
-      } : null,
-      allocationSummary: {
-        frozenVehicleAllocated: true,
-        previousStatus: previousStatus,
-        newStatus: vehicle.status,
-        gmApprovalRequired: requiresGmApproval,
-        allocationDate: new Date(),
-        allocatedBy: req.user.id,
-        notes: allocationNotes,
-        qrCodeGenerated: !!qrCodePath
+      if (matchingBookingIds.length === 0) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          totalCount: 0,
+          totalPages: 0,
+          currentPage: parseInt(page),
+          summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+          data: [],
+          availableBranches,
+          message: customerId ? `No bookings found for customer ID: ${customerId}` : 'No bookings found matching the specified filters'
+        });
       }
+    }
+
+    // ========== BUILD LEDGER MATCH CRITERIA ==========
+    let ledgerMatch = {
+      approvalStatus: 'Approved',
+      isDebit: { $ne: true }
     };
 
-    console.log('[ALLOCATE-FROZEN] Allocation successful');
-
-    res.status(200).json({
-      status: 'success',
-      message: `Frozen vehicle ${vehicle.chassisNumber} allocated to ${vehicle.customerName} successfully`,
-      data: responseData
-    });
-
-  } catch (err) {
-    console.error('[ALLOCATE-FROZEN] Error:', err.message);
-    console.error('[ALLOCATE-FROZEN] Stack trace:', err.stack);
-    
-    logger.error(`Error allocating frozen vehicle: ${err.message}`, {
-      error: err.stack,
-      vehicleId: req.params.vehicleId,
-      userId: req.user?.id
-    });
-    
-    // Create error audit log
-    try {
-      await mongoose.model('AuditLog').create({
-        action: 'VEHICLE_ALLOCATION_FAILED',
-        entity: 'Vehicle',
-        entityId: req.params.vehicleId,
-        user: req.user?.id,
-        ip: req.ip,
-        status: 'FAILED',
-        error: err.message,
-        metadata: {
-          vehicleId: req.params.vehicleId,
-          waitingListId: req.body.waitingListId,
-          bookingId: req.body.bookingId,
-          allocationNotes: req.body.allocationNotes
-        }
-      });
-    } catch (auditError) {
-      console.warn('[ALLOCATE-FROZEN] Error audit log creation failed:', auditError.message);
+    // Apply booking filter to ledger if we have matching booking IDs
+    if (matchingBookingIds.length > 0) {
+      ledgerMatch.booking = { $in: matchingBookingIds };
     }
-    
-    next(new AppError('Failed to allocate frozen vehicle to customer', 500));
+
+    // Apply date filter on approvedAt
+    if (startDate || endDate) {
+      ledgerMatch.approvedAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        ledgerMatch.approvedAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        ledgerMatch.approvedAt.$lte = end;
+      }
+    } else {
+      // Default to last 30 days if no date range provided
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      thirtyDaysAgo.setHours(0, 0, 0, 0);
+      ledgerMatch.approvedAt = { $gte: thirtyDaysAgo };
+    }
+
+    // Apply payment mode filter
+    if (paymentMode) {
+      ledgerMatch.paymentMode = paymentMode;
+    }
+
+    console.log('🔍 Ledger match criteria:', JSON.stringify(ledgerMatch, null, 2));
+
+    // ========== GET APPROVED LEDGERS ==========
+    const ledgers = await Ledger.find(ledgerMatch)
+      .populate({ path: 'subPaymentModeDetails', select: 'payment_mode name' })
+      .populate({ path: 'approvedBy', select: 'name email' })
+      .populate({ path: 'receivedByDetails', select: 'name email' })
+      .sort({ approvedAt: -1 })
+      .lean();
+
+    console.log(`✅ Found ${ledgers.length} approved ledgers`);
+
+    if (ledgers.length === 0) {
+      // Check if there are any ledgers at all for debugging
+      const totalLedgers = await Ledger.countDocuments({ approvalStatus: 'Approved' });
+      console.log(`📊 Total approved ledgers in DB: ${totalLedgers}`);
+      
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        totalCount: 0,
+        totalPages: 0,
+        currentPage: parseInt(page),
+        summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+        data: [],
+        availableBranches,
+        filters: {
+          approvalDateRange: { startDate: startDate || null, endDate: endDate || null },
+          selectedBranch: branchId || null,
+          paymentMode: paymentMode || 'All',
+          customerId: customerId || null,
+          bookingNumber: bookingNumber || null
+        },
+        message: 'No approved receipts found for the specified filters'
+      });
+    }
+
+    const ledgerIds = ledgers.map(l => l._id);
+
+    // Build ledger map for quick lookup
+    const ledgerMap = {};
+    ledgers.forEach(ledger => {
+      ledgerMap[ledger._id.toString()] = ledger;
+    });
+
+    // ========== GET RECEIPTS FOR THOSE LEDGERS ==========
+    let receipts = await Receipt.find({
+      ledger: { $in: ledgerIds },
+      status: 'active'
+    })
+      .populate({ path: 'createdBy', select: 'name email' })
+      .populate({ path: 'receivedBy', select: 'name email' })
+      .lean();
+
+    console.log(`✅ Found ${receipts.length} receipts for the approved ledgers`);
+
+    // Debug: Log all receipt customer IDs
+    receipts.forEach((r, i) => {
+      console.log(`Receipt ${i+1}:`, {
+        receiptNumber: r.receiptNumber,
+        custId: r.customer?.custId,
+        bookingNumber: r.bookingNumber
+      });
+    });
+
+    // Handle receipts that exist in ledger but NOT in Receipt collection
+    const receiptLedgerIds = new Set(receipts.map(r => r.ledger?.toString()));
+    const missingReceiptLedgers = ledgers.filter(l => !receiptLedgerIds.has(l._id.toString()));
+
+    if (missingReceiptLedgers.length > 0) {
+      console.warn(`⚠️ ${missingReceiptLedgers.length} approved ledgers have NO matching Receipt document — including them from ledger data`);
+
+      const syntheticReceipts = missingReceiptLedgers.map(ledger => ({
+        _id: null,
+        booking: ledger.booking,
+        ledger: ledger._id,
+        bookingNumber: ledger.bookingNumber || '',
+        customer: { 
+          name: '', 
+          custId: ledger.custId || '' 
+        },
+        receiptNumber: ledger.receiptNumber || `LEDGER-${ledger._id}`,
+        receiptDate: ledger.receiptDate || ledger.createdAt,
+        amount: ledger.amount || 0,
+        netAmount: ledger.amount || 0,
+        gcAmount: ledger.gcAmount || 0,
+        paymentMode: ledger.paymentMode || '',
+        transactionReference: ledger.transactionReference || '',
+        status: 'active',
+        createdBy: ledger.receivedBy || null,
+        receivedBy: ledger.receivedBy || null,
+        _fromLedgerOnly: true
+      }));
+
+      receipts = [...receipts, ...syntheticReceipts];
+    }
+
+    // ========== COLLECT ALL BOOKING IDs FROM RECEIPTS ==========
+    const allBookingIds = [
+      ...new Set(
+        receipts
+          .map(r => r.booking?.toString())
+          .filter(Boolean)
+      )
+    ].map(id => new mongoose.Types.ObjectId(id));
+
+    // ========== GET BOOKING DETAILS ==========
+    let bookingMap = {};
+    if (allBookingIds.length > 0) {
+      const bookings = await Booking.find({ _id: { $in: allBookingIds } })
+        .populate({ path: 'vehicle', select: 'chassisNumber engineNumber' })
+        .populate({ path: 'model', select: 'model_name' })
+        .populate({ path: 'color', select: 'name' })
+        .populate({ path: 'branch', select: 'name address city' })
+        .lean();
+
+      bookings.forEach(b => {
+        bookingMap[b._id.toString()] = b;
+      });
+      console.log(`✅ Fetched ${bookings.length} booking details`);
+    }
+
+    // ========== FINAL SAFETY FILTER - Ensure customerId matches exactly ==========
+    if (customerId) {
+      const beforeFilter = receipts.length;
+      receipts = receipts.filter(r => {
+        const booking = r.booking ? bookingMap[r.booking.toString()] : null;
+        const receiptCustId = r.customer?.custId;
+        const bookingCustId = booking?.customerDetails?.custId;
+        
+        // Check if either the receipt or booking has the matching customer ID
+        const matches = receiptCustId === customerId || bookingCustId === customerId;
+        
+        if (!matches) {
+          console.log('❌ Filtering out receipt:', {
+            receiptNumber: r.receiptNumber,
+            receiptCustId,
+            bookingCustId,
+            expectedCustomerId: customerId
+          });
+        }
+        
+        return matches;
+      });
+      console.log(`🔍 After customerId filter: ${beforeFilter} -> ${receipts.length} receipts`);
+    }
+
+    if (receipts.length === 0) {
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        totalCount: 0,
+        totalPages: 0,
+        currentPage: parseInt(page),
+        summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+        data: [],
+        availableBranches,
+        message: customerId ? `No receipts found for customer ID: ${customerId}` : 'No receipts found after applying filters'
+      });
+    }
+
+    // ========== MERGE RECEIPT + LEDGER + BOOKING DATA ==========
+    const enrichedReceipts = receipts.map(receipt => {
+      const ledger = ledgerMap[receipt.ledger?.toString()] || {};
+      const booking = receipt.booking ? bookingMap[receipt.booking.toString()] : null;
+
+      // Chassis / Engine number resolution
+      let chassisNumber = booking?.chassisNumber || booking?.vehicle?.chassisNumber || '';
+      let engineNumber = booking?.engineNumber || booking?.vehicle?.engineNumber || '';
+
+      // Customer name resolution - PRIORITIZE RECEIPT DATA
+      let customerName = receipt.customer?.name || booking?.customerDetails?.name || '';
+      let customerCustId = receipt.customer?.custId || booking?.customerDetails?.custId || '';
+
+      // Sub payment mode resolution
+      let subPaymentMode = '';
+      if (ledger.subPaymentModeDetails) {
+        if (Array.isArray(ledger.subPaymentModeDetails) && ledger.subPaymentModeDetails.length > 0) {
+          subPaymentMode = ledger.subPaymentModeDetails[0].payment_mode || ledger.subPaymentModeDetails[0].name || '';
+        } else if (typeof ledger.subPaymentModeDetails === 'object') {
+          subPaymentMode = ledger.subPaymentModeDetails.payment_mode || ledger.subPaymentModeDetails.name || '';
+        }
+      }
+      if (!subPaymentMode && receipt.paymentDetails?.subPaymentMode) {
+        subPaymentMode = receipt.paymentDetails.subPaymentMode.name || receipt.paymentDetails.subPaymentMode.code || '';
+      }
+
+      // Approver name resolution
+      let approverName = '';
+      if (ledger.approvedBy) {
+        if (typeof ledger.approvedBy === 'object') {
+          approverName = ledger.approvedBy.name || ledger.approvedBy.email || ledger.approvedBy.toString();
+        } else {
+          approverName = ledger.approvedBy.toString();
+        }
+      }
+
+      return {
+        ...receipt,
+        ledger,
+        bookingDetails: booking,
+        approvalDate: ledger.approvedAt,
+        receiptDate: receipt.receiptDate,
+        chassisNumber,
+        engineNumber,
+        branchName: booking?.branch?.name || '',
+        branchId: booking?.branch?._id?.toString() || '',
+        customerName,
+        customerCustId, // Include this for debugging
+        subPaymentMode,
+        approvedBy: approverName,
+        approvedById: ledger.approvedBy?._id || ledger.approvedBy,
+        approvedAt: ledger.approvedAt,
+        receivedByName: receipt.receivedBy?.name || '',
+        createdByName: receipt.createdBy?.name || '',
+        receiptType: 'Receipt'
+      };
+    });
+
+    // ========== SORT BY APPROVAL DATE (most recent first) ==========
+    enrichedReceipts.sort((a, b) => new Date(b.approvalDate) - new Date(a.approvalDate));
+
+    // ========== PAGINATION ==========
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const startIndex = (pageNum - 1) * limitNum;
+    const endIndex = pageNum * limitNum;
+
+    const paginatedReceipts = enrichedReceipts.slice(startIndex, endIndex);
+    const totalPages = Math.ceil(enrichedReceipts.length / limitNum);
+
+    // ========== EXCEL FORMAT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+
+      let worksheetName = 'Approved Receipts';
+      if (branchId && branchId !== 'all') {
+        const branch = await Branch.findById(branchId).select('name').lean();
+        if (branch?.name) worksheetName = `${branch.name} Approved Receipts`;
+      }
+
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      worksheet.columns = [
+        { header: 'S.No', key: 'sno', width: 8 },
+        { header: 'Receipt Number', key: 'receiptNumber', width: 25 },
+        { header: 'Receipt Date', key: 'receiptDate', width: 15 },
+        { header: 'Approval Date', key: 'approvalDate', width: 15 },
+        { header: 'Approved By', key: 'approvedBy', width: 25 },
+        { header: 'Booking Number', key: 'bookingNumber', width: 20 },
+        { header: 'Customer ID', key: 'customerId', width: 15 },
+        { header: 'Branch Name', key: 'branchName', width: 25 },
+        { header: 'Chassis Number', key: 'chassisNumber', width: 25 },
+        { header: 'Engine Number', key: 'engineNumber', width: 25 },
+        { header: 'Payment Mode', key: 'paymentMode', width: 15 },
+        { header: 'Sub Payment Mode', key: 'subPaymentMode', width: 20 },
+        { header: 'Amount (₹)', key: 'amount', width: 15, style: { numFmt: '#,##0.00' } },
+        { header: 'Customer Name', key: 'customerName', width: 25 },
+        { header: 'Transaction Reference', key: 'transactionReference', width: 25 },
+        { header: 'Received By', key: 'receivedBy', width: 25 },
+        { header: 'Created By', key: 'createdBy', width: 25 }
+      ];
+
+      paginatedReceipts.forEach((receipt, index) => {
+        worksheet.addRow({
+          sno: startIndex + index + 1,
+          receiptNumber: receipt.receiptNumber || '',
+          receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('DD/MM/YYYY') : '',
+          approvalDate: receipt.approvalDate ? moment(receipt.approvalDate).format('DD/MM/YYYY') : '',
+          approvedBy: receipt.approvedBy || '',
+          bookingNumber: receipt.bookingNumber || receipt.bookingDetails?.bookingNumber || '',
+          customerId: receipt.customerCustId || '',
+          branchName: receipt.branchName || '',
+          chassisNumber: receipt.chassisNumber || '',
+          engineNumber: receipt.engineNumber || '',
+          paymentMode: receipt.paymentMode || receipt.ledger?.paymentMode || '',
+          subPaymentMode: receipt.subPaymentMode || '',
+          amount: receipt.netAmount || receipt.amount || receipt.ledger?.amount || 0,
+          customerName: receipt.customerName || '',
+          transactionReference: receipt.transactionReference || receipt.ledger?.transactionReference || '',
+          receivedBy: receipt.receivedByName || '',
+          createdBy: receipt.createdByName || ''
+        });
+      });
+
+      const headerRow = worksheet.getRow(1);
+      headerRow.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4CAF50' } };
+      });
+
+      const fileName = `approved_receipts_${moment().format('YYYY-MM-DD')}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      await workbook.xlsx.write(res);
+      return res.end();
+    }
+
+    // ========== JSON FORMAT ==========
+    const formattedReceipts = paginatedReceipts.map(receipt => ({
+      receiptNumber: receipt.receiptNumber,
+      receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('YYYY-MM-DD') : null,
+      approvalDate: receipt.approvalDate ? moment(receipt.approvalDate).format('YYYY-MM-DD') : null,
+      approvedBy: receipt.approvedBy,
+      approvedById: receipt.approvedById,
+      bookingNumber: receipt.bookingNumber || receipt.bookingDetails?.bookingNumber,
+      branchName: receipt.branchName,
+      branchId: receipt.branchId,
+      vehicle: {
+        chassisNumber: receipt.chassisNumber,
+        engineNumber: receipt.engineNumber
+      },
+      payment: {
+        mode: receipt.paymentMode || receipt.ledger?.paymentMode,
+        subPaymentMode: receipt.subPaymentMode,
+        amount: receipt.netAmount || receipt.amount || receipt.ledger?.amount,
+        transactionReference: receipt.transactionReference || receipt.ledger?.transactionReference
+      },
+      customer: {
+        name: receipt.customerName,
+        custId: receipt.customerCustId || receipt.customer?.custId || receipt.bookingDetails?.customerDetails?.custId
+      },
+      receivedBy: receipt.receivedByName,
+      createdBy: receipt.createdByName,
+      bookingId: receipt.booking?.toString() || receipt.bookingDetails?._id?.toString(),
+      _fromLedgerOnly: receipt._fromLedgerOnly || false
+    }));
+
+    // Summary calculations
+    const totalAmount = enrichedReceipts.reduce((sum, r) => sum + (r.netAmount || r.amount || r.ledger?.amount || 0), 0);
+    const uniqueBookings = [...new Set(enrichedReceipts.map(r => r.booking?.toString()).filter(Boolean))];
+
+    const approvalDates = enrichedReceipts.map(r => r.approvalDate).filter(Boolean);
+    const minApprovalDate = approvalDates.length > 0 ? new Date(Math.min(...approvalDates.map(d => new Date(d)))) : null;
+    const maxApprovalDate = approvalDates.length > 0 ? new Date(Math.max(...approvalDates.map(d => new Date(d)))) : null;
+
+    return res.status(200).json({
+      success: true,
+      count: paginatedReceipts.length,
+      totalCount: enrichedReceipts.length,
+      totalPages,
+      currentPage: pageNum,
+      summary: {
+        totalReceipts: enrichedReceipts.length,
+        totalAmount,
+        uniqueBookings: uniqueBookings.length,
+        approvalDateRange: {
+          from: minApprovalDate ? moment(minApprovalDate).format('YYYY-MM-DD') : null,
+          to: maxApprovalDate ? moment(maxApprovalDate).format('YYYY-MM-DD') : null
+        },
+        paymentModeBreakdown: {
+          bank: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Bank').length,
+          cash: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Cash').length,
+          exchange: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Exchange').length,
+          other: enrichedReceipts.filter(r => {
+            const mode = r.paymentMode || r.ledger?.paymentMode;
+            return mode && !['Bank', 'Cash', 'Exchange'].includes(mode);
+          }).length
+        }
+      },
+      data: formattedReceipts,
+      availableBranches,
+      filters: {
+        approvalDateRange: { startDate: startDate || null, endDate: endDate || null },
+        selectedBranch: branchId || null,
+        paymentMode: paymentMode || 'All',
+        customerId: customerId || null,
+        bookingNumber: bookingNumber || null
+      },
+      message: `Found ${enrichedReceipts.length} receipts for customer ID: ${customerId || 'all'}`
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching approved receipts:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching approved receipts',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 };
+exports.getApprovedReceipts = async (req, res) => {
+  try {
+    const {
+      branchId,
+      startDate,
+      endDate,
+      paymentMode,
+      bookingNumber,
+      customerId,
+      bookingType,
+      customerType,
+      modelId,
+      colorId,
+      salesExecutiveId,
+      page = 1,
+      limit = 100,
+      format = 'json'
+    } = req.query;
+
+    console.log('🔍 Received filters:', { 
+      bookingNumber, 
+      customerId,
+      startDate, 
+      endDate,
+      paymentMode 
+    });
+
+    // ========== BRANCH ACCESS LOGIC ==========
+    const userId = req.user.id;
+
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({ path: 'roles', select: 'name isSuperAdmin permissionsCount' })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === 'SUPERADMIN') || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+
+    let hasAllBranchesAccess = false;
+    if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+      availableBranches = user.accessibleBranches.map(b => ({
+        _id: b._id, 
+        name: b.name, 
+        address: b.address, 
+        city: b.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+    } else if (user.branch) {
+      availableBranches = [{ 
+        _id: user.branch._id, 
+        name: user.branch.name, 
+        address: user.branch.address, 
+        city: user.branch.city 
+      }];
+    }
+
+    // ========== BUILD BOOKING FILTER FIRST ==========
+    let bookingFilter = {};
+
+    // Apply branch access filter
+    if (!hasAllBranchesAccess) {
+      let allowedBranchIds = [];
+
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+        allowedBranchIds = user.accessibleBranches.map(b => b._id);
+
+        if (branchId && branchId !== 'all') {
+          const requestedId = new mongoose.Types.ObjectId(branchId);
+          const hasAccess = allowedBranchIds.some(id => id.toString() === requestedId.toString());
+          if (!hasAccess) {
+            return res.status(403).json({ success: false, message: 'You do not have access to this branch' });
+          }
+          allowedBranchIds = [requestedId];
+        }
+      } else if (user.branch?._id) {
+        allowedBranchIds = [user.branch._id];
+        
+        if (branchId && branchId !== 'all' && branchId !== user.branch._id.toString()) {
+          return res.status(403).json({ success: false, message: 'You do not have access to this branch' });
+        }
+      } else {
+        return res.status(403).json({ success: false, message: 'You do not have access to any branch' });
+      }
+
+      bookingFilter.branch = { $in: allowedBranchIds };
+    } else {
+      // SuperAdmin - apply optional branch filter
+      if (branchId && branchId !== 'all') {
+        bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
+      }
+    }
+
+    // Apply booking-level filters
+    if (bookingType) bookingFilter.bookingType = bookingType;
+    if (customerType) bookingFilter.customerType = customerType;
+    if (modelId) bookingFilter.model = new mongoose.Types.ObjectId(modelId);
+    if (colorId) bookingFilter.color = new mongoose.Types.ObjectId(colorId);
+    if (salesExecutiveId) bookingFilter.salesExecutive = new mongoose.Types.ObjectId(salesExecutiveId);
+    
+    // IMPORTANT FIX: Apply customerId filter directly to booking
+    if (customerId) {
+      bookingFilter['customerDetails.custId'] = customerId; // Exact match
+      console.log('🔍 Filtering by customerId:', customerId);
+    }
+    
+    // IMPORTANT FIX: Apply bookingNumber filter directly to booking
+    if (bookingNumber) {
+      bookingFilter.bookingNumber = new RegExp(bookingNumber, 'i'); // Case-insensitive partial match
+      console.log('🔍 Filtering by bookingNumber:', bookingNumber);
+    }
+
+    // ========== GET MATCHING BOOKING IDS ==========
+    let matchingBookingIds = [];
+    if (Object.keys(bookingFilter).length > 0) {
+      const matchingBookings = await Booking.find(bookingFilter).select('_id').lean();
+      matchingBookingIds = matchingBookings.map(b => b._id);
+      
+      console.log(`📚 Found ${matchingBookingIds.length} bookings matching filters`);
+
+      if (matchingBookingIds.length === 0) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          totalCount: 0,
+          totalPages: 0,
+          currentPage: parseInt(page),
+          summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+          data: [],
+          availableBranches,
+          message: customerId ? `No bookings found for customer ID: ${customerId}` : 'No bookings found matching the specified filters'
+        });
+      }
+    }
+
+    // ========== BUILD LEDGER MATCH CRITERIA ==========
+    let ledgerMatch = {
+      approvalStatus: 'Approved',
+      isDebit: { $ne: true }
+    };
+
+    // Apply booking filter to ledger if we have matching booking IDs
+    if (matchingBookingIds.length > 0) {
+      ledgerMatch.booking = { $in: matchingBookingIds };
+    }
+
+    // Apply date filter on approvedAt
+    if (startDate || endDate) {
+      ledgerMatch.approvedAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        ledgerMatch.approvedAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        ledgerMatch.approvedAt.$lte = end;
+      }
+    } else {
+      // Default to last 30 days if no date range provided
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      thirtyDaysAgo.setHours(0, 0, 0, 0);
+      ledgerMatch.approvedAt = { $gte: thirtyDaysAgo };
+    }
+
+    // Apply payment mode filter
+    if (paymentMode) {
+      ledgerMatch.paymentMode = paymentMode;
+    }
+
+    console.log('🔍 Ledger match criteria:', JSON.stringify(ledgerMatch, null, 2));
+
+    // ========== GET APPROVED LEDGERS ==========
+    const ledgers = await Ledger.find(ledgerMatch)
+      .populate({ path: 'subPaymentModeDetails', select: 'payment_mode name' })
+      .populate({ path: 'approvedBy', select: 'name email' })
+      .populate({ path: 'receivedByDetails', select: 'name email' })
+      .sort({ approvedAt: -1 })
+      .lean();
+
+    console.log(`✅ Found ${ledgers.length} approved ledgers`);
+
+    if (ledgers.length === 0) {
+      // Check if there are any ledgers at all for debugging
+      const totalLedgers = await Ledger.countDocuments({ approvalStatus: 'Approved' });
+      console.log(`📊 Total approved ledgers in DB: ${totalLedgers}`);
+      
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        totalCount: 0,
+        totalPages: 0,
+        currentPage: parseInt(page),
+        summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+        data: [],
+        availableBranches,
+        filters: {
+          approvalDateRange: { startDate: startDate || null, endDate: endDate || null },
+          selectedBranch: branchId || null,
+          paymentMode: paymentMode || 'All',
+          customerId: customerId || null,
+          bookingNumber: bookingNumber || null
+        },
+        message: 'No approved receipts found for the specified filters'
+      });
+    }
+
+    const ledgerIds = ledgers.map(l => l._id);
+
+    // Build ledger map for quick lookup
+    const ledgerMap = {};
+    ledgers.forEach(ledger => {
+      ledgerMap[ledger._id.toString()] = ledger;
+    });
+
+    // ========== GET RECEIPTS FOR THOSE LEDGERS ==========
+    let receipts = await Receipt.find({
+      ledger: { $in: ledgerIds },
+      status: 'active'
+    })
+      .populate({ path: 'createdBy', select: 'name email' })
+      .populate({ path: 'receivedBy', select: 'name email' })
+      .lean();
+
+    console.log(`✅ Found ${receipts.length} receipts for the approved ledgers`);
+
+    // Debug: Log all receipt customer IDs
+    receipts.forEach((r, i) => {
+      console.log(`Receipt ${i+1}:`, {
+        receiptNumber: r.receiptNumber,
+        custId: r.customer?.custId,
+        bookingNumber: r.bookingNumber
+      });
+    });
+
+    // Handle receipts that exist in ledger but NOT in Receipt collection
+    const receiptLedgerIds = new Set(receipts.map(r => r.ledger?.toString()));
+    const missingReceiptLedgers = ledgers.filter(l => !receiptLedgerIds.has(l._id.toString()));
+
+    if (missingReceiptLedgers.length > 0) {
+      console.warn(`⚠️ ${missingReceiptLedgers.length} approved ledgers have NO matching Receipt document — including them from ledger data`);
+
+      const syntheticReceipts = missingReceiptLedgers.map(ledger => ({
+        _id: null,
+        booking: ledger.booking,
+        ledger: ledger._id,
+        bookingNumber: ledger.bookingNumber || '',
+        customer: { 
+          name: '', 
+          custId: ledger.custId || '' 
+        },
+        receiptNumber: ledger.receiptNumber || `LEDGER-${ledger._id}`,
+        receiptDate: ledger.receiptDate || ledger.createdAt,
+        amount: ledger.amount || 0,
+        netAmount: ledger.amount || 0,
+        gcAmount: ledger.gcAmount || 0,
+        paymentMode: ledger.paymentMode || '',
+        transactionReference: ledger.transactionReference || '',
+        status: 'active',
+        createdBy: ledger.receivedBy || null,
+        receivedBy: ledger.receivedBy || null,
+        _fromLedgerOnly: true
+      }));
+
+      receipts = [...receipts, ...syntheticReceipts];
+    }
+
+    // ========== COLLECT ALL BOOKING IDs FROM RECEIPTS ==========
+    const allBookingIds = [
+      ...new Set(
+        receipts
+          .map(r => r.booking?.toString())
+          .filter(Boolean)
+      )
+    ].map(id => new mongoose.Types.ObjectId(id));
+
+    // ========== GET BOOKING DETAILS ==========
+    let bookingMap = {};
+    if (allBookingIds.length > 0) {
+      const bookings = await Booking.find({ _id: { $in: allBookingIds } })
+        .populate({ path: 'vehicle', select: 'chassisNumber engineNumber' })
+        .populate({ path: 'model', select: 'model_name' })
+        .populate({ path: 'color', select: 'name' })
+        .populate({ path: 'branch', select: 'name address city' })
+        .lean();
+
+      bookings.forEach(b => {
+        bookingMap[b._id.toString()] = b;
+      });
+      console.log(`✅ Fetched ${bookings.length} booking details`);
+    }
+
+    // ========== FINAL SAFETY FILTER - Ensure customerId matches exactly ==========
+    if (customerId) {
+      const beforeFilter = receipts.length;
+      receipts = receipts.filter(r => {
+        const booking = r.booking ? bookingMap[r.booking.toString()] : null;
+        const receiptCustId = r.customer?.custId;
+        const bookingCustId = booking?.customerDetails?.custId;
+        
+        // Check if either the receipt or booking has the matching customer ID
+        const matches = receiptCustId === customerId || bookingCustId === customerId;
+        
+        if (!matches) {
+          console.log('❌ Filtering out receipt:', {
+            receiptNumber: r.receiptNumber,
+            receiptCustId,
+            bookingCustId,
+            expectedCustomerId: customerId
+          });
+        }
+        
+        return matches;
+      });
+      console.log(`🔍 After customerId filter: ${beforeFilter} -> ${receipts.length} receipts`);
+    }
+
+    if (receipts.length === 0) {
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        totalCount: 0,
+        totalPages: 0,
+        currentPage: parseInt(page),
+        summary: { totalReceipts: 0, totalAmount: 0, uniqueBookings: 0 },
+        data: [],
+        availableBranches,
+        message: customerId ? `No receipts found for customer ID: ${customerId}` : 'No receipts found after applying filters'
+      });
+    }
+
+    // ========== MERGE RECEIPT + LEDGER + BOOKING DATA ==========
+    const enrichedReceipts = receipts.map(receipt => {
+      const ledger = ledgerMap[receipt.ledger?.toString()] || {};
+      const booking = receipt.booking ? bookingMap[receipt.booking.toString()] : null;
+
+      // Chassis / Engine number resolution
+      let chassisNumber = booking?.chassisNumber || booking?.vehicle?.chassisNumber || '';
+      let engineNumber = booking?.engineNumber || booking?.vehicle?.engineNumber || '';
+
+      // Customer name resolution - PRIORITIZE RECEIPT DATA
+      let customerName = receipt.customer?.name || booking?.customerDetails?.name || '';
+      let customerCustId = receipt.customer?.custId || booking?.customerDetails?.custId || '';
+
+      // Sub payment mode resolution
+      let subPaymentMode = '';
+      if (ledger.subPaymentModeDetails) {
+        if (Array.isArray(ledger.subPaymentModeDetails) && ledger.subPaymentModeDetails.length > 0) {
+          subPaymentMode = ledger.subPaymentModeDetails[0].payment_mode || ledger.subPaymentModeDetails[0].name || '';
+        } else if (typeof ledger.subPaymentModeDetails === 'object') {
+          subPaymentMode = ledger.subPaymentModeDetails.payment_mode || ledger.subPaymentModeDetails.name || '';
+        }
+      }
+      if (!subPaymentMode && receipt.paymentDetails?.subPaymentMode) {
+        subPaymentMode = receipt.paymentDetails.subPaymentMode.name || receipt.paymentDetails.subPaymentMode.code || '';
+      }
+
+      // Approver name resolution
+      let approverName = '';
+      if (ledger.approvedBy) {
+        if (typeof ledger.approvedBy === 'object') {
+          approverName = ledger.approvedBy.name || ledger.approvedBy.email || ledger.approvedBy.toString();
+        } else {
+          approverName = ledger.approvedBy.toString();
+        }
+      }
+
+      return {
+        ...receipt,
+        ledger,
+        bookingDetails: booking,
+        approvalDate: ledger.approvedAt,
+        receiptDate: receipt.receiptDate,
+        chassisNumber,
+        engineNumber,
+        branchName: booking?.branch?.name || '',
+        branchId: booking?.branch?._id?.toString() || '',
+        customerName,
+        customerCustId, // Include this for debugging
+        subPaymentMode,
+        approvedBy: approverName,
+        approvedById: ledger.approvedBy?._id || ledger.approvedBy,
+        approvedAt: ledger.approvedAt,
+        receivedByName: receipt.receivedBy?.name || '',
+        createdByName: receipt.createdBy?.name || '',
+        receiptType: 'Receipt'
+      };
+    });
+
+    // ========== SORT BY APPROVAL DATE (most recent first) ==========
+    enrichedReceipts.sort((a, b) => new Date(b.approvalDate) - new Date(a.approvalDate));
+
+    // ========== PAGINATION ==========
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const startIndex = (pageNum - 1) * limitNum;
+    const endIndex = pageNum * limitNum;
+
+    const paginatedReceipts = enrichedReceipts.slice(startIndex, endIndex);
+    const totalPages = Math.ceil(enrichedReceipts.length / limitNum);
+
+    // ========== EXCEL FORMAT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+
+      let worksheetName = 'Approved Receipts';
+      if (branchId && branchId !== 'all') {
+        const branch = await Branch.findById(branchId).select('name').lean();
+        if (branch?.name) worksheetName = `${branch.name} Approved Receipts`;
+      }
+
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      worksheet.columns = [
+        { header: 'S.No', key: 'sno', width: 8 },
+        { header: 'Receipt Number', key: 'receiptNumber', width: 25 },
+        { header: 'Receipt Date', key: 'receiptDate', width: 15 },
+        { header: 'Approval Date', key: 'approvalDate', width: 15 },
+        { header: 'Approved By', key: 'approvedBy', width: 25 },
+        { header: 'Booking Number', key: 'bookingNumber', width: 20 },
+        { header: 'Customer ID', key: 'customerId', width: 15 },
+        { header: 'Branch Name', key: 'branchName', width: 25 },
+        { header: 'Chassis Number', key: 'chassisNumber', width: 25 },
+        { header: 'Engine Number', key: 'engineNumber', width: 25 },
+        { header: 'Payment Mode', key: 'paymentMode', width: 15 },
+        { header: 'Sub Payment Mode', key: 'subPaymentMode', width: 20 },
+        { header: 'Amount (₹)', key: 'amount', width: 15, style: { numFmt: '#,##0.00' } },
+        { header: 'Customer Name', key: 'customerName', width: 25 },
+        { header: 'Transaction Reference', key: 'transactionReference', width: 25 },
+        { header: 'Received By', key: 'receivedBy', width: 25 },
+        { header: 'Created By', key: 'createdBy', width: 25 }
+      ];
+
+      paginatedReceipts.forEach((receipt, index) => {
+        worksheet.addRow({
+          sno: startIndex + index + 1,
+          receiptNumber: receipt.receiptNumber || '',
+          receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('DD/MM/YYYY') : '',
+          approvalDate: receipt.approvalDate ? moment(receipt.approvalDate).format('DD/MM/YYYY') : '',
+          approvedBy: receipt.approvedBy || '',
+          bookingNumber: receipt.bookingNumber || receipt.bookingDetails?.bookingNumber || '',
+          customerId: receipt.customerCustId || '',
+          branchName: receipt.branchName || '',
+          chassisNumber: receipt.chassisNumber || '',
+          engineNumber: receipt.engineNumber || '',
+          paymentMode: receipt.paymentMode || receipt.ledger?.paymentMode || '',
+          subPaymentMode: receipt.subPaymentMode || '',
+          amount: receipt.netAmount || receipt.amount || receipt.ledger?.amount || 0,
+          customerName: receipt.customerName || '',
+          transactionReference: receipt.transactionReference || receipt.ledger?.transactionReference || '',
+          receivedBy: receipt.receivedByName || '',
+          createdBy: receipt.createdByName || ''
+        });
+      });
+
+      const headerRow = worksheet.getRow(1);
+      headerRow.eachCell(cell => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4CAF50' } };
+      });
+
+      const fileName = `approved_receipts_${moment().format('YYYY-MM-DD')}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      await workbook.xlsx.write(res);
+      return res.end();
+    }
+
+    // ========== JSON FORMAT ==========
+    const formattedReceipts = paginatedReceipts.map(receipt => ({
+      receiptNumber: receipt.receiptNumber,
+      receiptDate: receipt.receiptDate ? moment(receipt.receiptDate).format('YYYY-MM-DD') : null,
+      approvalDate: receipt.approvalDate ? moment(receipt.approvalDate).format('YYYY-MM-DD') : null,
+      approvedBy: receipt.approvedBy,
+      approvedById: receipt.approvedById,
+      bookingNumber: receipt.bookingNumber || receipt.bookingDetails?.bookingNumber,
+      branchName: receipt.branchName,
+      branchId: receipt.branchId,
+      vehicle: {
+        chassisNumber: receipt.chassisNumber,
+        engineNumber: receipt.engineNumber
+      },
+      payment: {
+        mode: receipt.paymentMode || receipt.ledger?.paymentMode,
+        subPaymentMode: receipt.subPaymentMode,
+        amount: receipt.netAmount || receipt.amount || receipt.ledger?.amount,
+        transactionReference: receipt.transactionReference || receipt.ledger?.transactionReference
+      },
+      customer: {
+        name: receipt.customerName,
+        custId: receipt.customerCustId || receipt.customer?.custId || receipt.bookingDetails?.customerDetails?.custId
+      },
+      receivedBy: receipt.receivedByName,
+      createdBy: receipt.createdByName,
+      bookingId: receipt.booking?.toString() || receipt.bookingDetails?._id?.toString(),
+      _fromLedgerOnly: receipt._fromLedgerOnly || false
+    }));
+
+    // Summary calculations
+    const totalAmount = enrichedReceipts.reduce((sum, r) => sum + (r.netAmount || r.amount || r.ledger?.amount || 0), 0);
+    const uniqueBookings = [...new Set(enrichedReceipts.map(r => r.booking?.toString()).filter(Boolean))];
+
+    const approvalDates = enrichedReceipts.map(r => r.approvalDate).filter(Boolean);
+    const minApprovalDate = approvalDates.length > 0 ? new Date(Math.min(...approvalDates.map(d => new Date(d)))) : null;
+    const maxApprovalDate = approvalDates.length > 0 ? new Date(Math.max(...approvalDates.map(d => new Date(d)))) : null;
+
+    return res.status(200).json({
+      success: true,
+      count: paginatedReceipts.length,
+      totalCount: enrichedReceipts.length,
+      totalPages,
+      currentPage: pageNum,
+      summary: {
+        totalReceipts: enrichedReceipts.length,
+        totalAmount,
+        uniqueBookings: uniqueBookings.length,
+        approvalDateRange: {
+          from: minApprovalDate ? moment(minApprovalDate).format('YYYY-MM-DD') : null,
+          to: maxApprovalDate ? moment(maxApprovalDate).format('YYYY-MM-DD') : null
+        },
+        paymentModeBreakdown: {
+          bank: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Bank').length,
+          cash: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Cash').length,
+          exchange: enrichedReceipts.filter(r => (r.paymentMode || r.ledger?.paymentMode) === 'Exchange').length,
+          other: enrichedReceipts.filter(r => {
+            const mode = r.paymentMode || r.ledger?.paymentMode;
+            return mode && !['Bank', 'Cash', 'Exchange'].includes(mode);
+          }).length
+        }
+      },
+      data: formattedReceipts,
+      availableBranches,
+      filters: {
+        approvalDateRange: { startDate: startDate || null, endDate: endDate || null },
+        selectedBranch: branchId || null,
+        paymentMode: paymentMode || 'All',
+        customerId: customerId || null,
+        bookingNumber: bookingNumber || null
+      },
+      message: `Found ${enrichedReceipts.length} receipts for customer ID: ${customerId || 'all'}`
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching approved receipts:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching approved receipts',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+exports.generateDummyInvoiceReport = async (req, res) => {
+  try {
+    const { 
+      startDate, 
+      endDate, 
+      branchId,
+      status,
+      format = 'excel' 
+    } = req.query;
+
+    // Build filter conditions
+    const filter = {};
+
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    
+    // Check user roles
+    const userRoles = user.roles || [];
+    const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+    const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    // Check if user has all branches access
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+    } else if (user.branch) {
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+    }
+    
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+    }
+
+    // ========== APPLY BRANCH FILTER ==========
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        
+        if (branchId) {
+          if (branchId === 'all') {
+            filter.branch = { $in: accessibleBranchIds };
+          } else {
+            const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+            const hasAccess = accessibleBranchIds.some(bId => 
+              bId.toString() === requestedBranchId.toString()
+            );
+            
+            if (!hasAccess) {
+              return res.status(403).json({
+                success: false,
+                message: 'You do not have access to this branch'
+              });
+            }
+            filter.branch = requestedBranchId;
+          }
+        } else {
+          filter.branch = { $in: accessibleBranchIds };
+        }
+      } else if (user.branch && user.branch._id) {
+        filter.branch = user.branch._id;
+      } else {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have access to any branch'
+        });
+      }
+    } else if (branchId && branchId !== 'all') {
+      filter.branch = new mongoose.Types.ObjectId(branchId);
+    }
+
+    // ========== DATE RANGE FILTER ==========
+    if (startDate || endDate) {
+      filter.invoiceDate = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        filter.invoiceDate.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        filter.invoiceDate.$lte = end;
+      }
+    }
+
+    // ========== STATUS FILTER ==========
+    if (status) {
+      filter.status = status;
+    }
+
+    console.log('Generated filter:', JSON.stringify(filter, null, 2));
+    
+    // ========== FETCH DUMMY INVOICES ==========
+    const invoices = await DummyInvoice.find(filter)
+      .populate({
+        path: 'booking',
+        select: 'bookingNumber model color chassisNumber customerDetails bookingNumber',
+        populate: [
+          { path: 'model', select: 'model_name' },
+          { path: 'color', select: 'name' }
+        ]
+      })
+      .populate('createdBy', 'name email')
+      .populate('headerPrices.header', 'header_key')
+      .sort({ invoiceDate: -1 })
+      .lean();
+
+    console.log(`Found ${invoices.length} dummy invoices`);
+
+    if (invoices.length === 0 && format === 'json') {
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        data: [],
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0
+        }
+      });
+    }
+
+    // ========== GET ALL UNIQUE HEADERS FOR DYNAMIC COLUMNS ==========
+    const headerMap = new Map();
+    
+    invoices.forEach(invoice => {
+      if (invoice.headerPrices && invoice.headerPrices.length > 0) {
+        invoice.headerPrices.forEach(price => {
+          if (price.header && price.header_key && !headerMap.has(price.header_key)) {
+            headerMap.set(price.header_key, {
+              header_key: price.header_key,
+              index: headerMap.size
+            });
+          }
+        });
+      }
+    });
+
+    const priceHeaders = Array.from(headerMap.values());
+    
+    // Sort headers alphabetically for consistent column order
+    priceHeaders.sort((a, b) => a.header_key.localeCompare(b.header_key));
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      let worksheetName = 'Dummy Invoice Report';
+      if (filter.branch && typeof filter.branch === 'object' && !filter.branch.$in) {
+        worksheetName = `Invoice Report`;
+      } else if (hasAllBranchesAccess && !branchId) {
+        worksheetName = 'All Branches Invoice Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName);
+
+      // Define headers - EXACTLY as requested
+      const headers = [
+        'Sr. No',
+        'Booking ID',
+        'Model Name',
+        'Customer Name',
+        'Chassis Number',
+        'Booking Date',
+        'Invoice Date',
+        'Invoice Number',
+        'Created By Name'
+      ];
+
+      // Add dynamic price headers
+      priceHeaders.forEach(header => {
+        headers.push(header.header_key);
+      });
+
+      // Add total amount header at the end
+      headers.push('Total Amount');
+
+      // Set worksheet columns
+      const columns = headers.map((header, index) => {
+        let width = 15;
+        
+        if (header === 'Sr. No') width = 8;
+        else if (header === 'Booking ID') width = 18;
+        else if (header === 'Model Name') width = 20;
+        else if (header === 'Customer Name') width = 25;
+        else if (header === 'Chassis Number') width = 20;
+        else if (header === 'Booking Date') width = 12;
+        else if (header === 'Invoice Date') width = 12;
+        else if (header === 'Invoice Number') width = 18;
+        else if (header === 'Created By Name') width = 20;
+        else if (header === 'Total Amount') width = 15;
+        else width = 15; // For dynamic price headers
+
+        return {
+          header: header,
+          key: `col_${index}`,
+          width: width,
+          style: header === 'Total Amount' || priceHeaders.some(ph => ph.header_key === header) ? 
+                 { numFmt: '#,##0.00' } : {}
+        };
+      });
+
+      worksheet.columns = columns;
+
+      // Add data rows
+      invoices.forEach((invoice, index) => {
+        const rowData = {};
+        
+        // Sr. No
+        rowData['col_0'] = index + 1;
+        
+        // Booking ID
+        rowData['col_1'] = invoice.booking?.bookingNumber || '';
+        
+        // Model Name
+        rowData['col_2'] = invoice.booking?.model?.model_name || invoice.bookingInfo?.modelName || '';
+        
+        // Customer Name
+        rowData['col_3'] = invoice.customerInfo?.name || invoice.booking?.customerDetails?.name || '';
+        
+        // Chassis Number
+        rowData['col_4'] = invoice.booking?.chassisNumber || invoice.bookingInfo?.chassisNumber || '';
+        
+        // Booking Date
+        rowData['col_5'] = invoice.booking?.createdAt ? 
+          moment(invoice.booking.createdAt).format('DD/MM/YYYY') : 
+          (invoice.bookingInfo?.bookingDate ? moment(invoice.bookingInfo.bookingDate).format('DD/MM/YYYY') : '');
+        
+        // Invoice Date
+        rowData['col_6'] = invoice.invoiceDate ? moment(invoice.invoiceDate).format('DD/MM/YYYY') : '';
+        
+        // Invoice Number
+        rowData['col_7'] = invoice.invoiceNumber || '';
+        
+        // Created By Name
+        rowData['col_8'] = invoice.createdByName || invoice.createdBy?.name || 'System';
+
+        // Create price component map for this invoice
+        const priceMap = new Map();
+        if (invoice.headerPrices && invoice.headerPrices.length > 0) {
+          invoice.headerPrices.forEach(price => {
+            if (price.header_key) {
+              priceMap.set(price.header_key, price.unitPrice || 0);
+            }
+          });
+        }
+
+        // Add dynamic price values (starting from column 9)
+        priceHeaders.forEach((header, priceIndex) => {
+          const columnIndex = 9 + priceIndex;
+          rowData[`col_${columnIndex}`] = priceMap.get(header.header_key) || 0;
+        });
+
+        // Add total amount (last column)
+        const totalAmountIndex = 9 + priceHeaders.length;
+        rowData[`col_${totalAmountIndex}`] = invoice.totals?.totalAmount || 0;
+
+        worksheet.addRow(rowData);
+      });
+
+      // Style the header row
+      worksheet.getRow(1).eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Format all amount columns
+      for (let i = 1; i <= invoices.length; i++) {
+        const row = worksheet.getRow(i + 1);
+        
+        // Format price header columns and total amount
+        priceHeaders.forEach((header, priceIndex) => {
+          const colIndex = 9 + priceIndex + 1; // +1 because Excel columns are 1-indexed
+          const cell = row.getCell(colIndex);
+          if (typeof cell.value === 'number') {
+            cell.numFmt = '#,##0.00';
+            cell.alignment = { horizontal: 'right' };
+          }
+        });
+        
+        // Format total amount column
+        const totalColIndex = 9 + priceHeaders.length + 1;
+        const totalCell = row.getCell(totalColIndex);
+        if (typeof totalCell.value === 'number') {
+          totalCell.numFmt = '#,##0.00';
+          totalCell.alignment = { horizontal: 'right' };
+          totalCell.font = { bold: true };
+        }
+      }
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [
+        { state: 'frozen', ySplit: 1 }
+      ];
+
+      // Set response headers for file download
+      const fileName = `dummy_invoice_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${fileName}"`
+      );
+
+      // Write to response
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      const formattedInvoices = invoices.map((invoice, index) => {
+        // Create price components object
+        const priceComponents = {};
+        if (invoice.headerPrices && invoice.headerPrices.length > 0) {
+          invoice.headerPrices.forEach(price => {
+            if (price.header_key) {
+              priceComponents[price.header_key] = price.unitPrice || 0;
+            }
+          });
+        }
+
+        return {
+          srNo: index + 1,
+          bookingId: invoice.booking?.bookingNumber || invoice.bookingInfo?.bookingNumber || '',
+          modelName: invoice.booking?.model?.model_name || invoice.bookingInfo?.modelName || '',
+          customerName: invoice.customerInfo?.name || invoice.booking?.customerDetails?.name || '',
+          chassisNumber: invoice.booking?.chassisNumber || invoice.bookingInfo?.chassisNumber || '',
+          bookingDate: invoice.booking?.createdAt ? 
+            moment(invoice.booking.createdAt).format('DD/MM/YYYY') : 
+            (invoice.bookingInfo?.bookingDate ? moment(invoice.bookingInfo.bookingDate).format('DD/MM/YYYY') : ''),
+          invoiceDate: invoice.invoiceDate ? moment(invoice.invoiceDate).format('DD/MM/YYYY') : '',
+          invoiceNumber: invoice.invoiceNumber || '',
+          createdByName: invoice.createdByName || invoice.createdBy?.name || 'System',
+          priceComponents: priceComponents,
+          totalAmount: invoice.totals?.totalAmount || 0,
+          status: invoice.status
+        };
+      });
+
+      // Calculate summary statistics
+      const summary = {
+        totalInvoices: formattedInvoices.length,
+        totalAmount: formattedInvoices.reduce((sum, inv) => sum + inv.totalAmount, 0),
+        byStatus: {
+          DRAFT: formattedInvoices.filter(inv => inv.status === 'DRAFT').length,
+          FINAL: formattedInvoices.filter(inv => inv.status === 'FINAL').length,
+          CANCELLED: formattedInvoices.filter(inv => inv.status === 'CANCELLED').length
+        }
+      };
+
+      res.status(200).json({
+        success: true,
+        count: invoices.length,
+        summary: summary,
+        data: formattedInvoices,
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          dateRange: filter.invoiceDate ? {
+            start: filter.invoiceDate.$gte ? filter.invoiceDate.$gte.toISOString() : undefined,
+            end: filter.invoiceDate.$lte ? filter.invoiceDate.$lte.toISOString() : undefined
+          } : undefined,
+          branchId: branchId,
+          status: status
+        },
+        headers: {
+          fixed: ['Sr. No', 'Booking ID', 'Model Name', 'Customer Name', 'Chassis Number', 
+                  'Booking Date', 'Invoice Date', 'Invoice Number', 'Created By Name'],
+          dynamic: priceHeaders.map(h => h.header_key),
+          total: 'Total Amount'
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error generating dummy invoice report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error generating dummy invoice report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+/**
+ * Get booking report filtered by allocation date
+ * @route GET /api/reports/booking-allocation
+ * @access Private (Admin, Manager, Accountant)
+ */
+exports.getBookingAllocationReport = async (req, res) => {
+  try {
+    const {
+      branchId,
+      startDate,
+      endDate,
+      status,
+      bookingType,
+      customerType,
+      modelType,
+      allocationStatus,
+      paymentType,
+      rto,
+      format = 'json'
+    } = req.query;
+
+    // Validate required dates
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date and end date are required'
+      });
+    }
+
+    // Parse dates
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    
+    // Set end date to end of day
+    end.setHours(23, 59, 59, 999);
+
+    // Validate date range
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date cannot be greater than end date'
+      });
+    }
+
+    // Get user info from auth middleware
+    const userId = req.user.id;
+    
+    // Fetch user with all necessary data
+    const user = await User.findById(userId)
+      .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+      .populate({
+        path: 'roles',
+        select: 'name isSuperAdmin permissionsCount'
+      })
+      .populate('branch')
+      .populate({
+        path: 'accessibleBranches',
+        model: 'Branch',
+        select: '_id name address city state pincode phone email is_active logo1'
+      })
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    console.log(`👤 User: ${user.name} (${user.email})`);
+    console.log(`🏢 User's branch: ${user.branch?.name || 'None'}`);
+    console.log(`🔑 Branch Access Type: ${user.branchAccess || 'OWN'}`);
+    
+    // Check user roles
+    const userRoles = user.roles || [];
+    
+    // Check if user is SUPERADMIN
+    const isActualSuperAdmin = userRoles.some(role => 
+      role.name === "SUPERADMIN"
+    ) || false;
+    
+    // Check if user has superadmin flag
+    const isSuperAdminFlag = userRoles.some(role => 
+      role.isSuperAdmin === true
+    ) || false;
+    
+    // Get branch access from user
+    const branchAccess = user.branchAccess || 'OWN';
+    
+    // Check if user has all branches access
+    let hasAllBranchesAccess = false;
+    
+    if (isActualSuperAdmin) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is SUPERADMIN - has access to all branches');
+    } else if (branchAccess === 'ALL') {
+      hasAllBranchesAccess = true;
+      console.log('✅ User has ALL branch access permission');
+    } else if (isSuperAdminFlag) {
+      hasAllBranchesAccess = true;
+      console.log('✅ User is ADMIN/GM - has access to all branches');
+    } else {
+      console.log('ℹ️ User has restricted branch access');
+    }
+
+    // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+    let availableBranches = [];
+    
+    if (hasAllBranchesAccess) {
+      // User can see all active branches
+      availableBranches = await Branch.find({ is_active: true })
+        .select('_id name address city')
+        .sort({ name: 1 })
+        .lean();
+      console.log(`✅ Fetched ${availableBranches.length} total branches for dropdown`);
+    } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches) {
+      // User can see only assigned branches
+      availableBranches = user.accessibleBranches.map(branch => ({
+        _id: branch._id,
+        name: branch.name,
+        address: branch.address,
+        city: branch.city
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      console.log(`✅ Using ${availableBranches.length} assigned branches for dropdown`);
+    } else if (user.branch) {
+      // User can see only their own branch
+      availableBranches = [{
+        _id: user.branch._id,
+        name: user.branch.name,
+        address: user.branch.address,
+        city: user.branch.city
+      }];
+      console.log('✅ Using only own branch for dropdown');
+    }
+    
+    // Add "All" option for users with multiple branch access
+    if (availableBranches.length > 1) {
+      availableBranches.unshift({
+        _id: 'all',
+        name: 'All Branches',
+        address: '',
+        city: ''
+      });
+      console.log('✅ Added "All Branches" option to dropdown');
+    }
+
+    // ========== BUILD FILTER CONDITIONS ==========
+    
+    // Build booking filter for ALLOCATED status
+    const bookingFilter = {
+      chassisAllocationStatus: 'ALLOCATED' // Only bookings with allocated chassis
+    };
+
+    // Apply branch filter
+    if (!hasAllBranchesAccess) {
+      if (branchAccess === 'ASSIGNED' && user.accessibleBranches && user.accessibleBranches.length > 0) {
+        const accessibleBranchIds = user.accessibleBranches.map(branch => branch._id);
+        
+        if (branchId && branchId !== 'all') {
+          const requestedBranchId = new mongoose.Types.ObjectId(branchId);
+          const hasAccess = accessibleBranchIds.some(bId => 
+            bId.toString() === requestedBranchId.toString()
+          );
+          
+          if (!hasAccess) {
+            return res.status(403).json({
+              success: false,
+              message: 'You do not have access to this branch'
+            });
+          }
+          bookingFilter.branch = requestedBranchId;
+        } else if (branchId === 'all') {
+          bookingFilter.branch = { $in: accessibleBranchIds };
+        } else {
+          bookingFilter.branch = { $in: accessibleBranchIds };
+        }
+      } else {
+        if (user.branch && user.branch._id) {
+          bookingFilter.branch = user.branch._id;
+        } else {
+          return res.status(403).json({
+            success: false,
+            message: 'You do not have access to any branch'
+          });
+        }
+      }
+    } else {
+      if (branchId && branchId !== 'all') {
+        bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
+      }
+    }
+
+    // Apply additional filters
+    if (status) bookingFilter.status = status;
+    if (bookingType) bookingFilter.bookingType = bookingType;
+    if (customerType) bookingFilter.customerType = customerType;
+    if (paymentType) bookingFilter['payment.type'] = paymentType;
+    if (rto) bookingFilter.rto = rto;
+
+    console.log('Booking Filter:', JSON.stringify(bookingFilter, null, 2));
+
+    // ========== FETCH BOOKINGS WITH ALLOCATED STATUS ==========
+    // First, get all bookings with ALLOCATED status
+    let bookingsQuery = Booking.find(bookingFilter)
+      .populate('model', 'model_name type')
+      .populate('color', 'name')
+      .populate('branch', 'name address city')
+      .populate('salesExecutive', 'name email mobile')
+      .populate('createdBy', 'name email')
+      .populate('verticleDetails', 'name')
+      .populate({
+        path: 'priceComponents.header',
+        select: 'header_key category_key priority'
+      })
+      .populate({
+        path: 'ledgerEntries',
+        select: 'amount paymentMode type date approvalStatus isDebit',
+        match: { approvalStatus: 'Approved' }
+      })
+      .populate('financeDisbursements', 'disbursementReference disbursementAmount receivedAmount status disbursementDate')
+      .populate('exchangeDetails.broker', 'name mobile')
+      .populate('payment.financer', 'name')
+      .populate({
+        path: 'accessories.accessory',
+        select: 'name code category description',
+        model: 'Accessory'
+      })
+      .populate({
+        path: 'vehicle',
+        select: 'chassisNumber engineNumber batteryNumber keyNumber motorNumber chargerNumber allocationHistory',
+        model: 'Vehicle'
+      });
+
+    // Apply model type filter if provided
+    if (modelType) {
+      const models = await mongoose.model('Model').find({ 
+        type: modelType.toUpperCase() 
+      }).select('_id').lean();
+      
+      const modelIds = models.map(model => model._id);
+      
+      if (modelIds.length > 0) {
+        bookingsQuery = bookingsQuery.where('model').in(modelIds);
+      } else {
+        // No models of this type found
+        if (format === 'excel') {
+          const workbook = new ExcelJS.Workbook();
+          const worksheet = workbook.addWorksheet('Allocation Report');
+          const headers = getBaseHeaders();
+          worksheet.columns = headers.map((header, index) => ({
+            header: header,
+            key: `col_${index}`,
+            width: getColumnWidth(header)
+          }));
+          
+          const fileName = `allocation_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          
+          await workbook.xlsx.write(res);
+          res.end();
+          return;
+        } else {
+          return res.status(200).json({
+            success: true,
+            count: 0,
+            data: [],
+            availableBranches: availableBranches,
+            userAccessInfo: {
+              hasAllBranchesAccess: hasAllBranchesAccess,
+              branchAccess: branchAccess,
+              accessibleBranchesCount: user.accessibleBranches?.length || 0,
+              userBranch: user.branch ? {
+                _id: user.branch._id,
+                name: user.branch.name
+              } : null
+            },
+            filters: {
+              startDate: start,
+              endDate: end,
+              branchId: branchId,
+              status: status,
+              bookingType: bookingType,
+              customerType: customerType,
+              modelType: modelType,
+              allocationStatus: 'ALLOCATED',
+              paymentType: paymentType,
+              rto: rto
+            }
+          });
+        }
+      }
+    }
+
+    // Execute query
+    let bookings = await bookingsQuery.lean();
+
+    console.log(`Found ${bookings.length} bookings with ALLOCATED status before date filtering`);
+
+    // ========== FILTER BY ALLOCATION DATE USING VEHICLE ALLOCATION HISTORY ==========
+    // This is the CORRECT way - filter by allocation date from vehicle history
+    const filteredBookings = [];
+    
+    for (const booking of bookings) {
+      let allocationDate = null;
+      let allocationStatus = null;
+      
+      // Check vehicle allocation history
+      if (booking.vehicle && booking.vehicle.allocationHistory && booking.vehicle.allocationHistory.length > 0) {
+        // Find allocation entries for this booking with ALLOCATED status
+        const allocationEntries = booking.vehicle.allocationHistory.filter(
+          history => history.bookingId && 
+                    history.bookingId.toString() === booking._id.toString() &&
+                    history.status === 'ALLOCATED' // Only ALLOCATED status
+        );
+        
+        if (allocationEntries.length > 0) {
+          // Sort by date (most recent first)
+          allocationEntries.sort((a, b) => new Date(b.allocatedAt) - new Date(a.allocatedAt));
+          const latestAllocation = allocationEntries[0];
+          
+          allocationDate = latestAllocation.allocatedAt;
+          allocationStatus = latestAllocation.status;
+        }
+      }
+      
+      // If allocation date found, check if it's within the requested date range
+      if (allocationDate) {
+        const allocDate = new Date(allocationDate);
+        
+        // Check if within range
+        const isAfterStart = !startDate || allocDate >= start;
+        const isBeforeEnd = !endDate || allocDate <= end;
+        
+        if (isAfterStart && isBeforeEnd) {
+          // Add allocation info to booking
+          booking.allocationDate = allocationDate;
+          booking.allocationStatus = allocationStatus;
+          filteredBookings.push(booking);
+        }
+      }
+    }
+
+    console.log(`After allocation date filtering, ${filteredBookings.length} records with ALLOCATED status in date range`);
+
+    if (filteredBookings.length === 0) {
+      if (format === 'excel') {
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Allocation Report');
+        const headers = getBaseHeaders();
+        worksheet.columns = headers.map((header, index) => ({
+          header: header,
+          key: `col_${index}`,
+          width: getColumnWidth(header)
+        }));
+        
+        const fileName = `allocation_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+        
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        
+        await workbook.xlsx.write(res);
+        res.end();
+        return;
+      } else {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          data: [],
+          availableBranches: availableBranches,
+          userAccessInfo: {
+            hasAllBranchesAccess: hasAllBranchesAccess,
+            branchAccess: branchAccess,
+            accessibleBranchesCount: user.accessibleBranches?.length || 0,
+            userBranch: user.branch ? {
+              _id: user.branch._id,
+              name: user.branch.name
+            } : null
+          },
+          filters: {
+            startDate: start,
+            endDate: end,
+            branchId: branchId,
+            status: status,
+            bookingType: bookingType,
+            customerType: customerType,
+            modelType: modelType,
+            allocationStatus: 'ALLOCATED',
+            paymentType: paymentType,
+            rto: rto
+          }
+        });
+      }
+    }
+
+    // ========== GET DYNAMIC PRICE HEADERS FROM ALL BOOKINGS ==========
+    // This ensures we capture ALL price headers that appear in ANY booking
+    const headerMap = new Map();
+    
+    filteredBookings.forEach(booking => {
+      if (booking.priceComponents && booking.priceComponents.length > 0) {
+        // Sort by priority to maintain order
+        const sortedComponents = [...booking.priceComponents].sort((a, b) => {
+          const priorityA = a.header?.priority || 999;
+          const priorityB = b.header?.priority || 999;
+          return priorityA - priorityB;
+        });
+
+        sortedComponents.forEach(pc => {
+          if (pc.header && pc.header.header_key && !headerMap.has(pc.header.header_key)) {
+            headerMap.set(pc.header.header_key, {
+              header_key: pc.header.header_key,
+              priority: pc.header.priority || 999,
+              index: headerMap.size
+            });
+          }
+        });
+      }
+    });
+
+    // Sort price headers by priority
+    const priceHeaders = Array.from(headerMap.values())
+      .sort((a, b) => a.priority - b.priority);
+
+    console.log(`Found ${priceHeaders.length} dynamic price headers:`, priceHeaders.map(h => h.header_key));
+
+    // ========== BUILD COMPLETE HEADERS LIST ==========
+    // Base headers that are always present
+    const baseHeaders = [
+      'Booking Number',
+      'Booking Date',
+      'Allocation Date',
+      'Branch Name',
+      'Sales Executive',
+      'Model',
+      'Verticle',
+      'Model Type',
+      'Color',
+      'Chassis Number',
+      'Engine Number',
+      'Customer Name',
+      'Mobile1',
+      'Mobile2',
+      'Address',
+      'Pincode',
+      'Aadhar number',
+      'Pan no',
+      'Birthday',
+      'Nominee Name',
+      'Nominee Relation',
+      'Nominee Age',
+      'Booking Type',
+      'Financier Name',
+      'Customer Type',
+      'GST Number',
+      // Exchange Details Headers
+      'Exchange Vehicle',
+      'Exchange Vehicle Number',
+      'Exchange Chassis Number',
+      'Exchange Broker',
+      'Exchange Price'
+    ];
+
+    // Combine all headers: base + dynamic price headers + totals
+    const allHeaders = [
+      ...baseHeaders,
+      ...priceHeaders.map(ph => ph.header_key), // Dynamic price headers
+      'Total Amount',
+      'Total Discount Given',
+      'Final Deal Amount',
+      'Accessories'
+    ];
+
+    console.log(`Total headers: ${allHeaders.length}`);
+
+    // ========== FORMAT DATA FOR REPORT ==========
+    const reportData = filteredBookings.map(booking => {
+      const model = booking.model || {};
+      const color = booking.color || {};
+      const branch = booking.branch || {};
+      const salesExecutive = booking.salesExecutive || {};
+      const financer = booking.payment?.financer || {};
+      const broker = booking.exchangeDetails?.broker || {};
+      const vehicleDetail = booking.vehicle || {};
+
+      // Get verticle names
+      let verticleNames = '';
+      if (booking.verticleDetails && booking.verticleDetails.length > 0) {
+        verticleNames = booking.verticleDetails
+          .map(v => v.name || '')
+          .filter(name => name !== '')
+          .join(', ');
+      } else if (booking.verticles && booking.verticles.length > 0) {
+        verticleNames = 'Multiple';
+      }
+
+      // Create dynamic price components object with ALL headers
+      const priceComponents = {};
+      
+      // Initialize all price headers with 0
+      priceHeaders.forEach(ph => {
+        priceComponents[ph.header_key] = 0;
+      });
+      
+      // Fill in actual values where they exist
+      if (booking.priceComponents && booking.priceComponents.length > 0) {
+        booking.priceComponents.forEach(pc => {
+          if (pc.header && pc.header.header_key) {
+            priceComponents[pc.header.header_key] = pc.discountedValue || 0;
+          }
+        });
+      }
+
+      // Get accessories names
+      let accessoriesText = '';
+      if (Array.isArray(booking.accessories) && booking.accessories.length > 0) {
+        const accessoryNamesArray = booking.accessories
+          .map(acc => {
+            if (acc.accessory && acc.accessory.name) {
+              return acc.accessory.name;
+            }
+            return '';
+          })
+          .filter(name => name !== '');
+        
+        accessoriesText = accessoryNamesArray.join(', ');
+      }
+
+      // Calculate total discount
+      const totalDiscount = (booking.totalAmount || 0) - (booking.discountedAmount || 0);
+
+      // Build data object with dynamic properties
+      const dataItem = {
+        // Core fields
+        bookingNumber: booking.bookingNumber || '',
+        bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+        allocationDate: booking.allocationDate ? moment(booking.allocationDate).format('DD/MM/YYYY') : '',
+        branchName: branch.name || '',
+        salesExecutive: salesExecutive.name || '',
+        model: model.model_name || '',
+        verticle: verticleNames,
+        modelType: model.type || '',
+        color: color.name || '',
+        chassisNumber: booking.chassisNumber || vehicleDetail.chassisNumber || '',
+        engineNumber: vehicleDetail.engineNumber || booking.engineNumber || '',
+        customerName: booking.customerDetails?.name || '',
+        mobile1: booking.customerDetails?.mobile1 || '',
+        mobile2: booking.customerDetails?.mobile2 || '',
+        address: booking.customerDetails?.address || '',
+        pincode: booking.customerDetails?.pincode || '',
+        aadharNumber: booking.customerDetails?.aadharNumber || '',
+        panNo: booking.customerDetails?.panNo || '',
+        birthday: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+        nomineeName: booking.customerDetails?.nomineeName || '',
+        nomineeRelation: booking.customerDetails?.nomineeRelation || '',
+        nomineeAge: booking.customerDetails?.nomineeAge || '',
+        bookingType: booking.payment?.type || '',
+        financierName: financer.name || '',
+        customerType: booking.customerType || '',
+        gstNumber: (booking.customerType === 'B2B') ? (booking.gstin || '') : '',
+        
+        // Exchange Details
+        exchangeVehicle: booking.exchange ? 'YES' : 'NO',
+        exchangeVehicleNumber: booking.exchangeDetails?.vehicleNumber || '',
+        exchangeChassisNumber: booking.exchangeDetails?.chassisNumber || '',
+        exchangeBroker: broker.name || '',
+        exchangePrice: booking.exchangeDetails?.price || 0,
+        
+        // Dynamic Price Components - add all from priceComponents object
+        ...priceComponents,
+        
+        // Totals
+        totalAmount: booking.totalAmount || 0,
+        totalDiscountGiven: totalDiscount,
+        finalDealAmount: booking.discountedAmount || 0,
+        accessories: accessoriesText
+      };
+
+      return dataItem;
+    });
+
+    // ========== GENERATE EXCEL REPORT ==========
+    if (format === 'excel') {
+      const workbook = new ExcelJS.Workbook();
+      
+      // Create worksheet name
+      let worksheetName = 'Allocation Report';
+      if (branchId && branchId !== 'all' && reportData.length > 0) {
+        const branch = reportData[0]?.branchName;
+        if (branch) {
+          worksheetName = `${branch} Allocation Report`;
+        }
+      } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+        worksheetName = 'All Branches Allocation Report';
+      }
+      
+      const worksheet = workbook.addWorksheet(worksheetName, {
+        properties: { defaultRowHeight: 20 },
+        pageSetup: { paperSize: 9, orientation: 'landscape' }
+      });
+
+      // Set worksheet columns with proper widths
+      const columns = allHeaders.map((header, index) => ({
+        header: header,
+        key: `col_${index}`,
+        width: getColumnWidth(header),
+        style: {
+          alignment: { vertical: 'middle', horizontal: getAlignment(header) },
+          font: { size: 10 }
+        }
+      }));
+
+      worksheet.columns = columns;
+
+      // Style header row
+      const headerRow = worksheet.getRow(1);
+      headerRow.height = 30;
+      headerRow.eachCell((cell) => {
+        cell.font = { 
+          bold: true, 
+          color: { argb: 'FFFFFFFF' },
+          size: 11,
+          name: 'Arial'
+        };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF2E75B5' }
+        };
+        cell.alignment = { 
+          vertical: 'middle', 
+          horizontal: 'center',
+          wrapText: true
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Add data rows dynamically
+      reportData.forEach((item) => {
+        const rowData = {};
+        
+        allHeaders.forEach((header, index) => {
+          // Map header to item property - this works dynamically for all fields
+          let value = '';
+          
+          // Handle special mapping for fields that might have different names
+          if (header === 'Booking Number') value = item.bookingNumber;
+          else if (header === 'Booking Date') value = item.bookingDate;
+          else if (header === 'Allocation Date') value = item.allocationDate;
+          else if (header === 'Branch Name') value = item.branchName;
+          else if (header === 'Sales Executive') value = item.salesExecutive;
+          else if (header === 'Model') value = item.model;
+          else if (header === 'Verticle') value = item.verticle;
+          else if (header === 'Model Type') value = item.modelType;
+          else if (header === 'Color') value = item.color;
+          else if (header === 'Chassis Number') value = item.chassisNumber;
+          else if (header === 'Engine Number') value = item.engineNumber;
+          else if (header === 'Customer Name') value = item.customerName;
+          else if (header === 'Mobile1') value = item.mobile1;
+          else if (header === 'Mobile2') value = item.mobile2;
+          else if (header === 'Address') value = item.address;
+          else if (header === 'Pincode') value = item.pincode;
+          else if (header === 'Aadhar number') value = item.aadharNumber;
+          else if (header === 'Pan no') value = item.panNo;
+          else if (header === 'Birthday') value = item.birthday;
+          else if (header === 'Nominee Name') value = item.nomineeName;
+          else if (header === 'Nominee Relation') value = item.nomineeRelation;
+          else if (header === 'Nominee Age') value = item.nomineeAge;
+          else if (header === 'Booking Type') value = item.bookingType;
+          else if (header === 'Financier Name') value = item.financierName;
+          else if (header === 'Customer Type') value = item.customerType;
+          else if (header === 'GST Number') value = item.gstNumber;
+          else if (header === 'Exchange Vehicle') value = item.exchangeVehicle;
+          else if (header === 'Exchange Vehicle Number') value = item.exchangeVehicleNumber;
+          else if (header === 'Exchange Chassis Number') value = item.exchangeChassisNumber;
+          else if (header === 'Exchange Broker') value = item.exchangeBroker;
+          else if (header === 'Exchange Price') value = item.exchangePrice;
+          else if (header === 'Total Amount') value = item.totalAmount;
+          else if (header === 'Total Discount Given') value = item.totalDiscountGiven;
+          else if (header === 'Final Deal Amount') value = item.finalDealAmount;
+          else if (header === 'Accessories') value = item.accessories;
+          else {
+            // For dynamic price headers, get value from item directly
+            // The property name should match the header exactly
+            value = item[header] !== undefined ? item[header] : 0;
+          }
+          
+          rowData[`col_${index}`] = value;
+        });
+
+        const row = worksheet.addRow(rowData);
+        
+        // Style data rows
+        row.height = 20;
+        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+          const header = allHeaders[colNumber - 1];
+          
+          // Set alignment based on content type
+          if (header.includes('Amount') || header.includes('Price') || 
+              header.includes('Discount') || header.includes('Charges') ||
+              header === 'Total Amount' || header === 'Final Deal Amount' ||
+              header === 'Exchange Price') {
+            cell.alignment = { horizontal: 'right', vertical: 'middle' };
+            if (typeof cell.value === 'number' && cell.value !== 0) {
+              cell.numFmt = '#,##0.00';
+            }
+          } else if (header === 'Booking Number' || header === 'Chassis Number' || 
+                    header === 'Engine Number' || header === 'Aadhar number' || 
+                    header === 'Pan no' || header === 'Mobile1' || header === 'Mobile2' ||
+                    header === 'Pincode' || header === 'Nominee Age') {
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+          } else {
+            cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: true };
+          }
+          
+          // Add borders
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+        });
+      });
+
+      // Auto-filter for all columns
+      if (worksheet.rowCount > 1) {
+        const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+        worksheet.autoFilter = {
+          from: 'A1',
+          to: `${lastColLetter}${worksheet.rowCount}`
+        };
+      }
+
+      // Freeze header row
+      worksheet.views = [
+        { state: 'frozen', ySplit: 1 }
+      ];
+
+      // Set response headers for file download
+      const fileName = `allocation_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      
+      await workbook.xlsx.write(res);
+      res.end();
+
+    } else {
+      // ========== RETURN JSON FORMAT ==========
+      return res.status(200).json({
+        success: true,
+        count: reportData.length,
+        data: reportData,
+        priceHeaders: priceHeaders.map(ph => ph.header_key), // Return dynamic headers info
+        availableBranches: availableBranches,
+        userAccessInfo: {
+          hasAllBranchesAccess: hasAllBranchesAccess,
+          branchAccess: branchAccess,
+          accessibleBranchesCount: user.accessibleBranches?.length || 0,
+          userBranch: user.branch ? {
+            _id: user.branch._id,
+            name: user.branch.name
+          } : null
+        },
+        filters: {
+          startDate: start,
+          endDate: end,
+          branchId: branchId,
+          status: status,
+          bookingType: bookingType,
+          customerType: customerType,
+          modelType: modelType,
+          allocationStatus: 'ALLOCATED',
+          paymentType: paymentType,
+          rto: rto
+        },
+        generatedAt: new Date()
+      });
+    }
+
+  } catch (error) {
+    console.error('Error in getBookingAllocationReport:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error generating booking allocation report',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};
+
+/**
+ * Get base headers (without dynamic price headers)
+ */
+function getBaseHeaders() {
+  return [
+    'Booking Number',
+    'Booking Date',
+    'Allocation Date',
+    'Branch Name',
+    'Sales Executive',
+    'Model',
+    'Verticle',
+    'Model Type',
+    'Color',
+    'Chassis Number',
+    'Engine Number',
+    'Customer Name',
+    'Mobile1',
+    'Mobile2',
+    'Address',
+    'Pincode',
+    'Aadhar number',
+    'Pan no',
+    'Birthday',
+    'Nominee Name',
+    'Nominee Relation',
+    'Nominee Age',
+    'Booking Type',
+    'Financier Name',
+    'Customer Type',
+    'GST Number',
+    'Exchange Vehicle',
+    'Exchange Vehicle Number',
+    'Exchange Chassis Number',
+    'Exchange Broker',
+    'Exchange Price',
+    'Total Amount',
+    'Total Discount Given',
+    'Final Deal Amount',
+    'Accessories'
+  ];
+}
+
+/**
+ * Get column width based on header
+ */
+function getColumnWidth(header) {
+  const widths = {
+    'Booking Number': 18,
+    'Booking Date': 12,
+    'Allocation Date': 12,
+    'Branch Name': 25,
+    'Sales Executive': 25,
+    'Model': 20,
+    'Verticle': 20,
+    'Model Type': 12,
+    'Color': 15,
+    'Chassis Number': 20,
+    'Engine Number': 20,
+    'Customer Name': 25,
+    'Mobile1': 15,
+    'Mobile2': 15,
+    'Address': 40,
+    'Pincode': 12,
+    'Aadhar number': 20,
+    'Pan no': 20,
+    'Birthday': 12,
+    'Nominee Name': 25,
+    'Nominee Relation': 20,
+    'Nominee Age': 15,
+    'Booking Type': 15,
+    'Financier Name': 25,
+    'Customer Type': 15,
+    'GST Number': 25,
+    'Exchange Vehicle': 15,
+    'Exchange Vehicle Number': 20,
+    'Exchange Chassis Number': 20,
+    'Exchange Broker': 25,
+    'Exchange Price': 15,
+    'Total Amount': 15,
+    'Total Discount Given': 18,
+    'Final Deal Amount': 18,
+    'Accessories': 40
+  };
+  
+  // For dynamic price headers, return standard width
+  return widths[header] || 18;
+}
+
+/**
+ * Get alignment based on header
+ */
+function getAlignment(header) {
+  if (header.includes('Amount') || header.includes('Price') || 
+      header.includes('Discount') || header.includes('Charges') ||
+      header === 'Total Amount' || header === 'Final Deal Amount' ||
+      header === 'Exchange Price') {
+    return 'right';
+  }
+  if (header === 'Booking Number' || header === 'Chassis Number' || 
+      header === 'Engine Number' || header === 'Aadhar number' || 
+      header === 'Pan no' || header === 'Mobile1' || header === 'Mobile2' ||
+      header === 'Pincode' || header === 'Nominee Age') {
+    return 'center';
+  }
+  return 'left';
+}
+
+/**
+ * Generate Insurance Report - Shows ONLY bookings with AWAITING and LATER insurance status
+ * Comprehensive customer and vehicle information
+ * @route GET /api/v1/reports/insurance/pending
+ * @access Private
+ */
+// exports.generateInsurancePendingReport = async (req, res) => {
+//   try {
+//     const {
+//       branchId,
+//       bookingType,
+//       customerType,
+//       modelType,
+//       format = 'excel'
+//     } = req.query;
+
+//     // ========== BRANCH ACCESS LOGIC ==========
+//     const userId = req.user.id;
+    
+//     const user = await User.findById(userId)
+//       .select('-otp -otpExpires -emailOtp -emailOtpExpires -password')
+//       .populate({
+//         path: 'roles',
+//         select: 'name isSuperAdmin permissionsCount'
+//       })
+//       .populate('branch')
+//       .populate({
+//         path: 'accessibleBranches',
+//         model: 'Branch',
+//         select: '_id name'
+//       })
+//       .lean();
+
+//     if (!user) {
+//       return res.status(404).json({
+//         success: false,
+//         message: 'User not found'
+//       });
+//     }
+
+//     const userRoles = user.roles || [];
+//     const isActualSuperAdmin = userRoles.some(role => role.name === "SUPERADMIN") || false;
+//     const isSuperAdminFlag = userRoles.some(role => role.isSuperAdmin === true) || false;
+//     const branchAccess = user.branchAccess || 'OWN';
+    
+//     let hasAllBranchesAccess = false;
+    
+//     if (isActualSuperAdmin || branchAccess === 'ALL' || isSuperAdminFlag) {
+//       hasAllBranchesAccess = true;
+//     }
+
+//     // ========== GET AVAILABLE BRANCHES FOR DROPDOWN ==========
+//     let availableBranches = [];
+    
+//     if (hasAllBranchesAccess) {
+//       availableBranches = await Branch.find({ is_active: true })
+//         .select('_id name')
+//         .sort({ name: 1 })
+//         .lean();
+//     } else if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+//       availableBranches = user.accessibleBranches.map(b => ({
+//         _id: b._id,
+//         name: b.name
+//       })).sort((a, b) => a.name.localeCompare(b.name));
+//     } else if (user.branch) {
+//       availableBranches = [{
+//         _id: user.branch._id,
+//         name: user.branch.name
+//       }];
+//     }
+
+//     // Add "All" option for users with multiple branch access
+//     if (availableBranches.length > 1) {
+//       availableBranches.unshift({
+//         _id: 'all',
+//         name: 'All Branches'
+//       });
+//     }
+
+//     // ========== BUILD BOOKING FILTER ==========
+//     // ONLY show AWAITING and LATER insurance status
+//     const bookingFilter = {
+//       insuranceStatus: { $in: ['AWAITING', 'LATER'] }
+//     };
+
+//     // Branch filter
+//     if (!hasAllBranchesAccess) {
+//       let allowedBranchIds = [];
+
+//       if (branchAccess === 'ASSIGNED' && user.accessibleBranches?.length) {
+//         allowedBranchIds = user.accessibleBranches.map(b => b._id);
+
+//         if (branchId && branchId !== 'all') {
+//           const requestedId = new mongoose.Types.ObjectId(branchId);
+//           const hasAccess = allowedBranchIds.some(id => id.toString() === requestedId.toString());
+//           if (!hasAccess) {
+//             return res.status(403).json({
+//               success: false,
+//               message: 'You do not have access to this branch'
+//             });
+//           }
+//           allowedBranchIds = [requestedId];
+//         }
+//       } else if (user.branch?._id) {
+//         allowedBranchIds = [user.branch._id];
+        
+//         if (branchId && branchId !== 'all' && branchId !== user.branch._id.toString()) {
+//           return res.status(403).json({
+//             success: false,
+//             message: 'You do not have access to this branch'
+//           });
+//         }
+//       }
+
+//       if (allowedBranchIds.length > 0) {
+//         bookingFilter.branch = { $in: allowedBranchIds };
+//       }
+//     } else if (branchId && branchId !== 'all') {
+//       bookingFilter.branch = new mongoose.Types.ObjectId(branchId);
+//     }
+
+//     // Apply additional filters
+//     if (bookingType) bookingFilter.bookingType = bookingType;
+//     if (customerType) bookingFilter.customerType = customerType;
+
+//     // ========== FETCH BOOKINGS WITH INSURANCE STATUS AWAITING/LATER ==========
+//     let bookingsQuery = Booking.find(bookingFilter)
+//       .populate({
+//         path: 'model',
+//         select: 'model_name type'
+//       })
+//       .populate({
+//         path: 'color',
+//         select: 'name'
+//       })
+//       .populate({
+//         path: 'branch',
+//         select: 'name'
+//       })
+//       .populate({
+//         path: 'vehicle',
+//         select: 'chassisNumber engineNumber'
+//       })
+//       // ❌ REMOVED: .populate({ path: 'insuranceDetails', ... })
+//       .sort({ createdAt: -1 });
+
+//     // ========== APPLY MODEL TYPE FILTER IF PROVIDED ==========
+//     if (modelType) {
+//       const models = await mongoose.model('Model').find({ 
+//         type: modelType.toUpperCase() 
+//       }).select('_id').lean();
+      
+//       const modelIds = models.map(model => model._id);
+      
+//       if (modelIds.length > 0) {
+//         bookingsQuery = bookingsQuery.where('model').in(modelIds);
+//       } else {
+//         // No models of this type found
+//         if (format === 'excel') {
+//           const workbook = new ExcelJS.Workbook();
+//           const worksheet = workbook.addWorksheet('Insurance Pending Report');
+          
+//           // Add headers
+//           const headers = [
+//             'Sr. No',
+//             'Booking ID',
+//             'Model Name',
+//             'Booking Date',
+//             'Customer Name',
+//             'Chassis Number',
+//             'Engine Number',
+//             'Insurance Status',
+//             'Customer Information'
+//           ];
+          
+//           worksheet.columns = headers.map((header, index) => ({
+//             header: header,
+//             key: `col_${index}`,
+//             width: header === 'Customer Information' ? 60 : 20
+//           }));
+          
+//           const fileName = `insurance_pending_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+          
+//           res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+//           res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+          
+//           await workbook.xlsx.write(res);
+//           res.end();
+//           return;
+//         } else {
+//           return res.status(200).json({
+//             success: true,
+//             count: 0,
+//             data: [],
+//             availableBranches: availableBranches,
+//             userAccessInfo: {
+//               hasAllBranchesAccess: hasAllBranchesAccess,
+//               branchAccess: branchAccess,
+//               accessibleBranchesCount: user.accessibleBranches?.length || 0
+//             },
+//             filters: {
+//               branchId: branchId,
+//               insuranceStatus: ['AWAITING', 'LATER'],
+//               bookingType: bookingType,
+//               customerType: customerType,
+//               modelType: modelType
+//             }
+//           });
+//         }
+//       }
+//     }
+    
+//     const bookings = await bookingsQuery.lean();
+
+//     // ========== GENERATE EXCEL REPORT ==========
+//     if (format === 'excel') {
+//       const workbook = new ExcelJS.Workbook();
+      
+//       let worksheetName = 'Insurance Pending Report';
+//       if (branchId && branchId !== 'all' && bookings.length > 0) {
+//         worksheetName = `${bookings[0]?.branch?.name || ''} Insurance Pending`.trim();
+//       } else if (hasAllBranchesAccess && (!branchId || branchId === 'all')) {
+//         worksheetName = 'All Branches Insurance Pending';
+//       }
+      
+//       const worksheet = workbook.addWorksheet(worksheetName, {
+//         properties: { defaultRowHeight: 45 },
+//         pageSetup: { paperSize: 9, orientation: 'landscape' }
+//       });
+
+//       // Define headers
+//       const headers = [
+//         'Sr. No',
+//         'Booking ID',
+//         'Model Name',
+//         'Booking Date',
+//         'Customer Name',
+//         'Chassis Number',
+//         'Engine Number',
+//         'Insurance Status',
+//         'Customer Information'
+//       ];
+
+//       // Set worksheet columns with proper widths
+//       worksheet.columns = headers.map((header, index) => ({
+//         header: header,
+//         key: `col_${index}`,
+//         width: header === 'Customer Information' ? 80 : 
+//                header === 'Customer Name' ? 30 :
+//                header === 'Booking ID' ? 20 : 18
+//       }));
+
+//       // Style header row
+//       const headerRow = worksheet.getRow(1);
+//       headerRow.height = 40;
+//       headerRow.eachCell((cell) => {
+//         cell.font = { 
+//           bold: true, 
+//           color: { argb: 'FFFFFFFF' },
+//           size: 12,
+//           name: 'Arial'
+//         };
+//         cell.fill = {
+//           type: 'pattern',
+//           pattern: 'solid',
+//           fgColor: { argb: 'FF2E75B5' }
+//         };
+//         cell.alignment = { 
+//           vertical: 'middle', 
+//           horizontal: 'center',
+//           wrapText: true
+//         };
+//         cell.border = {
+//           top: { style: 'thin' },
+//           left: { style: 'thin' },
+//           bottom: { style: 'thin' },
+//           right: { style: 'thin' }
+//         };
+//       });
+
+//       // Add data rows
+//       bookings.forEach((booking, index) => {
+//         // Calculate age from DOB
+//         let age = '';
+//         if (booking.customerDetails?.dob) {
+//           const dob = new Date(booking.customerDetails.dob);
+//           const today = new Date();
+//           age = today.getFullYear() - dob.getFullYear();
+//           const m = today.getMonth() - dob.getMonth();
+//           if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) {
+//             age--;
+//           }
+//         }
+
+//         // Format customer information exactly as shown in your example
+//         const customerInfo = [
+//           `Customer Name`,
+//           `${booking.customerDetails?.salutation || ''} ${booking.customerDetails?.name || ''}`.trim(),
+//           ``,
+//           `Customer ID`,
+//           booking.customerDetails?.custId || '',
+//           ``,
+//           `Address`,
+//           booking.customerDetails?.address || '',
+//           `${booking.customerDetails?.taluka || ''} ${booking.customerDetails?.district || ''} - ${booking.customerDetails?.pincode || ''}`.trim(),
+//           ``,
+//           `Mobile Numbers`,
+//           booking.customerDetails?.mobile1 || '',
+//           booking.customerDetails?.mobile2 || '',
+//           ``,
+//           `Identity Documents`,
+//           `PAN:${booking.customerDetails?.panNo || ''}`,
+//           `Aadhar:${booking.customerDetails?.aadharNumber || ''}`,
+//           ``,
+//           `Vehicle Information`,
+//           `Model Name`,
+//           booking.model?.model_name || '',
+//           ``,
+//           `Color`,
+//           booking.color?.name || '',
+//           ``,
+//           `Chassis Number`,
+//           booking.chassisNumber || booking.vehicle?.chassisNumber || '',
+//           ``,
+//           `Engine Number`,
+//           booking.vehicle?.engineNumber || booking.engineNumber || '',
+//           ``,
+//           `Additional Information`,
+//           `Occupation`,
+//           booking.customerDetails?.occupation || '',
+//           ``,
+//           `Date of Birth`,
+//           booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+//           `Age: ${age} years`,
+//           ``,
+//           `Nominee`,
+//           booking.customerDetails?.nomineeName || '',
+//           booking.customerDetails?.nomineeRelation ? `(${booking.customerDetails.nomineeRelation})` : ''
+//         ].join('\n');
+
+//         const rowData = {
+//           col_0: index + 1,
+//           col_1: booking.bookingNumber || '',
+//           col_2: booking.model?.model_name || '',
+//           col_3: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+//           col_4: `${booking.customerDetails?.salutation || ''} ${booking.customerDetails?.name || ''}`.trim(),
+//           col_5: booking.chassisNumber || booking.vehicle?.chassisNumber || '',
+//           col_6: booking.vehicle?.engineNumber || booking.engineNumber || '',
+//           col_7: booking.insuranceStatus || 'AWAITING',
+//           col_8: customerInfo
+//         };
+
+//         const row = worksheet.addRow(rowData);
+//         row.height = 400; // Tall row for customer information
+
+//         // Style the row
+//         row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+//           cell.alignment = {
+//             vertical: 'top',
+//             horizontal: colNumber === 9 ? 'left' : 'center', // Column 9 is Customer Information
+//             wrapText: true
+//           };
+//           cell.border = {
+//             top: { style: 'thin' },
+//             left: { style: 'thin' },
+//             bottom: { style: 'thin' },
+//             right: { style: 'thin' }
+//           };
+
+//           // Color code insurance status
+//           if (colNumber === 8) { // Insurance Status column (column H)
+//             const status = cell.value;
+//             if (status === 'AWAITING') {
+//               cell.fill = {
+//                 type: 'pattern',
+//                 pattern: 'solid',
+//                 fgColor: { argb: 'FFFFC7CE' } // Light red
+//               };
+//               cell.font = { bold: true, color: { argb: 'FF9C0006' } };
+//             } else if (status === 'LATER') {
+//               cell.fill = {
+//                 type: 'pattern',
+//                 pattern: 'solid',
+//                 fgColor: { argb: 'FFFFE699' } // Light orange
+//               };
+//               cell.font = { bold: true, color: { argb: 'FF9C5700' } };
+//             }
+//           }
+
+//           // Alternate row colors
+//           if (index % 2 === 0 && colNumber !== 8) {
+//             cell.fill = {
+//               type: 'pattern',
+//               pattern: 'solid',
+//               fgColor: { argb: 'FFF2F2F2' }
+//             };
+//           }
+//         });
+//       });
+
+//       // Auto-filter
+//       if (worksheet.rowCount > 1) {
+//         const lastColLetter = String.fromCharCode(64 + worksheet.columnCount);
+//         worksheet.autoFilter = {
+//           from: 'A1',
+//           to: `${lastColLetter}${worksheet.rowCount}`
+//         };
+//       }
+
+//       // Freeze header row
+//       worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+//       // Add summary section
+//       const summaryStartRow = worksheet.rowCount + 3;
+      
+//       // Summary title
+//       worksheet.mergeCells(`A${summaryStartRow}:C${summaryStartRow}`);
+//       const titleCell = worksheet.getCell(`A${summaryStartRow}`);
+//       titleCell.value = 'INSURANCE PENDING SUMMARY';
+//       titleCell.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+//       titleCell.fill = {
+//         type: 'pattern',
+//         pattern: 'solid',
+//         fgColor: { argb: 'FF2E75B5' }
+//       };
+//       titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+
+//       // Summary data
+//       const awaitingCount = bookings.filter(b => b.insuranceStatus === 'AWAITING').length;
+//       const laterCount = bookings.filter(b => b.insuranceStatus === 'LATER').length;
+      
+//       const summaryData = [
+//         ['Total Pending Bookings:', bookings.length],
+//         ['AWAITING Status:', awaitingCount],
+//         ['LATER Status:', laterCount]
+//       ];
+
+//       summaryData.forEach(([label, value], index) => {
+//         const rowNum = summaryStartRow + 2 + index;
+        
+//         worksheet.getCell(`A${rowNum}`).value = label;
+//         worksheet.getCell(`A${rowNum}`).font = { bold: true };
+//         worksheet.getCell(`A${rowNum}`).alignment = { horizontal: 'right' };
+        
+//         worksheet.getCell(`B${rowNum}`).value = value;
+//         worksheet.getCell(`B${rowNum}`).font = { bold: true };
+//         worksheet.getCell(`B${rowNum}`).alignment = { horizontal: 'left' };
+//       });
+
+//       // Add footer with generation info
+//       const footerRow = summaryStartRow + summaryData.length + 3;
+//       worksheet.mergeCells(`A${footerRow}:C${footerRow}`);
+//       const footerCell = worksheet.getCell(`A${footerRow}`);
+//       footerCell.value = `Report generated on ${moment().format('DD MMM YYYY HH:mm:ss')} | Showing ONLY AWAITING and LATER insurance status`;
+//       footerCell.font = { italic: true, size: 10, color: { argb: 'FF666666' } };
+//       footerCell.alignment = { horizontal: 'center' };
+
+//       // Set response headers
+//       const fileName = `insurance_pending_report_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+      
+//       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+//       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      
+//       await workbook.xlsx.write(res);
+//       res.end();
+
+//     } else {
+//       // ========== RETURN JSON FORMAT ==========
+//       const formattedBookings = bookings.map((booking, index) => {
+//         // Calculate age from DOB
+//         let age = '';
+//         if (booking.customerDetails?.dob) {
+//           const dob = new Date(booking.customerDetails.dob);
+//           const today = new Date();
+//           age = today.getFullYear() - dob.getFullYear();
+//           const m = today.getMonth() - dob.getMonth();
+//           if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) {
+//             age--;
+//           }
+//         }
+
+//         return {
+//           srNo: index + 1,
+//           bookingId: booking.bookingNumber,
+//           modelName: booking.model?.model_name || '',
+//           bookingDate: booking.createdAt ? moment(booking.createdAt).format('DD/MM/YYYY') : '',
+//           customerInfo: {
+//             name: `${booking.customerDetails?.salutation || ''} ${booking.customerDetails?.name || ''}`.trim(),
+//             customerId: booking.customerDetails?.custId || '',
+//             address: booking.customerDetails?.address || '',
+//             taluka: booking.customerDetails?.taluka || '',
+//             district: booking.customerDetails?.district || '',
+//             pincode: booking.customerDetails?.pincode || '',
+//             mobile1: booking.customerDetails?.mobile1 || '',
+//             mobile2: booking.customerDetails?.mobile2 || '',
+//             panNo: booking.customerDetails?.panNo || '',
+//             aadharNumber: booking.customerDetails?.aadharNumber || '',
+//             occupation: booking.customerDetails?.occupation || '',
+//             dob: booking.customerDetails?.dob ? moment(booking.customerDetails.dob).format('DD/MM/YYYY') : '',
+//             age: age,
+//             nomineeName: booking.customerDetails?.nomineeName || '',
+//             nomineeRelation: booking.customerDetails?.nomineeRelation || ''
+//           },
+//           vehicleInfo: {
+//             chassisNumber: booking.chassisNumber || booking.vehicle?.chassisNumber || '',
+//             engineNumber: booking.vehicle?.engineNumber || booking.engineNumber || '',
+//             color: booking.color?.name || ''
+//           },
+//           insuranceStatus: booking.insuranceStatus,
+//           branchName: booking.branch?.name || '',
+//           bookingType: booking.bookingType,
+//           customerType: booking.customerType
+//         };
+//       });
+
+//       // Calculate summary statistics
+//       const summary = {
+//         totalPendingBookings: bookings.length,
+//         awaitingCount: bookings.filter(b => b.insuranceStatus === 'AWAITING').length,
+//         laterCount: bookings.filter(b => b.insuranceStatus === 'LATER').length,
+//         branchWiseBreakdown: bookings.reduce((acc, booking) => {
+//           const branch = booking.branch?.name || 'Unknown';
+//           if (!acc[branch]) {
+//             acc[branch] = { total: 0, awaiting: 0, later: 0 };
+//           }
+//           acc[branch].total++;
+//           if (booking.insuranceStatus === 'AWAITING') acc[branch].awaiting++;
+//           if (booking.insuranceStatus === 'LATER') acc[branch].later++;
+//           return acc;
+//         }, {})
+//       };
+//       res.status(200).json({
+//         success: true,
+//         count: bookings.length,
+//         summary: summary,
+//         data: formattedBookings,
+//         availableBranches: availableBranches,
+//         userAccessInfo: {
+//           hasAllBranchesAccess: hasAllBranchesAccess,
+//           branchAccess: branchAccess,
+//           accessibleBranchesCount: user.accessibleBranches?.length || 0,
+//           userBranch: user.branch ? {
+//             _id: user.branch._id,
+//             name: user.branch.name
+//           } : null
+//         },
+//         filters: {
+//           branchId: branchId,
+//           insuranceStatus: ['AWAITING', 'LATER'],
+//           bookingType: bookingType,
+//           customerType: customerType,
+//           modelType: modelType
+//         },
+//         generatedAt: new Date()
+//       });
+//     }
+
+//   } catch (error) {
+//     console.error('Error generating insurance pending report:', error);
+//     res.status(500).json({
+//       success: false,
+//       message: 'Error generating insurance pending report',
+//       error: error.message,
+//       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+//     });
+//   }
+// };

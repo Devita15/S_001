@@ -85,6 +85,7 @@ const machineRoutes = require('./routes/BOM/machineRoutes');
 const processMasterRoutes = require('./routes/BOM/processMasterRoutes');
 const bomRoutes = require('./routes/BOM/bomRoutes');
 const salesOrderRoutes = require('./routes/CRM/salesOrderRoutes');
+
 const app = express();
 
 // Body parser
@@ -163,7 +164,8 @@ app.use('/api/boms', bomRoutes);
 app.use('/api/routings', routingRoutes);
 app.use('/api/machines', machineRoutes);
 app.use('/api/process-master', processMasterRoutes);
-app.use('/api/salesOrder',salesOrderRoutes);
+app.use('/api/sales-orders/order-book',salesOrderRoutes);
+app.use('/api/sales-orders',salesOrderRoutes);
 // Default route
 app.get('/', (req, res) => {
   res.json({
