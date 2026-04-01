@@ -7,17 +7,14 @@
 //   node scripts/createSuperAdmin.js
 
 'use strict';
-
 require('dotenv').config();
 const mongoose = require('mongoose');
 const User     = require("../models/user's & setting's/User");
 const Role     = require("../models/user's & setting's/Role");
-
 // ─── Credentials — change after first login ──────────────────────────────────
 const SUPERADMIN_EMAIL    = 'ceo@suyash.com';
 const SUPERADMIN_USERNAME = 'superadmin';
-const SUPERADMIN_PASSWORD = 'Admin@123';   // ← will be hashed by pre-save hook
-
+const SUPERADMIN_PASSWORD = 'Admin@123';  
 async function createSuperAdmin() {
   const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/hr-system';
   await mongoose.connect(uri);

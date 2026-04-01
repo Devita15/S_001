@@ -425,7 +425,6 @@ router.get('/:id', protect, getDimensionWeight);
  *           message: "Dimension weight created successfully"
  */
 router.post('/', protect, createDimensionWeight);
-
 /**
  * @swagger
  * /api/dimension-weights/{id}:
@@ -494,7 +493,6 @@ router.post('/', protect, createDimensionWeight);
  *           message: "Dimension weight updated successfully"
  */
 router.put('/:id', protect, updateDimensionWeight);
-
 /**
  * @swagger
  * /api/dimension-weights/{id}:

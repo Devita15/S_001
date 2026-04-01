@@ -11,9 +11,7 @@ const drawingRevisionSchema = new mongoose.Schema({
   change_description: { type: String, trim: true, default: '' },
   is_latest:          { type: Boolean, default: false },
 }, { _id: true });
-
 const itemSchema = new mongoose.Schema({
-
   item_id: {
     type: String, required: [true, 'Item ID is required'],
     unique: true, trim: true, uppercase: true,
@@ -30,12 +28,10 @@ const itemSchema = new mongoose.Schema({
   part_description: {
     type: String, required: [true, 'Part description is required'], trim: true,
   },
-
   // ── Drawing & Revision Control ────────────────────────────────────────────
   drawing_no:       { type: String, default: '', trim: true },
   revision_no:      { type: String, default: '0', trim: true },
   drawing_file_path:{ type: String, default: '', trim: true }, // path to current approved drawing PDF
-
   // Append-only history — never delete entries
   drawing_history: { type: [drawingRevisionSchema], default: [] },
 
@@ -50,7 +46,6 @@ const itemSchema = new mongoose.Schema({
     enum: ['Busbar', 'Stamping', 'Gasket', 'Tooling', 'Copper Strip', 'Aluminium Profile', 'Rubber Sheet', 'Cork', 'Other'],
     default: 'Other',
   },
-
   // ── Raw Material Specification ────────────────────────────────────────────
   rm_grade:  { type: String, trim: true, default: '' },
   density:   { type: Number, min: 0 },                    // g/cm³ — no longer required at model level; controller validates per item_category
