@@ -84,12 +84,6 @@ const itemSchema = new mongoose.Schema({
   hsn_code: {
     type: String, required: [true, 'HSN code is required'], trim: true,
   },
-  gst_percentage: {
-    type: Number,
-    enum: [0, 5, 12, 18, 28],
-    default: 18,
-    // Auto-populated from Tax Master when hsn_code is entered — see itemController.createItem
-  },
 
   // ── Inventory Control ─────────────────────────────────────────────────────
   reorder_level:  { type: Number, default: 0, min: 0 },

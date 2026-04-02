@@ -10,6 +10,8 @@ const nodemailer = require('nodemailer');
 const multer     = require('multer');
 const path       = require('path');
 const fs         = require('fs');
+const Tax = require('../../models/CRM/Tax');
+
 
 const { SalesOrder, SO_STATUS_TRANSITIONS } = require('../../models/CRM/SalesOrder');
 const Customer  = require('../../models/CRM/Customer');
@@ -135,8 +137,7 @@ async function fetchItemDetails(itemId) {
     part_no: item.part_no,
     part_name: item.part_name,
     unit: item.unit,
-    hsn_code: item.hsn_code,
-    gst_percentage: item.gst_percentage
+    hsn_code: item.hsn_code
   });
   
   return {
@@ -144,7 +145,7 @@ async function fetchItemDetails(itemId) {
     part_name: item.part_name,
     unit: item.unit,
     hsn_code: item.hsn_code,
-    gst_percentage: item.gst_percentage || 18,
+    // REMOVED: gst_percentage - now fetched from Tax Master
     drawing_no: item.drawing_no || '',
     revision_no: item.revision_no || '0',
   };
@@ -174,14 +175,24 @@ async function validateAndEnrichItems(items) {
       // Fetch details from Item Master using item_id
       const masterDetails = await fetchItemDetails(item.item_id);
 
-      // Enrich with master data
+      // ✅ NEW: Fetch GST from Tax Master using HSN code
+      const tax = await Tax.findOne({ HSNCode: masterDetails.hsn_code, IsActive: true });
+      if (!tax) {
+        throw new Error(`No tax configuration found for HSN code: ${masterDetails.hsn_code}. Please add it in Tax Master first.`);
+      }
+      
+      const gstPercentage = tax.GSTPercentage;
+      
+      console.log(`[validateAndEnrichItems] Item: ${masterDetails.part_no}, HSN: ${masterDetails.hsn_code}, GST: ${gstPercentage}%`);
+
+      // Enrich with master data (GST from Tax Master, NOT from Item)
       enrichedItems.push({
         item_id: masterDetails._id,  // Store the reference
         part_no: masterDetails.part_no,
         part_name: masterDetails.part_name,
         hsn_code: masterDetails.hsn_code,
         unit: masterDetails.unit,
-        gst_percentage: masterDetails.gst_percentage,
+        gst_percentage: gstPercentage,  // ← FROM TAX MASTER
         drawing_no: masterDetails.drawing_no,
         revision_no: masterDetails.revision_no,
         ordered_qty: Number(item.ordered_qty),

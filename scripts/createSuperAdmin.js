@@ -89,7 +89,6 @@ async function createSuperAdmin() {
   await mongoose.disconnect();
   process.exit(0);
 }
-
 createSuperAdmin().catch(err => {
   console.error('❌  Error:', err.message);
   process.exit(1);

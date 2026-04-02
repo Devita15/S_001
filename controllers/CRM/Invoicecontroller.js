@@ -775,3 +775,4 @@ module.exports = {
   // exported for use by other modules
   amountInWords, postGLEntries,
 };
+
